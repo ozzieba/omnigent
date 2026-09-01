@@ -2186,9 +2186,7 @@ class _CodexAppServerSession:
         # definitions) from ``$CODEX_HOME``; without this step a freshly-
         # created temp dir has neither, causing 401 Unauthorized errors
         # for subscription-authenticated users.
-        config_source = _codex_home_config_source_from_env(
-            self._home_env_var, self._home_dir_name
-        )
+        config_source = _codex_home_config_source_from_env(self._home_env_var, self._home_dir_name)
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched. Only an auto-harness

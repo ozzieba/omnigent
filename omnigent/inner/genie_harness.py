@@ -137,7 +137,9 @@ def _resolve_skills_filter() -> str | list[str]:
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError as exc:
-        _logger.warning("%s is not valid JSON (%s); falling back to 'all'", _ENV_SKILLS_FILTER, exc)
+        _logger.warning(
+            "%s is not valid JSON (%s); falling back to 'all'", _ENV_SKILLS_FILTER, exc
+        )
         return "all"
     if isinstance(decoded, str) and decoded in ("all", "none"):
         return decoded

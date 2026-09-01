@@ -145,7 +145,15 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "genie", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
+    "claude-sdk",
+    "codex",
+    "genie",
+    "pi",
+    "openai-agents-sdk",
+    "antigravity",
+    "kimi",
+    "qwen",
+    "goose",
 ]
 
 
