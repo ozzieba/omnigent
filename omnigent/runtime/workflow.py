@@ -145,7 +145,7 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
+    "claude-sdk", "codex", "genie", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
 ]
 
 
@@ -199,6 +199,20 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_CODEX_GATEWAY_HOST",
         auth_key="HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
+        catalog_family="openai",
+    ),
+    # Genie is Databricks' codex fork; same gateway transport as codex, its
+    # own ``HARNESS_GENIE_*`` env vars. ``agent_name="genie"`` means a host
+    # with no ucode ``genie`` agent simply skips ucode enrichment.
+    "genie": UcodeHarnessConfig(
+        agent_name="genie",
+        model_key="HARNESS_GENIE_MODEL",
+        base_url_key="HARNESS_GENIE_GATEWAY_BASE_URL",
+        base_url_family="codex",
+        base_urls_key=None,
+        host_key="HARNESS_GENIE_GATEWAY_HOST",
+        auth_key="HARNESS_GENIE_GATEWAY_AUTH_COMMAND",
+        refresh_key="HARNESS_GENIE_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
         catalog_family="openai",
     ),
     "pi": UcodeHarnessConfig(
@@ -393,6 +407,7 @@ def _inject_ucode_agent_state(
 _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
+    "genie": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
@@ -411,6 +426,7 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
 _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_GATEWAY",
     "codex": "HARNESS_CODEX_GATEWAY",
+    "genie": "HARNESS_GENIE_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
     "qwen": "HARNESS_QWEN_GATEWAY",
 }
@@ -431,6 +447,7 @@ _PI_FAMILY_KEY: dict[str, str] = {
 _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE",
     "codex": "HARNESS_CODEX_DATABRICKS_PROFILE",
+    "genie": "HARNESS_GENIE_DATABRICKS_PROFILE",
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
     "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
