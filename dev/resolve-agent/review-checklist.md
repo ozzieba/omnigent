@@ -62,3 +62,19 @@ what to look for, and why it's wrong.
   never force-delete the pre-existing thing (e.g. `git branch -D` on a branch the
   user owned before the call, losing unpushed commits). Check every failure path
   that shares a cleanup helper with the create-from-scratch flow.
+
+## Policy / guardrail merging
+
+- **Never let a lower-trust layer replace a higher-trust instance by name.**
+  When merging policy/guardrail lists across trust boundaries (child spec vs
+  parent spec, session vs admin), a name-keyed "child wins" dedup lets the
+  lower-trust side redeclare a fence's name with a looser config and delete
+  the stricter instance. Keep both instances and rely on DENY short-circuit
+  (stricter wins), or dedupe only within one trust level.
+- **Derived spec context must follow the resolved spec.** When a fix resolves
+  a more specific spec (e.g. a sub-agent's), check every derived value the
+  engine/handler also computes from the old spec — model, harness, timeouts,
+  LLM config — or the merged policies run against the wrong context.
+- **Respect a builder's freshness contract.** If a function re-reads/refreshes
+  its row mid-flow before authorizing, any new decision input must be derived
+  from the refreshed row, not the pre-refresh snapshot.
