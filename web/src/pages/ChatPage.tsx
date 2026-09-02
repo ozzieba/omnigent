@@ -152,6 +152,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
@@ -1906,7 +1907,7 @@ function MainAgentSurface({
   useEffect(() => {
     // globalThis prefix because React's KeyboardEvent is imported above.
     const handler = (e: globalThis.KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || !e.altKey) return;
+      if (!hasCommandModifier(e) || !e.altKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
       const target = e.target;
       if (

@@ -1,11 +1,15 @@
 // ⌘K (Ctrl+K on Win/Linux) toggles the global command palette. Sibling to the
-// session-switch (⌘↑/↓) and sidebar-toggle (⌘⌥[ / ⌘⌥]) hotkeys; like them it's
-// bound ONCE at the app shell, where the palette's open-state lives.
+// session-switch (⌘[ / ⌘]) and sidebar-toggle (⌘⌥[ / ⌘⌥]) hotkeys; like them
+// it's bound ONCE at the app shell, where the palette's open-state lives.
 //
 // Why ⌘K: it's the de-facto command-palette key across developer tools, and
 // issue #1059 / PR #1064 deliberately reserved it for this (PR #1064 took ⌘⇧F
 // for sidebar search precisely to leave ⌘K free). The browser binds Ctrl+K to
 // the address bar, so we preventDefault to claim it.
+//
+// Platform-aware: only ⌘K fires on macOS and only Ctrl+K on Win/Linux — never
+// the other modifier. On macOS Ctrl+K is emacs kill-to-end-of-line, which users
+// rely on in the composer; matching it too would swallow that keystroke.
 //
 // Two surfaces own ⌘K themselves and must keep it: xterm terminals (forward it
 // to the PTY) and the Monaco editor (⌘K is a chord prefix). When focus sits in
@@ -13,12 +17,18 @@
 
 import { useEffect, useRef } from "react";
 
+import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+
 /** Selector for surfaces that own ⌘K and must keep it (terminals, code editor). */
 const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor";
 
-/** True when the event is the command-palette chord: Cmd/Ctrl+K, no Alt/Shift. */
-export function isCommandPaletteHotkey(e: globalThis.KeyboardEvent): boolean {
-  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return false;
+/** True when the event is the command-palette chord: the platform command
+ *  modifier + K, no Alt/Shift. */
+export function isCommandPaletteHotkey(
+  e: globalThis.KeyboardEvent,
+  isMac: boolean = isMacPlatform(),
+): boolean {
+  if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return false;
   // AltGr reports as Ctrl+Alt on some layouts; the altKey check above already
   // rejects it, but guard explicitly so intl typing never triggers the palette.
   if (e.getModifierState("AltGraph")) return false;
@@ -39,7 +49,11 @@ function focusOwnsHotkey(): boolean {
  * @param enabled  Pass `false` to disable the hotkey (e.g. embedded mode, where
  *   ⌘K belongs to the host page). Defaults to enabled.
  */
-export function useCommandPaletteHotkey(onToggle: () => void, enabled = true): void {
+export function useCommandPaletteHotkey(
+  onToggle: () => void,
+  enabled = true,
+  isMac = isMacPlatform(),
+): void {
   // Held in a ref so the bound handler always calls the latest closure without
   // re-registering on every render.
   const latest = useRef(onToggle);
@@ -50,7 +64,7 @@ export function useCommandPaletteHotkey(onToggle: () => void, enabled = true): v
     const handler = (e: globalThis.KeyboardEvent): void => {
       // Ignore auto-repeat: holding the chord would flap the palette.
       if (e.repeat) return;
-      if (!isCommandPaletteHotkey(e)) return;
+      if (!isCommandPaletteHotkey(e, isMac)) return;
       // Leave ⌘K to terminals/editors that bind it themselves.
       if (focusOwnsHotkey()) return;
       // Claim the chord: preventDefault drops the browser default (Ctrl+K
@@ -62,5 +76,5 @@ export function useCommandPaletteHotkey(onToggle: () => void, enabled = true): v
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [enabled]);
+  }, [enabled, isMac]);
 }
