@@ -681,9 +681,6 @@ def create_hosts_router(
         request: Request,
         host_id: str,
         harness: str,
-        # Not ``dict[str, list[Any]]``: an empty catalog carries a string
-        # ``error`` reason, and a list-only response contract rejects it —
-        # turning an explainable empty picker into a 500.
     ) -> dict[str, Any]:
         """Return pre-launch model choices resolved by the selected host.
 
