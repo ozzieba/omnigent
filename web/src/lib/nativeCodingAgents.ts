@@ -65,7 +65,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Codex",
     iconKind: "codex",
     sortRank: 20,
-    capabilities: ["approvalMode"],
+    capabilities: ["approvalMode", "modelPicker"],
     fullySupported: true,
   },
   {
