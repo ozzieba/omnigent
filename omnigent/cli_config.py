@@ -21,6 +21,7 @@ import collections.abc
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import types
@@ -149,6 +150,59 @@ def _node_dependency_problem() -> str | None:
     version = _node_version(node)
     detected = f" (detected {version})" if version else ""
     return f"Node.js is too old{detected} — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
+
+
+# Minimum tmux version the native harnesses are supported on. The managed
+# terminals (``omnigent/inner/terminal.py``) rely on tmux 3.x behavior
+# (``extended-keys`` CSI-u input, ``if-shell -F``, pane-scoped options) and
+# use quiet ``-q`` flags that make an older tmux degrade silently and fail
+# late in cryptic ways; the pane integration's own gate is also 3.2.
+_MIN_TMUX_VERSION = (3, 2)
+_MIN_TMUX_VERSION_HINT = ".".join(str(part) for part in _MIN_TMUX_VERSION)
+_TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
+
+
+def _tmux_dependency_problem() -> str | None:
+    """
+    Return a one-line problem if tmux is missing or too old, else ``None``.
+
+    The native tmux-backed harnesses (``omnigent claude`` / ``codex`` and
+    every managed terminal) need a tmux at or above
+    :data:`_MIN_TMUX_VERSION`; older releases lack the input/option
+    features they use and degrade silently (the option commands pass
+    ``-q``), so an outdated tmux fails late and cryptically instead of at
+    setup. Parses ``tmux -V`` (e.g. ``"tmux 3.2a"`` — suffix letters are
+    ignored) and compares the ``(major, minor)`` pair against the floor.
+
+    :returns: A human-readable description suitable for a warning bullet,
+        or ``None`` when tmux is present and new enough. A flaky/timed-out
+        probe or unparsable version also yields ``None`` — setup should
+        not block on it.
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return "tmux not found — native Claude/Codex need tmux (macOS: `brew install tmux`)."
+    try:
+        result = subprocess.run(
+            [tmux, "-V"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = _TMUX_VERSION_RE.search(result.stdout) if result.returncode == 0 else None
+    if match is None:
+        return None
+    version = (int(match.group(1)), int(match.group(2)))
+    if version >= _MIN_TMUX_VERSION:
+        return None
+    detected = f"{version[0]}.{version[1]}"
+    return (
+        f"tmux is too old (detected tmux {detected}) — native Claude/Codex need "
+        f"tmux {_MIN_TMUX_VERSION_HINT} or newer (macOS: `brew upgrade tmux`)."
+    )
 
 
 @contextlib.contextmanager
@@ -317,10 +371,9 @@ def _warn_missing_harness_dependencies() -> None:
     node_problem = _node_dependency_problem()
     if node_problem is not None:
         problems.append(node_problem)
-    if shutil.which("tmux") is None:
-        problems.append(
-            "tmux not found — native Claude/Codex need tmux (macOS: `brew install tmux`)."
-        )
+    tmux_problem = _tmux_dependency_problem()
+    if tmux_problem is not None:
+        problems.append(tmux_problem)
     if not problems:
         return
     ui.warn("Some harnesses need external tools:")
