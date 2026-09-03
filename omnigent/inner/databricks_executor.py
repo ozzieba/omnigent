@@ -733,6 +733,13 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     exactly the requested host. The host-keyed ``databricks-cli``
     lookup remains as the last resort for cfg-less setups.
 
+    When several profiles match the host, they are tried in identity
+    preference order (see :func:`_host_profile_selection_order`): the
+    ``DATABRICKS_CONFIG_PROFILE`` profile first, then user (U2M)
+    profiles, then M2M service-principal profiles — so a machine with
+    both a user login and an SP for the same workspace authenticates
+    as the person, not the service principal.
+
     :param host: Workspace host, e.g.
         ``"https://example.databricks.com"``.
     :returns: ``(auth, host)`` — an httpx Auth and the workspace URL.
@@ -743,7 +750,7 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
         f"Databricks authentication failed for workspace {host}. "
         f"Run: databricks auth login --host {host}"
     )
-    for profile_name in _databrickscfg_profiles_for_host(host):
+    for profile_name in _host_profile_selection_order(host):
         try:
             cfg = _sdk_config(profile=profile_name)
             cfg.authenticate()
@@ -770,6 +777,81 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     except Exception as exc:
         raise DatabricksAuthError(host_failure) from exc
     return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
+
+
+def _host_profile_selection_order(host: str) -> list[str]:
+    """Order the host-matching profiles by identity preference.
+
+    File order is identity-blind: an M2M service-principal section listed
+    before the user's ``[DEFAULT]`` (U2M) section always wins a
+    first-successful-auth walk, because static client credentials never
+    fail to mint. On a machine holding both identities for one workspace
+    the host would then silently register as the service principal — a
+    different account from the signed-in app user, so the user sees no
+    live host. Order by intent instead:
+
+    1. The ``DATABRICKS_CONFIG_PROFILE`` profile, when it matches *host*
+       — an explicit selection always wins (even naming an SP profile).
+    2. User (U2M / PAT) profiles, in file order.
+    3. M2M service-principal profiles, in file order — still reachable
+       when they are the only credential for the host.
+
+    :param host: Workspace host to match, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: Matching profile names, most-preferred first.
+    """
+    matches = _databrickscfg_profiles_for_host(host)
+    if len(matches) < 2:
+        return matches
+    env_profile = (os.environ.get("DATABRICKS_CONFIG_PROFILE") or "").strip()
+    sp_sections = _databrickscfg_service_principal_sections()
+    explicit = [name for name in matches if name == env_profile]
+    users = [name for name in matches if name != env_profile and name not in sp_sections]
+    sps = [name for name in matches if name != env_profile and name in sp_sections]
+    return explicit + users + sps
+
+
+def _databrickscfg_service_principal_sections() -> set[str]:
+    """Section names in ``~/.databrickscfg`` holding M2M service-principal creds.
+
+    A section is a service principal when it carries ``client_id`` +
+    ``client_secret`` (or an explicit machine ``auth_type`` such as
+    ``oauth-m2m``) and no user-interactive ``auth_type`` overrides that.
+
+    Parsed with the ``DEFAULT`` section demoted to a regular section:
+    ConfigParser's default-section inheritance would otherwise smear a
+    ``[DEFAULT]`` user profile's ``auth_type = databricks-cli`` onto every
+    named SP section and misclassify it as a user profile.
+
+    :returns: The SP section names (``"DEFAULT"`` included when the
+        default section itself is an SP), or ``set()`` when the config
+        file is missing or unparseable.
+    """
+    import configparser
+    from pathlib import Path
+
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    if not cfg_path.exists():
+        return set()
+    # A sentinel default_section keeps [DEFAULT] a plain section with only
+    # its own keys (no inheritance in either direction).
+    config = configparser.ConfigParser(default_section="@omnigent-no-default-inheritance@")
+    try:
+        config.read(cfg_path)
+    except configparser.Error:
+        return set()
+    user_auth_types = {"databricks-cli", "external-browser", "pat", "runtime"}
+    sections: set[str] = set()
+    for section in config.sections():
+        options = config[section]
+        auth_type = options.get("auth_type", "").strip().lower()
+        if auth_type in user_auth_types:
+            continue
+        if auth_type in {"oauth-m2m", "azure-client-secret", "github-oidc-azure"} or (
+            "client_id" in options and "client_secret" in options
+        ):
+            sections.add(section)
+    return sections
 
 
 def _databrickscfg_profiles_for_host(host: str) -> list[str]:
