@@ -422,6 +422,28 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByText(":20-30")).toBeInTheDocument();
   });
 
+  it("gives two ranges of the same file distinct accessible remove labels", () => {
+    // WHY: the visible chip already disambiguates ranges (see the test above),
+    // but the ✕ button's aria-label used to be built from the bare path alone
+    // -- identical "Remove a.ts" on both, so a screen-reader user couldn't
+    // tell which range a given button removes (same latent gap NewChatDialog's
+    // landing chip had, fixed there via mentionItemPath -- see its history).
+    useChatStore.setState({
+      pendingComposerAttachments: [
+        { path: "a.ts", isDir: false, lineRange: { start: 2, end: 9 } },
+        { path: "a.ts", isDir: false, lineRange: { start: 20, end: 30 } },
+      ],
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByLabelText("Remove a.ts:2-9")).toBeInTheDocument();
+    expect(screen.getByLabelText("Remove a.ts:20-30")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Remove a.ts:2-9"));
+
+    expect(screen.queryByText(":2-9")).not.toBeInTheDocument();
+    expect(screen.getByText(":20-30")).toBeInTheDocument();
+  });
+
   it("collapses identical queued attachments to one chip on drain", () => {
     // The store dedups on insert, but the drain must also dedup within a batch
     // (and against already-tagged chips) so a duplicated queue can't double up.
