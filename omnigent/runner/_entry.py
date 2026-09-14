@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from fastapi import FastAPI
 
+from omnigent import build_receipt as _build_receipt  # noqa: F401 — capture before graph import
 from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner import _proc

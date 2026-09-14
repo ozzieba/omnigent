@@ -105,6 +105,7 @@ def test_import_graph_is_single_threaded() -> None:
             "print(threading.active_count())",
             "print([t.name for t in threading.enumerate()])",
             "print(all(name in sys.modules for name in (",
+            "    'omnigent.build_receipt',",
             "    'omnigent.runner.background_titles.claude_native',",
             "    'omnigent.runner.background_titles.codex_native',",
             "    'omnigent.runner.background_titles.sdk',",

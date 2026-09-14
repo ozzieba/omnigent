@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.requests import HTTPConnection
 
+from omnigent.build_receipt import captured_build_receipt
 from omnigent.errors import OmnigentError
 from omnigent.runner import create_runner_app
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
@@ -26,7 +27,12 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
-from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
+from omnigent.runner.transports.ws_tunnel.serve import (
+    _send_hello as send_runner_hello,
+)
+from omnigent.runner.transports.ws_tunnel.serve import (
+    dispatch_via_asgi,
+)
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
@@ -342,6 +348,56 @@ async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
 
     assert offline.json() == {"runner_id": _RUNNER_ID, "online": False}
     assert online.json() == {"runner_id": _RUNNER_ID, "online": True}
+
+
+async def test_status_exposes_captured_build_only_to_online_runner_owner() -> None:
+    """Production hello → registry → status transports the stamp without metadata leakage."""
+    route_app = _tunnel_route_app(auth_provider=_CredentialHeaderAuthProvider())
+    communicator = await _connect_route(
+        route_app.app,
+        _TUNNEL_PATH,
+        headers=[(b"x-test-user", b"owner@example.com")],
+    )
+
+    async def send_text(text: str) -> None:
+        await communicator.send_input({"type": "websocket.receive", "text": text})
+
+    await send_runner_hello(send_text, "0.1.0-test")
+    await asyncio.wait_for(_wait_until_registered(route_app.registry, _RUNNER_ID), timeout=1.0)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=route_app.app),
+            base_url="http://server",
+        ) as client:
+            own = await client.get(
+                f"/v1/runners/{_RUNNER_ID}/status",
+                headers={"x-test-user": "owner@example.com"},
+            )
+            other = await client.get(
+                f"/v1/runners/{_RUNNER_ID}/status",
+                headers={"x-test-user": "other@example.com"},
+            )
+        assert own.status_code == other.status_code == 200
+        assert own.json() == {
+            "runner_id": _RUNNER_ID,
+            "online": True,
+            "captured_build": captured_build_receipt().to_wire(),
+        }
+        assert other.json() == {"runner_id": _RUNNER_ID, "online": False}
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=1.0)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=route_app.app),
+        base_url="http://server",
+    ) as client:
+        offline = await client.get(
+            f"/v1/runners/{_RUNNER_ID}/status",
+            headers={"x-test-user": "owner@example.com"},
+        )
+    assert offline.json() == {"runner_id": _RUNNER_ID, "online": False}
 
 
 async def test_ws_tunnel_list_runners_reports_online_harnesses(app: FastAPI) -> None:

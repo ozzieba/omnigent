@@ -56,6 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from omnigent import build_receipt as _build_receipt  # noqa: F401 — capture before graph import
 from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
 
 # Env var the daemon sets to the inherited control-socket fd number.

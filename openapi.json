@@ -9684,7 +9684,7 @@
     },
     "/v1/runners/{runner_id}/status": {
       "get": {
-        "description": "Return whether a runner currently has an open tunnel.\n\nWhen auth is active, a runner owned by a different user\nappears as offline to prevent enumeration.\n\n**Returns:** A JSON object with `runner_id` and `online`.",
+        "description": "Return whether a runner currently has an open tunnel.\n\nWhen auth is active, a runner owned by a different user\nappears as offline to prevent enumeration.\n\n**Returns:** `runner_id`, `online`, and an optional `captured_build` stamp from the visible runner's latest hello frame.",
         "operationId": "runner_status_v1_runners__runner_id__status_get",
         "parameters": [
           {
@@ -9703,16 +9703,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "boolean"
-                      }
-                    ]
-                  },
+                  "additionalProperties": true,
                   "title": "Response Runner Status V1 Runners  Runner Id  Status Get",
                   "type": "object"
                 }
