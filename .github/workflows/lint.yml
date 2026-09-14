@@ -7,6 +7,7 @@ name: Lint
 # check doesn't strand pending.
 
 on:
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
