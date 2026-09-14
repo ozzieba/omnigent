@@ -13,8 +13,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
 
@@ -402,6 +407,7 @@ def build_mcp_config(
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
+    servers: Sequence[MCPServerConfig] = (),
 ) -> dict[str, object]:
     """Build agy's ``mcp_config.json`` payload for the Omnigent relay server.
 
@@ -423,31 +429,55 @@ def build_mcp_config(
         config points at.
     :param python_executable: Python interpreter for the relay command;
         defaults to the current interpreter (``sys.executable``).
+    :param servers: Only the current agent's explicitly declared MCP servers.
     :returns: The ``mcp_config.json`` payload as a dict.
     """
     python = python_executable or sys.executable
-    return {
-        "mcpServers": {
-            _MCP_SERVER_NAME: {
-                "command": python,
-                "args": [
-                    "-I",
-                    "-m",
-                    "omnigent.claude_native_bridge",
-                    "serve-mcp",
-                    "--bridge-dir",
-                    str(bridge_dir),
-                ],
-                "enabledTools": list(_AGY_ENABLED_TOOLS),
-                "env": {
-                    "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-                    # Pin the relay to the RUNNER's real home so its bridge-root
-                    # validation matches where the bridge dir lives. See docstring.
-                    "HOME": str(Path.home()),
-                },
-            }
+    entries: dict[str, dict[str, object]] = {
+        _MCP_SERVER_NAME: {
+            "command": python,
+            "args": [
+                "-I",
+                "-m",
+                "omnigent.claude_native_bridge",
+                "serve-mcp",
+                "--bridge-dir",
+                str(bridge_dir),
+            ],
+            "enabledTools": list(_AGY_ENABLED_TOOLS),
+            "env": {
+                "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+                # Pin the relay to the RUNNER's real home so its bridge-root
+                # validation matches where the bridge dir lives. See docstring.
+                "HOME": str(Path.home()),
+            },
         }
     }
+    for server in servers:
+        if not server.name or server.name in entries:
+            raise ValueError("MCP server name conflicts with another server or the relay")
+        if server.transport == "stdio":
+            if not server.command:
+                raise ValueError("Stdio MCP server requires a command")
+            entries[server.name] = {
+                "command": server.command,
+                "args": list(server.args),
+                "env": dict(server.env),
+                "disabled": False,
+            }
+        elif server.transport == "http":
+            if not server.url:
+                raise ValueError("HTTP MCP server requires a URL")
+            if server.databricks_profile:
+                raise ValueError("Native Antigravity cannot resolve an MCP auth profile")
+            entries[server.name] = {
+                "serverUrl": server.url,
+                "headers": dict(server.headers),
+                "disabled": False,
+            }
+        else:
+            raise ValueError("Unsupported native Antigravity MCP transport")
+    return {"mcpServers": entries}
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
@@ -475,6 +505,7 @@ def write_mcp_config(
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
+    servers: Sequence[MCPServerConfig] = (),
 ) -> Path:
     """Write the per-session agy MCP config + relay token.
 
@@ -491,16 +522,24 @@ def write_mcp_config(
         and the isolated agy Gemini dir).
     :param python_executable: Python interpreter for the relay command;
         defaults to the current interpreter.
+    :param servers: Current agent declarations; omitted servers are not inherited.
     :returns: Absolute path to the written ``mcp_config.json``.
     """
-    write_mcp_bridge_config(bridge_dir)
     config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
-    config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = config_dir / _MCP_CONFIG_FILE
-    payload = build_mcp_config(bridge_dir, python_executable=python_executable)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    if path.is_symlink():
+        raise ValueError("MCP config must not be a symbolic link")
+    payload = build_mcp_config(bridge_dir, python_executable=python_executable, servers=servers)
+    write_mcp_bridge_config(bridge_dir)
+    config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="mcp_config.json.", dir=config_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
     return path
 
 

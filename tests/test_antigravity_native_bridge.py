@@ -1473,6 +1473,94 @@ def test_write_mcp_config_targets_isolated_agy_gemini_dir(tmp_path: Path) -> Non
     assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
 
 
+def test_build_mcp_config_renders_declared_stdio_and_http_servers(tmp_path: Path) -> None:
+    """The agent's explicit MCP declarations reach agy's supported transport schema."""
+    stdio = SimpleNamespace(
+        name="personal-cloud",
+        transport="stdio",
+        command="/fixture/bridge",
+        args=["--fixture"],
+        env={"FIXTURE": "value"},
+    )
+    http = SimpleNamespace(
+        name="fixture-http",
+        transport="http",
+        url="https://example.invalid/mcp",
+        headers={"X-Fixture": "value"},
+        databricks_profile=None,
+    )
+    servers = build_mcp_config(tmp_path, servers=[stdio, http])["mcpServers"]
+    assert servers["personal-cloud"] == {
+        "command": "/fixture/bridge",
+        "args": ["--fixture"],
+        "env": {"FIXTURE": "value"},
+        "disabled": False,
+    }
+    assert servers["fixture-http"] == {
+        "serverUrl": "https://example.invalid/mcp",
+        "headers": {"X-Fixture": "value"},
+        "disabled": False,
+    }
+    assert "enabledTools" not in servers["personal-cloud"]
+    assert "omnigent" in servers
+
+
+def test_write_mcp_config_reconciles_only_current_session_spec(tmp_path: Path) -> None:
+    """Declarations are session-local and removing one removes its generated entry."""
+    declared = SimpleNamespace(
+        name="personal-cloud", transport="stdio", command="/fixture/bridge", args=[], env={}
+    )
+    bridge_dir = tmp_path / "personal-session"
+    path = write_mcp_config(bridge_dir, servers=[declared])
+    first = path.read_bytes()
+    assert "personal-cloud" in json.loads(first)["mcpServers"]
+    write_mcp_config(bridge_dir, servers=[declared])
+    assert path.read_bytes() == first
+    assert path.stat().st_mode & 0o777 == 0o600
+    other = write_mcp_config(tmp_path / "other-session")
+    assert set(json.loads(other.read_text())["mcpServers"]) == {"omnigent"}
+    assert path.read_bytes() == first
+    write_mcp_config(bridge_dir, servers=[])
+    assert set(json.loads(path.read_text())["mcpServers"]) == {"omnigent"}
+
+
+@pytest.mark.parametrize("name", ["omnigent", "duplicate"])
+def test_build_mcp_config_rejects_conflicting_names(tmp_path: Path, name: str) -> None:
+    """Declarations cannot replace the framework relay or each other."""
+    declared = SimpleNamespace(name=name, transport="stdio", command="fixture", args=[], env={})
+    declarations = [declared] if name == "omnigent" else [declared, declared]
+    with pytest.raises(ValueError, match="name"):
+        write_mcp_config(tmp_path, servers=declarations)
+    assert not (tmp_path / "bridge.json").exists()
+
+
+def test_build_mcp_config_rejects_unresolved_profile(tmp_path: Path) -> None:
+    """A dynamic HTTP auth profile must not silently become an anonymous server."""
+    declared = SimpleNamespace(
+        name="fixture",
+        transport="http",
+        url="https://example.invalid/mcp",
+        headers={},
+        databricks_profile="fixture-profile",
+    )
+    with pytest.raises(ValueError, match="profile"):
+        build_mcp_config(tmp_path, servers=[declared])
+
+
+def test_write_mcp_config_refuses_symlinked_registration(tmp_path: Path) -> None:
+    """A link to another profile is not an isolated registration to rewrite."""
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"mcpServers":{"other":{"command":"fixture"}}}')
+    path = agy_gemini_dir(tmp_path / "bridge") / "config" / "mcp_config.json"
+    path.parent.mkdir(parents=True)
+    path.symlink_to(outside)
+    before = outside.read_bytes()
+    with pytest.raises(ValueError, match="symbolic link"):
+        write_mcp_config(tmp_path / "bridge")
+    assert path.is_symlink()
+    assert outside.read_bytes() == before
+
+
 def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
     """A second write keeps the existing token so a live relay is not re-tokened."""
     write_mcp_bridge_config(tmp_path)

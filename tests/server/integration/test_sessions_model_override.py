@@ -10,13 +10,15 @@ runner-path forwarding is verified here by stubbing
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import httpx
 import pytest
 
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -364,6 +366,84 @@ async def test_bundle_create_inherits_spec_reasoning_effort(
     assert owning.json()["reasoning_effort"] == "high"
 
 
+@pytest.mark.parametrize("model", [None, "openrouter/example/tool-model"])
+async def test_bundle_create_model_override_round_trips(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
+) -> None:
+    """An uploaded native agent retains a selected model before its first turn."""
+    bundle = build_agent_bundle(
+        name="native-model-child",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "opencode-native"},
+            "model": "openrouter/example/spec-default",
+            "reasoning_effort": "high",
+        },
+        include_llm=False,
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {
+                    "title": "selected model",
+                    "model_override": model,
+                    "labels": {"purpose": "model-check"},
+                    "workspace": "/tmp/model-check",
+                    "reasoning_effort": "low",
+                }
+            )
+        },
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201, resp.text
+    sid = resp.json()["session_id"]
+    snap = await client.get(f"/v1/sessions/{sid}?include_items=false&refresh_state=false")
+    assert snap.status_code == 200, snap.text
+    actual = snap.json()
+    assert actual["model_override"] == model
+    assert actual["reasoning_effort"] == "low"
+    assert actual["title"] == "selected model"
+    assert actual["workspace"] == "/tmp/model-check"
+    assert actual["labels"]["purpose"] == "model-check"
+    from omnigent.runner.native.orchestration import _opencode_native_launch_config
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://test")
+    launch = await _opencode_native_launch_config(session_id=sid, server_client=client)
+    assert launch.model_override == model
+
+
+@pytest.mark.parametrize("model", ["", "   ", "--flag", "provider/bad model", "x" * 257])
+async def test_bundle_create_rejects_invalid_model_before_persistence(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    model: str,
+) -> None:
+    """Malformed native model arguments never create a session or agent."""
+    before = await client.get("/v1/sessions")
+    assert before.status_code == 200, before.text
+    artifacts_before = set((tmp_path / "artifacts").rglob("*"))
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"model_override": model})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(name="invalid-model"),
+                "application/gzip",
+            )
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "model" in resp.text
+    after = await client.get("/v1/sessions")
+    assert after.status_code == 200, after.text
+    assert after.json() == before.json()
+    assert set((tmp_path / "artifacts").rglob("*")) == artifacts_before
+
+
 class _CaptureClient:
     """Stub runner client that records the POSTed body for inspection."""
 
@@ -449,9 +529,11 @@ async def test_runner_path_forwards_persisted_model_override(
     )
 
 
+@pytest.mark.parametrize("create_mode", ["agent_id", "bundle"])
 async def test_create_time_model_override_forwards_on_first_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    create_mode: str,
 ) -> None:
     """A create-time override reaches the runner on the very first event.
 
@@ -463,17 +545,30 @@ async def test_create_time_model_override_forwards_on_first_event(
     """
     captured = _stub_runner_client(monkeypatch)
 
-    agent = await create_test_agent(client)
-    resp = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": agent["id"],
-            "initial_items": [],
-            "model_override": "databricks-claude-sonnet-4-6",
-        },
-    )
+    if create_mode == "agent_id":
+        agent = await create_test_agent(client)
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "initial_items": [],
+                "model_override": "databricks-claude-sonnet-4-6",
+            },
+        )
+    else:
+        resp = await client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({"model_override": "databricks-claude-sonnet-4-6"})},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(name="selected-model"),
+                    "application/gzip",
+                )
+            },
+        )
     assert resp.status_code == 201, resp.text
-    sid = resp.json()["id"]
+    sid = resp.json()["id" if create_mode == "agent_id" else "session_id"]
 
     event = await client.post(
         f"/v1/sessions/{sid}/events",

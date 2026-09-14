@@ -3329,6 +3329,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         agent_description: str | None,
         title: str | None = None,
         labels: dict[str, str] | None = None,
+        model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
@@ -3358,6 +3359,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``"debugging auth flow"``.
         :param labels: Optional initial guardrails labels,
             e.g. ``{"env": "test"}``. ``None`` writes no labels.
+        :param model_override: Optional per-session model selection.
+            ``None`` keeps the agent default.
         :param reasoning_effort: Optional per-session
             reasoning-effort hint, e.g. ``"high"``. ``None``
             means use the agent default.
@@ -3396,6 +3399,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             agent_description=agent_description,
             title=title,
             labels=labels,
+            model_override=model_override,
             reasoning_effort=reasoning_effort,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
@@ -3414,6 +3418,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         agent_description: str | None,
         title: str | None = None,
         labels: dict[str, str] | None = None,
+        model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
@@ -3449,7 +3454,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             parent_conversation_id=parent_conversation_id,
             root_conversation_id=root_conversation_id,
             agent_id=agent_id,
-            session_overrides=_encode_session_overrides({"reasoning_effort": reasoning_effort}),
+            session_overrides=_encode_session_overrides(
+                {"model_override": model_override, "reasoning_effort": reasoning_effort}
+            ),
         )
         with self._conv_session("create_session_with_agent") as ap_sess:
             ap_sess.add(conversation_row)

@@ -65,6 +65,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -8201,6 +8202,11 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
     """
     try:
         parsed = SessionCreateMetadata.model_validate_json(metadata)
+        model_override = (
+            validate_model_override(parsed.model_override)
+            if parsed.model_override is not None
+            else None
+        )
         reasoning_effort = validate_effort(
             parsed.reasoning_effort,
             "session metadata",
@@ -8209,7 +8215,9 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
+        return parsed.model_copy(
+            update={"model_override": model_override, "reasoning_effort": reasoning_effort}
+        )
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
@@ -8952,6 +8960,7 @@ def _persist_stored_session_bundle(
             agent_description=agent_description,
             title=metadata.title,
             labels=metadata.labels,
+            model_override=metadata.model_override,
             reasoning_effort=metadata.reasoning_effort,
             workspace=metadata.workspace,
             terminal_launch_args=metadata.terminal_launch_args,
