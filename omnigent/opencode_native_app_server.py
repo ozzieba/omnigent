@@ -173,11 +173,12 @@ def check_opencode_version(
         )
 
 
-def resolve_opencode_version(opencode_path: str) -> str:
+def resolve_opencode_version(opencode_path: str, *, env: Mapping[str, str] | None = None) -> str:
     """
     Run ``opencode --version`` and return the parsed version.
 
     :param opencode_path: Path to the ``opencode`` binary.
+    :param env: Explicit launch environment; ``None`` inherits the caller's.
     :returns: Parsed version string, e.g. ``"1.17.7"``.
     :raises OpenCodeVersionError: When the version cannot be determined.
     """
@@ -188,10 +189,15 @@ def resolve_opencode_version(opencode_path: str) -> str:
             text=True,
             timeout=30,
             check=False,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise OpenCodeVersionError(f"Could not run 'opencode --version': {exc}") from exc
     output = f"{completed.stdout}\n{completed.stderr}"
+    if completed.returncode != 0:
+        raise OpenCodeVersionError(
+            f"Could not run 'opencode --version' (exit {completed.returncode}): {output!r}"
+        )
     version = parse_opencode_version(output)
     if version is None:
         raise OpenCodeVersionError(f"Could not parse OpenCode version from: {output!r}")
@@ -392,6 +398,7 @@ class OpenCodeNativeServer:
 
     :param bridge_dir: Native OpenCode bridge directory.
     :param workspace: Working directory for the server.
+    :param session_id: Omnigent session identity for native launch admission.
     :param opencode_path: Path to the ``opencode`` binary; ``None``
         searches ``PATH``.
     :param hostname: Bind hostname (always loopback).
@@ -406,6 +413,7 @@ class OpenCodeNativeServer:
         *,
         bridge_dir: Path,
         workspace: Path,
+        session_id: str | None = None,
         opencode_path: str | None = None,
         hostname: str = "127.0.0.1",
         port: int | None = None,
@@ -418,6 +426,14 @@ class OpenCodeNativeServer:
         self.hostname = hostname
         self._explicit_port = port
         self._extra_env = dict(extra_env or {})
+        if session_id is not None:
+            # A child server must not inherit its runner's parent lease.
+            self._extra_env.update(
+                {
+                    "OMNIGENT_RUNNER_PRIMARY_SESSION_ID": session_id,
+                    "HARNESS_OPENCODE_NATIVE_REQUEST_SESSION_ID": session_id,
+                }
+            )
         self._opencode_args = tuple(opencode_args)
         self._verify_version = verify_version
         self.opencode_path = find_opencode_cli(opencode_path)
@@ -474,8 +490,9 @@ class OpenCodeNativeServer:
         :raises OpenCodeVersionError: When the CLI version is unsupported.
         :raises RuntimeError: When the server does not become ready.
         """
+        launch_env = self.env
         if self._verify_version:
-            self.version = resolve_opencode_version(self.opencode_path)
+            self.version = resolve_opencode_version(self.opencode_path, env=launch_env)
             if os.environ.get(_SKIP_VERSION_CHECK_ENV):
                 _logger.warning(
                     "%s set; skipping OpenCode version gate (got %s, supported >=%s,<%s)",
@@ -498,7 +515,7 @@ class OpenCodeNativeServer:
         self.process = subprocess.Popen(
             argv,
             cwd=str(self.workspace),
-            env=self.env,
+            env=launch_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

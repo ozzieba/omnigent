@@ -1356,6 +1356,7 @@ async def _auto_create_opencode_terminal(
     server = OpenCodeNativeServer(
         bridge_dir=bridge_dir,
         workspace=launch_config.workspace,
+        session_id=session_id,
         extra_env=policy_env or None,
     )
     await server.start()
