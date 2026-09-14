@@ -1285,7 +1285,7 @@ async def _auto_create_opencode_terminal(
     # through Omnigent's policy engine via the forwarder's permission gate —
     # opencode's enforcement is reactive (no pre-tool hook), so "ask" is what
     # makes the policy verdicts apply to MCP (and other) tools.
-    mcp_block = build_opencode_mcp_block(_opencode_native_mcp_servers_from_spec(agent_spec))
+    mcp_block = build_opencode_mcp_block(_native_mcp_servers_from_spec(agent_spec))
     if server_client is not None and ensure_comment_relay is not None:
         mcp_block.update(build_opencode_omnigent_mcp_server(bridge_dir))
     if mcp_block:
@@ -1723,7 +1723,7 @@ def _opencode_native_profile_from_spec(
         return None
 
 
-def _opencode_native_mcp_servers_from_spec(
+def _native_mcp_servers_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
 ) -> list[MCPServerConfig]:
     """
@@ -1739,6 +1739,10 @@ def _opencode_native_mcp_servers_from_spec(
         return list(spec.mcp_servers or [])
     except Exception:  # noqa: BLE001 - best effort.
         return []
+
+
+# Keep the existing runner-native re-export compatible for callers.
+_opencode_native_mcp_servers_from_spec = _native_mcp_servers_from_spec
 
 
 def _render_opencode_transcript_text(items: list[object]) -> str:
@@ -4703,6 +4707,7 @@ async def _auto_create_antigravity_terminal(
     resource_registry: SessionResourceRegistry,
     publish_event: Callable[[str, dict[str, object]], None],
     *,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
@@ -4751,6 +4756,7 @@ async def _auto_create_antigravity_terminal(
     :param publish_event: The runner's per-session SSE emitter, used to
         surface the new terminal on the live stream so the web UI's Terminal
         toggle enables without a refresh.
+    :param agent_spec: Bound agent spec with explicit MCP server declarations.
     :param server_client: Runner's Omnigent server HTTP client. Used to read
         the persisted workspace, launch args, and the discovered agy
         conversation id (``external_session_id``) for resume.
@@ -4871,7 +4877,9 @@ async def _auto_create_antigravity_terminal(
     # the same shared ``serve-mcp`` claude/codex/cursor use. Offloaded to a thread
     # (file I/O) and done BEFORE terminal launch so agy sees the config on its
     # first MCP scan.
-    await asyncio.to_thread(write_mcp_config, bridge_dir)
+    await asyncio.to_thread(
+        write_mcp_config, bridge_dir, servers=_native_mcp_servers_from_spec(agent_spec)
+    )
     env_overrides = {
         **env_overrides,
         **await asyncio.to_thread(
@@ -7603,6 +7611,7 @@ async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.session_id,
         ctx.resource_registry,
         ctx.publish_event,
+        agent_spec=ctx.agent_spec,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
     )

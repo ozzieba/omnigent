@@ -3811,6 +3811,7 @@ def create_runner_app(
                     return PreLaunchResult(needs_terminal=needs)
 
                 _launch_pre = _antigravity_pre_launch
+                _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
 
             elif harness_name == "pi-native":
                 # pi resolves its spec unwrapped — a resolution error surfaces as
@@ -8879,6 +8880,15 @@ def create_runner_app(
                 )
 
             elif terminal_name == "antigravity":
+
+                async def _antigravity_ensure_build(
+                    ctx: NativeLaunchContext,
+                ) -> NativeLaunchContext:
+                    return dataclasses.replace(
+                        ctx, agent_spec=await _resolve_session_agent_spec(session_id)
+                    )
+
+                _ensure_build = _antigravity_ensure_build
                 _ensure_is_owned = _is_runner_owned_antigravity_terminal
                 _ensure_conflict = (
                     "Existing antigravity terminal is not a runner-owned agy TUI "
