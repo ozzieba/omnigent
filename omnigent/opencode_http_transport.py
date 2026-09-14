@@ -179,6 +179,7 @@ class OpenCodeHttpTransport:
             self._server = OpenCodeNativeServer(
                 bridge_dir=self._bridge_dir or Path(launch.workspace),
                 workspace=Path(launch.workspace),
+                session_id=launch.omnigent_session_id,
             )
         await self._server.start()
         pid = self._server.process.pid if self._server.process is not None else None

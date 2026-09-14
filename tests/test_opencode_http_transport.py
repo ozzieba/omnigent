@@ -7,8 +7,10 @@ opencode-native HTTP/SSE wire surface stays covered without a live server.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -65,6 +67,32 @@ def test_build_prompt_payload_image_and_file_attachments() -> None:
 
 
 # ── transport methods over a fake client ────────────────────────────────────
+
+
+async def test_start_server_passes_child_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import omnigent.opencode_http_transport as transport_module
+
+    child = "22222222222222222222222222222222"
+    captured: dict[str, object] = {}
+
+    def make_server(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            start=AsyncMock(),
+            process=None,
+            base_url="http://127.0.0.1:49231",
+            env={},
+            bridge_dir=tmp_path,
+        )
+
+    monkeypatch.setattr(transport_module, "OpenCodeNativeServer", make_server)
+    transport = OpenCodeHttpTransport(bridge_dir=tmp_path)
+    await transport.start_server(
+        NativeLaunchConfig(omnigent_session_id=child, workspace=str(tmp_path))
+    )
+    assert captured["session_id"] == child
 
 
 class _FakeClient:

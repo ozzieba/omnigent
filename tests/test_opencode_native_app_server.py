@@ -203,11 +203,89 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert server.process.pid == 4242
 
 
+async def test_start_scopes_preflight_and_serve_to_child_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parent = "11111111111111111111111111111111"
+    child = "22222222222222222222222222222222"
+    identity_keys = (
+        "OMNIGENT_RUNNER_PRIMARY_SESSION_ID",
+        "HARNESS_OPENCODE_NATIVE_REQUEST_SESSION_ID",
+    )
+    for key in identity_keys:
+        monkeypatch.setenv(key, parent)
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", ",".join(identity_keys))
+    monkeypatch.setattr(appsrv.shutil, "which", lambda _name: "/usr/bin/opencode")
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        session_id=child,
+        port=49231,
+    )
+    launch_envs: list[dict[str, str]] = []
+    leases = {parent: "codex"}
+
+    def admit(env: dict[str, str]) -> None:
+        # A wrapper must see a real child lease, never the parent or no identity.
+        assert {env[key] for key in identity_keys} == {child}
+        assert leases.get(child) in (None, "opencode")
+        leases[child] = "opencode"
+        launch_envs.append(env)
+
+    def fake_version(argv, *, env, **_kwargs):  # type: ignore[no-untyped-def]
+        assert argv == ["/usr/bin/opencode", "--version"]
+        admit(env)
+        del leases[child]
+        return appsrv.subprocess.CompletedProcess(argv, 0, stdout="1.18.16", stderr="")
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(argv, *, env, **_kwargs):  # type: ignore[no-untyped-def]
+        assert argv[1] == "serve"
+        admit(env)
+        return FakeProc()
+
+    async def fake_wait(_self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(appsrv.subprocess, "run", fake_version)
+    monkeypatch.setattr(appsrv.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+
+    await server.start()
+
+    assert len(launch_envs) == 2
+    assert launch_envs[0] is launch_envs[1]
+    assert leases == {parent: "codex", child: "opencode"}
+
+
+async def test_start_stops_when_version_preflight_is_denied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(appsrv.shutil, "which", lambda _name: "/usr/bin/opencode")
+    server = OpenCodeNativeServer(bridge_dir=tmp_path, workspace=tmp_path)
+    monkeypatch.setattr(
+        appsrv.subprocess,
+        "run",
+        lambda argv, **_kwargs: appsrv.subprocess.CompletedProcess(
+            argv, 75, stdout="1.18.16", stderr="native launch denied"
+        ),
+    )
+
+    def unexpected_launch(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("serve must not launch after a denied version preflight")
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", unexpected_launch)
+    with pytest.raises(OpenCodeVersionError, match="exit 75"):
+        await server.start()
+
+
 async def test_start_raises_on_unsupported_version_without_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path, **_kwargs: "1.19.0")
     monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
@@ -235,7 +313,7 @@ async def test_start_skips_version_gate_when_env_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path, **_kwargs: "1.19.0")
     monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", "1")
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
