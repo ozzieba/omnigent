@@ -221,6 +221,8 @@ _MODEL_PICKER_OPEN_HINT = "use this session only"
 # accepted rather than confirmation-gated.
 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
+# Bound whole-draft stashing and the subsequent empty-composer verification.
+_INPUT_CLEAR_TIMEOUT_S = 5.0
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -3174,15 +3176,7 @@ def inject_user_message(
         info["tmux_target"],
         timeout_s=timeout_s,
     )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
+    _clear_input_draft(info["socket_path"], info["tmux_target"])
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
     # that Omnigent cannot drive. Allowed commands (``/clear``,
@@ -3242,6 +3236,13 @@ def inject_user_message(
             # The draft position cannot be confirmed, so fall through to a
             # best-effort blind submit rather than hard-failing.
             time.sleep(_PASTE_SETTLE_S)
+            if (
+                _composer_input_text(_capture_pane(info["socket_path"], info["tmux_target"]))
+                is None
+            ):
+                raise RuntimeError(
+                    "Claude's input box is no longer visible; message was not submitted."
+                )
             _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
             return
         raise RuntimeError(
@@ -3250,6 +3251,10 @@ def inject_user_message(
             "consuming the paste — the message was not submitted. Retry the send."
         )
     time.sleep(_PASTE_SETTLE_S)
+    if not _draft_in_input_box(_capture_pane(info["socket_path"], info["tmux_target"]), needle):
+        raise RuntimeError(
+            "Claude's pasted draft is no longer visible; message was not submitted."
+        )
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
@@ -4165,32 +4170,61 @@ def _submit_needle(content: str) -> str:
     return ""
 
 
+def _composer_input_text(pane: str) -> str | None:
+    """Read every row of a fully framed chat composer; unknown is not empty."""
+    lines = pane.splitlines()
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    if len(rules) < 2 or not _claude_prompt_rendered(pane):
+        return None
+    opening, closing = rules[-2:]
+    if opening + 1 >= closing:
+        return None
+    first = lines[opening + 1].lstrip()
+    if not first.startswith(_CLAUDE_PROMPT_GLYPH):
+        return None
+    footer = "\n".join(lines[closing + 1 :])
+    if any(hint in pane for hint in (*_CONFIRM_DIALOG_HINTS, _MODEL_PICKER_OPEN_HINT)):
+        return None
+    if any(hint in footer for hint in _FOREIGN_DIALOG_HINTS):
+        return None
+    if "esc to cancel" in footer.lower() or "escape to cancel" in footer.lower():
+        return None
+    return "\n".join([first[len(_CLAUDE_PROMPT_GLYPH) :], *lines[opening + 2 : closing]])
+
+
+def _clear_input_draft(socket_path: str, tmux_target: str) -> None:
+    """Stash one stable occupied draft, then verify the entire composer is empty.
+
+    Ctrl-A/Ctrl-K clear only the current logical line. Ctrl-S stashes the whole
+    draft without interrupting an active turn, but restores it on empty input,
+    so it is sent at most once and only after two identical occupied captures.
+    """
+    deadline = time.monotonic() + _INPUT_CLEAR_TIMEOUT_S
+    previous: str | None = None
+    stashed = False
+    while time.monotonic() < deadline:
+        text = _composer_input_text(_capture_pane(socket_path, tmux_target))
+        if text is not None and text == previous:
+            if not text.strip():
+                return
+            if not stashed:
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
+                stashed = True
+                text = None
+        previous = text
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    raise RuntimeError(
+        "Claude's complete input box could not be confirmed empty; "
+        "the message was not pasted or submitted."
+    )
+
+
 def _draft_in_input_box(pane: str, needle: str) -> bool:
-    """
-    Return whether the pasted draft is visible in Claude's input box.
-
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: Marker from :func:`_submit_needle`, e.g.
-        ``"fix the bug"``. Empty means the draft can't be identified;
-        only the paste placeholder is then considered.
-    :returns: ``True`` when the draft is still sitting in the input box.
-    """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
+    """Match a draft only inside the complete composer, including continuation rows."""
+    text = _composer_input_text(pane)
+    if text is None:
         return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
-        return True
-    return bool(needle) and needle in tail
+    return _PASTED_PLACEHOLDER_PREFIX in text or (bool(needle) and needle in text)
 
 
 def _format_terminal_failure_tail(pane: str) -> str:

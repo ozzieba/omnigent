@@ -3390,14 +3390,11 @@ def test_inject_user_message_pastes_content_then_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content=content)
 
-    # C-a, C-k (clear), load-buffer, paste-buffer, Enter — fewer than 5
-    # means a delivery step was dropped.
-    assert len(captured) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), got {len(captured)}."
+    # An empty composer needs no editing keystrokes before the paste.
+    assert len(captured) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(captured)}."
     )
-    clear_home, clear_kill, load, paste, submit = captured
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    load, paste, submit = captured
     # The buffer file carried the normalized content + trailing CR. A
     # missing trailing CR is the trailing-CR regression; a newline that stayed
     # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
@@ -3628,19 +3625,15 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content="hello")
 
-    # Gate polled until the third capture (prompt present), then the
-    # five delivery calls (C-a, C-k, load-buffer, paste-buffer, Enter)
-    # fired.
+    # Gate polled until the prompt rendered, then verified empty input
+    # before the three delivery calls.
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
+    assert len(send_keys) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(send_keys)}."
     )
-    clear_home, clear_kill, load, paste, submit = send_keys
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    load, paste, submit = send_keys
     # The paste fires after the gate via the buffer path. The exact
     # payload/flag assertions live in the dedicated paste test; here the
     # gate ordering is the claim.
@@ -8458,10 +8451,14 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     inject_user_message(bridge_dir, content="restore my composer")
 
     tails = [cmd[-1] for cmd in captured]
-    # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "C-a", "C-k"], (
-        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
-    )
+    # Escape dismisses the surface before pasting into the verified empty box.
+    assert tails[0] == "Escape"
+    assert [cmd[3] for cmd in captured] == [
+        "send-keys",
+        "load-buffer",
+        "paste-buffer",
+        "send-keys",
+    ]
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
     assert tails[-1] == "Enter"
 
