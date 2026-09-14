@@ -1041,6 +1041,8 @@ async def _send_hello(
         travels only alongside *direct_attach_port*.
     :returns: None.
     """
+    from omnigent.build_receipt import captured_build_receipt
+
     # Signal host-side telemetry opt-out to the server so it can honour
     # it on a best-effort basis when emitting session events.
     _tel_opt_out = False
@@ -1059,6 +1061,7 @@ async def _send_hello(
                 telemetry_opt_out=_tel_opt_out,
                 direct_attach_port=direct_attach_port,
                 direct_attach_token=direct_attach_token,
+                captured_build=captured_build_receipt(),
                 harnesses=[
                     "claude-native",
                     "claude-sdk",

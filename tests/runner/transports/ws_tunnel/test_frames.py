@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+from omnigent.build_receipt import captured_build_receipt
 from omnigent.runner.transports.ws_tunnel.frames import (
     FrameKind,
     HelloFrame,
@@ -46,6 +47,24 @@ def test_hello_round_trip() -> None:
     assert decoded.envs == ["os_sandbox"]
     assert decoded.direct_attach_port is None
     assert decoded.direct_attach_token is None
+    assert decoded.captured_build is None
+
+
+def test_hello_round_trip_with_captured_build() -> None:
+    receipt = captured_build_receipt()
+    frame = HelloFrame(runner_version="0.1.2", frame_protocol_version=1, captured_build=receipt)
+    decoded = decode_frame(encode_frame(frame))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.captured_build == receipt
+
+
+def test_optional_build_receipt_keeps_old_and_malformed_hellos_compatible() -> None:
+    wire = json.loads(encode_frame(HelloFrame(runner_version="0.1.2", frame_protocol_version=1)))
+    assert "captured_build" not in wire
+    wire["captured_build"] = {"schema_version": "unknown", "ignored": "never reflected"}
+    decoded = decode_frame(json.dumps(wire))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.captured_build is None
 
 
 def test_hello_round_trip_with_direct_attach_advert() -> None:

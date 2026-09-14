@@ -19,6 +19,7 @@ from websockets.exceptions import (
 )
 from websockets.http11 import Response
 
+from omnigent import build_receipt
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -41,6 +42,25 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     _websocket_http_status,
     serve_tunnel,
 )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_hello_uses_retained_build_without_recapturing(monkeypatch) -> None:
+    import json
+
+    expected = build_receipt.captured_build_receipt().to_wire()
+    sent = []
+
+    def unexpected_capture():
+        raise AssertionError("reconnect must not read the installed build")
+
+    async def send_text(text):
+        sent.append(json.loads(text))
+
+    monkeypatch.setattr(build_receipt, "_capture", unexpected_capture)
+    await serve_module._send_hello(send_text, "0.1.0-test")
+    await serve_module._send_hello(send_text, "0.1.0-test")
+    assert [hello["captured_build"] for hello in sent] == [expected, expected]
 
 
 @dataclass

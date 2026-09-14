@@ -252,7 +252,7 @@ def create_runner_tunnel_router(
         return {"data": data}
 
     @router.get("/runners/{runner_id}/status")
-    async def runner_status(request: Request, runner_id: str) -> dict[str, str | bool]:
+    async def runner_status(request: Request, runner_id: str) -> dict[str, object]:
         """Return whether a runner currently has an open tunnel.
 
         When auth is active, a runner owned by a different user
@@ -261,7 +261,8 @@ def create_runner_tunnel_router(
         :param request: The incoming FastAPI request (for auth).
         :param runner_id: Stable runner id, e.g.
             ``"runner_0123456789abcdef"``.
-        :returns: A JSON object with ``runner_id`` and ``online``.
+        :returns: ``runner_id``, ``online``, and an optional ``captured_build``
+            stamp from the visible runner's latest hello frame.
         """
         user_id = _get_user_id_from_request(request)
         session = registry.get(runner_id)
@@ -274,7 +275,9 @@ def create_runner_tunnel_router(
             and session.owner != user_id
         ):
             online = False
-        result: dict[str, str | bool] = {"runner_id": runner_id, "online": online}
+        result: dict[str, object] = {"runner_id": runner_id, "online": online}
+        if online and session is not None and session.hello.captured_build is not None:
+            result["captured_build"] = session.hello.captured_build.to_wire()
         if not online and runner_exit_reports is not None:
             # Host-daemon report that the runner process died (exit code
             # + log tail). Owner-scoped inside get_visible, so other

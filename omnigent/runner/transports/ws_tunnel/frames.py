@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import cast
 
+from omnigent.build_receipt import BuildReceipt
 from omnigent.json_types import JsonObject as _JsonObject
 
 
@@ -71,6 +72,8 @@ class HelloFrame:
     :param direct_attach_token: Per-process bearer token guarding the
         direct-attach listener. Only meaningful alongside
         *direct_attach_port*; both travel together or not at all.
+    :param captured_build: Optional import-time build stamp retained by this
+        process, possibly inherited from a zygote. Not a code attestation.
     """
 
     runner_version: str
@@ -80,6 +83,7 @@ class HelloFrame:
     telemetry_opt_out: bool = False
     direct_attach_port: int | None = None
     direct_attach_token: str | None = None
+    captured_build: BuildReceipt | None = None
 
 
 @dataclass
@@ -224,6 +228,8 @@ def encode_frame(frame: Frame) -> str:
         if frame.direct_attach_port is not None and frame.direct_attach_token:
             payload["direct_attach_port"] = frame.direct_attach_port
             payload["direct_attach_token"] = frame.direct_attach_token
+        if frame.captured_build is not None:
+            payload["captured_build"] = frame.captured_build.to_wire()
         return json.dumps(payload)
     if isinstance(frame, RequestFrame):
         return json.dumps(
@@ -406,6 +412,7 @@ def _decode_hello(msg: _JsonObject) -> HelloFrame:
         telemetry_opt_out=_optional_bool(msg, "telemetry_opt_out", False),
         direct_attach_port=direct_port,
         direct_attach_token=direct_token,
+        captured_build=BuildReceipt.from_wire(msg.get("captured_build")),
     )
 
 
