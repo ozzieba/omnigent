@@ -1592,13 +1592,15 @@ class SessionCreateMetadata(BaseModel):
     Metadata JSON part for multipart ``POST /v1/sessions``.
 
     The uploaded agent tarball supplies the agent spec. This JSON
-    part carries only session-level metadata so request metadata
-    cannot disagree with the agent bundle.
+    part carries session-level metadata, including an optional model
+    selection that takes precedence over the agent's default.
 
     :param title: Optional human-readable title for the session,
         e.g. ``"debugging auth flow"``.
     :param labels: Initial guardrails labels to set on the
         session. Empty dict (the default) starts with no labels.
+    :param model_override: Optional per-session model selection.
+        ``None`` keeps the agent default; validated before persistence.
     :param reasoning_effort: Optional per-session reasoning-effort
         hint. Accepted metadata values are ``"none"``,
         ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``,
@@ -1644,6 +1646,7 @@ class SessionCreateMetadata(BaseModel):
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
+    model_override: str | None = None
     reasoning_effort: str | None = None
     host_id: str | None = None
     workspace: str | None = None
