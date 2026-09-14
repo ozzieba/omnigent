@@ -122,15 +122,24 @@ rewrite case has the baseline filesystem limitation described above.
 
 This prototype does not build wheels, enforce immutable deployment, hash all
 loaded code, change the host daemon API, or publish SDK/UI conveniences. It
-cannot detect an unstamped patch solely from the new receipt. Before publishing
-this as a release feature, add the repository-required happy-path e2e coverage
-at the artifact/managed-runner boundary and qualify the upgraded server and
-runner together; the bounded prototype's API test uses an in-process ASGI server.
+cannot detect an unstamped patch solely from the new receipt.
+
+The happy-path e2e packages the real Python modules into temporary source
+archives A/B and installs them into an isolated directory. A fixture-managed
+runner subprocess imports the production entrypoint and serves the production
+tunnel. The production server route receives its hello over a real loopback
+WebSocket and exposes the receipt over HTTP. After installing B, A's running
+process keeps its receipt; a fresh child reports B. No session, native harness,
+provider, MCP client or real host daemon is started, and subprocesses receive
+an isolated allowlisted environment. This covers the artifact-to-process-to-
+status metadata path, not wheel construction or fleet supervision. Actual
+wheel/manifest integration and owner-qualified fleet adoption remain separate.
 
 To reproduce the bounded checks in an isolated development environment:
 
 ```sh
 uv run --no-sync pytest -q tests/runner/test_build_receipt.py tests/runner/transports/ws_tunnel/test_frames.py tests/runner/transports/ws_tunnel/test_serve.py tests/server/integration/test_runner_tunnel_route.py tests/host/test_runner_zygote.py
+uv run --no-sync pytest -q tests/e2e/test_captured_build_receipt_e2e.py
 uv run --no-sync pyrefly check
 ```
 
