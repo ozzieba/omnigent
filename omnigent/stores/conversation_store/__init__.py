@@ -1496,6 +1496,7 @@ class ConversationStore(ABC):
         agent_description: str | None,
         title: str | None = None,
         labels: dict[str, str] | None = None,
+        model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
@@ -1522,6 +1523,8 @@ class ConversationStore(ABC):
             ``"debugging auth flow"``.
         :param labels: Optional initial guardrails labels,
             e.g. ``{"env": "test"}``. ``None`` writes no labels.
+        :param model_override: Optional per-session model selection.
+            ``None`` keeps the agent default.
         :param reasoning_effort: Optional per-session
             reasoning-effort hint, e.g. ``"high"``. ``None``
             means use the agent default.

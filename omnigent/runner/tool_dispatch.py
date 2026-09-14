@@ -3083,8 +3083,8 @@ async def _execute_session_create(
             }
         )
     if has_config_path:
-        # The multipart create carries only the config bundle, so an effort
-        # passed here would never reach the child. Refuse instead of dropping it.
+        # Bundle-mode effort is configured in the uploaded spec. Refuse a
+        # tool-level override instead of silently dropping it.
         if args.get("reasoning_effort") is not None:
             return json.dumps(
                 {
@@ -3250,7 +3250,7 @@ async def _upload_config_bundle(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title``.
+    :param args: Parsed tool arguments; optional ``title`` and ``model``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param agent_spec: The calling agent's spec, for os_env resolution.
@@ -3277,6 +3277,9 @@ async def _upload_config_bundle(
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
+    model = args.get("model")
+    if model is not None:
+        metadata["model_override"] = model
     try:
         resp = await server_client.post(
             "/v1/sessions",
@@ -3318,8 +3321,8 @@ async def _session_create_from_config_path(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title`` /
-        ``message``.
+    :param args: Parsed tool arguments; optional ``title``, ``message``,
+        and ``model``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param publish_event: SSE publish callback for ``session.created``.

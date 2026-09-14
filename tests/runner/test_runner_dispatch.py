@@ -7240,8 +7240,10 @@ def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "openrouter/example/tool-model"])
 async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     tmp_path: Path,
+    model: str | None,
 ) -> None:
     """
     Bundle mode bundles a local agent config, POSTs the multipart
@@ -7288,7 +7290,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         output = await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+                {"config_path": "helper.yaml", "title": "auth", "message": "start", "model": model}
             ),
             server_client=server_client,
             conversation_id="conv_caller",
@@ -7301,7 +7303,10 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    expected_metadata = {"parent_session_id": "conv_caller", "title": "auth"}
+    if model is not None:
+        expected_metadata["model_override"] = model
+    assert parts["metadata"] == expected_metadata
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.
