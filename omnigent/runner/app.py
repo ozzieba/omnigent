@@ -5850,6 +5850,15 @@ def create_runner_app(
             await client.aclose()
         return Response(status_code=200)
 
+    async def _merge_llmq_into_opencode_options(rows: list[_JsonObject]) -> list[_JsonObject]:
+        """Best-effort llmq price enrichment for OpenCode picker rows."""
+        try:
+            from omnigent.opencode_llmq_catalog import merge_llmq_pricing
+
+            return await asyncio.to_thread(merge_llmq_pricing, rows)
+        except Exception:  # noqa: BLE001 - unpriced rows beat a broken picker
+            return rows
+
     async def _opencode_native_model_options(conv_id: str) -> list[_JsonObject]:
         from omnigent.opencode_native_app_server import (
             filtered_server_env,
@@ -5868,7 +5877,8 @@ def create_runner_app(
             auth_secret=state.auth_secret or "",
         )
         try:
-            return await asyncio.to_thread(list_opencode_cli_model_options, env=cli_env)
+            cli_rows = await asyncio.to_thread(list_opencode_cli_model_options, env=cli_env)
+            return await _merge_llmq_into_opencode_options(cli_rows)
         except Exception as exc:  # noqa: BLE001 - fall back to the server catalog.
             _logger.debug(
                 "OpenCode CLI model list failed for %s: %r",
@@ -5882,9 +5892,10 @@ def create_runner_app(
             headers=state.auth_headers(),
         )
         try:
-            return await client.list_models()
+            server_rows = await client.list_models()
         finally:
             await client.aclose()
+        return await _merge_llmq_into_opencode_options(server_rows)
 
     async def _handle_opencode_native_model_change(conv_id: str, model: str | None) -> Response:
         from omnigent.opencode_native_bridge import (

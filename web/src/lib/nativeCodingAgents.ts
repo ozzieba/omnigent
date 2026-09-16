@@ -77,16 +77,13 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "OpenCode",
     iconKind: "opencode",
     sortRank: 25,
-    // No capabilities → no permission picker. OpenCode has no claude-style
-    // permission-mode surface to mirror: its native modes are the `build`
-    // (allow-by-default) and `plan` primary agents, switched at runtime via Tab
-    // inside the TUI — and `opencode attach` (how the runner launches it) has
-    // no `--agent` flag to preset one anyway. The runner already forces
-    // `permission: "ask"` so tools route through the Omnigent policy engine, so
-    // a launch-time picker would mirror nothing. (Previously declared Codex's
-    // `approvalMode`, whose `--sandbox`/`--ask-for-approval` presets aren't
-    // understood by `opencode attach` and crashed the TUI on any non-default
-    // pick.)
+    capabilities: ["modelPicker"],
+    // OpenCode gets a pre-launch Model knob: the host resolves the catalog
+    // (ambient `opencode models` CLI rows enriched with llmq-routed
+    // opencode-go models + per-million prices) and a pick rides the create
+    // call as `model_override`, exactly like codex/kiro launch-only picks.
+    // Its in-session picker already mirrors the live TUI model; this only
+    // adds the before-launch selection.
   },
   {
     key: "cursor",
