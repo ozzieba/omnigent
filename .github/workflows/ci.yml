@@ -167,6 +167,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          uv-version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Install ripgrep + bubblewrap + tmux
@@ -264,6 +268,8 @@ jobs:
           python-version-file: ".python-version"
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
         with:
+          uv-version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
       - name: Install dependencies
         run: uv sync --locked --extra all --group test --extra databricks
@@ -310,6 +316,8 @@ jobs:
           python-version-file: ".python-version"
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
         with:
+          uv-version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
       - name: Install system MySQL client library
         run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
@@ -350,6 +358,8 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
+          uv-version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Set up Rust toolchain
