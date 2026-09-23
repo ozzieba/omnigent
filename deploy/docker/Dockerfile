@@ -211,8 +211,14 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       git tmux procps lsof bubblewrap curl ca-certificates unzip \
+      jq sqlite3 \
       iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
+
+# The builder installs uv for project builds; ship it in the runtime sandbox
+# as well so agents can manage isolated Python tools and project environments.
+COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
+COPY --from=builder /usr/local/bin/uvx /usr/local/bin/uvx
 
 # OpenShell-required non-root user (see the header note). UID/GID in the high
 # range per OpenShell's bring-your-own-container guidance, so that without

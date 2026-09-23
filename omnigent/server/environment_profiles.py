@@ -107,7 +107,7 @@ WORKSPACE_READONLY = EnvironmentProfile(
             id="agent.environment-catalog",
             name="Environment capability catalog",
             state="available",
-            interfaces=("resources/catalog.json", "jq", "sys_session_get_info"),
+            interfaces=("resources/catalog.json", "sys_session_get_info"),
             access="read-only",
             authorization_owner="platform",
             reason=(
@@ -322,7 +322,8 @@ def environment_profile_agent_guide(
     if catalog_path is not None:
         lines.append(
             "A read-only JSON capability catalog is mounted at "
-            f"`{catalog_path}`; query it with `jq` or read it with `sys_os_read`. "
+            f"`{catalog_path}`; query it with `jq` when installed in the selected runner, "
+            "or read it with `sys_os_read`. "
             "It describes grants but does not grant them."
         )
     for capability in profile.capabilities:

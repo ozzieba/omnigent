@@ -54,6 +54,12 @@ access. These generated files are outside the user's workspace and are
 recreated when the runner reinitializes the session; they are not portable
 workspace state.
 
+The default Omnigent managed-host container includes `uv`/`uvx` for isolated
+Python tooling, `jq` for JSON catalogs, and `sqlite3` for local structured data.
+Custom runner images must provide their own equivalent tools; the profile
+catalog does not imply that a particular binary is installed. `sys_os_read`
+remains the portable way to inspect the generated catalog.
+
 ## Adding a profile revision
 
 Add a new revision rather than changing the meaning of a published reference.
