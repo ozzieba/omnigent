@@ -1065,6 +1065,14 @@ class SqlConversationItem(ConversationBase):
             "native_turn_id",
             "native_item_id",
             unique=True,
+            postgresql_where=text(
+                "native_thread_id IS NOT NULL AND native_turn_id IS NOT NULL "
+                "AND native_item_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "native_thread_id IS NOT NULL AND native_turn_id IS NOT NULL "
+                "AND native_item_id IS NOT NULL"
+            ),
         ),
         # Latest-message previews scan one type per conversation ordered by
         # position DESC (list_latest_message_items_for_conversations). Ordering

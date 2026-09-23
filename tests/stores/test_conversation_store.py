@@ -5983,7 +5983,15 @@ def test_native_provenance_is_idempotent_and_does_not_use_text_as_key(
     assert append("item-1").id == first.id
     assert append("item-2").id != first.id
 
+    # Older forwarders omit provenance; multiple NULL-key rows remain valid.
+    legacy = NewConversationItem(
+        type="message",
+        response_id="legacy",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "yes"}]),
+    )
+    assert len(conversation_store.append(conv.id, [legacy, legacy])) == 2
+
     with ThreadPoolExecutor(max_workers=8) as pool:
         concurrent = list(pool.map(lambda _: append("item-3"), range(8)))
     assert len({item.id for item in concurrent}) == 1
-    assert len(conversation_store.list_items(conv.id).data) == 3
+    assert len(conversation_store.list_items(conv.id).data) == 5
