@@ -3875,12 +3875,13 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
   }
 
-  it("hides 'Create custom agent' on a sandbox", async () => {
+  it("shows 'Create custom agent' on a managed sandbox", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
     await selectSandbox();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // The item is omitted entirely on a sandbox target.
-    expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
+    const createItem = screen.getByTestId("new-chat-landing-create-agent");
+    fireEvent.click(createItem);
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
   });
 
   it("shows 'Create custom agent' on a host and opens the dialog", async () => {
@@ -3940,21 +3941,20 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
   }
 
-  it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
+  it("keeps a selected pending custom agent when the target switches to a sandbox", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
     await createAndSelectPendingAgentOnHost();
-    // Switch back to the sandbox: the pending pick can't run there, so the
-    // selection falls back to a real agent and the pending row disappears.
+    // A pending bundle agent is valid on both an external host and a managed
+    // sandbox, so changing the target keeps it selected.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
     );
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
-      "my-agent",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent");
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    expect(screen.getByTestId("new-chat-landing-agent-pending")).toBeTruthy();
   });
 });
 

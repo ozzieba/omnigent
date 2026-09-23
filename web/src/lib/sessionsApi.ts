@@ -655,7 +655,7 @@ async function importLocalSessionsBuffered(
  * in the `metadata` form part.
  *
  * @param bundle - The agent bundle as a `File` (`.tar.gz`).
- * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
+ * @param metadata - Session-level metadata (host type/provider, workspace, labels, etc.).
  *   A `project_id` files the session into that project atomically at create
  *   and lets the server default-fill absent fields from the project config.
  * @returns The created session's id, plus any non-fatal project-consistency
@@ -665,8 +665,9 @@ export async function createBundledSession(
   bundle: File,
   metadata: {
     host_id?: string;
-    host_type?: string;
-    workspace?: string;
+    host_type?: "external" | "managed";
+    sandbox_provider?: string;
+    workspace?: string | null;
     project_id?: string;
     labels?: Record<string, string>;
     terminal_launch_args?: string[];

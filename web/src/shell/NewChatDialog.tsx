@@ -894,6 +894,7 @@ export function AgentHarnessPicker({
   onSelectPending,
   onCreateCustomAgent,
   sandboxSelected,
+  managedSandboxSupportsBundles = false,
   allowCreateCustomAgent = true,
   onOpenChange,
   dropdownModal = true,
@@ -918,6 +919,8 @@ export function AgentHarnessPicker({
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
   sandboxSelected: boolean;
+  /** Whether managed sandboxes support sessions from uploaded agent bundles. */
+  managedSandboxSupportsBundles?: boolean;
   /** Whether to offer the "Create custom agent" action. Defaults true; an
    *  embedder that only picks an existing agent (e.g. project settings) can
    *  hide it since it has no interactive create flow. */
@@ -1066,10 +1069,10 @@ export function AgentHarnessPicker({
   // instead (see below). The submenu therefore renders only when there is at
   // least one custom / pending agent to group.
   const hasCustomAgents = customEntries.length > 0 || pendingAgent != null;
-  // "Create custom agent" is reachable on any non-sandbox target (a managed
-  // sandbox has no create path for an uploaded bundle), unless the embedder
-  // opts out (it has no create flow to route the action to).
-  const canCreateAgent = !sandboxSelected && allowCreateCustomAgent;
+  // Bundled agents can be created on external hosts everywhere, and on managed
+  // sandboxes only when this deployment supports that create path.
+  const canCreateAgent =
+    allowCreateCustomAgent && (!sandboxSelected || managedSandboxSupportsBundles);
   const createAgentItem = canCreateAgent ? (
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
@@ -2972,12 +2975,9 @@ export function NewChatLandingScreen() {
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
-  // The pending custom agent sentinel also wins when set.
-  // A pending (just-created, not-yet-submitted) custom agent can't run on a
-  // managed sandbox — the sandbox create path doesn't provision a runner for a
-  // bundled agent. So a pending pick made before switching to a sandbox is
-  // dropped there, falling back to a real agent; off the sandbox it's kept.
-  const pendingAgentAllowedOnTarget = !sandboxSelected;
+  // The pending custom agent sentinel also wins when set. Multipart bundle
+  // creation supports managed launches when this deployment offers sandboxes.
+  const pendingAgentAllowedOnTarget = !sandboxSelected || managedSandboxesEnabled;
   // The project's configured agent could not be resolved: the catalog, the
   // session scan, AND the pinned direct lookup all came up empty (deleted
   // agent, or one the caller can't read). Never substitute another agent for
@@ -2989,7 +2989,7 @@ export function NewChatLandingScreen() {
     agents !== undefined &&
     !agentList.some((a) => a.id === prefillConfig.agentId);
   const effectiveAgentId =
-    pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
+    pickedAgentId === PENDING_AGENT_ID && pendingAgent && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
         ? pickedAgentId
@@ -4313,18 +4313,25 @@ export function NewChatLandingScreen() {
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
         // Custom agent path: build bundle client-side and use multipart POST.
-        // The multipart create only stores the agent + session rows — it does
-        // NOT launch a runner on the host. We must follow up with launchRunner
-        // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
-        // same way the fork-resume path does.
+        // The server launches managed sandboxes for multipart creates too;
+        // external hosts still need the explicit runner bind below.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = {};
         if (pendingAgent.environmentProfile) {
           metadata.environment_profile = pendingAgent.environmentProfile;
         }
-        // A config-seeded workspace is omitted on a `project_id` create so the
-        // server default-fills it (same field semantics as the JSON path).
-        if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
+        if (sandboxSelected) {
+          metadata.host_type = "managed";
+          if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
+          // A managed sandbox clones a repository URL rather than using the
+          // external host's filesystem path. Pin null on a project create so
+          // the server does not default-fill a path from the project config.
+          metadata.workspace =
+            composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ??
+            (createProjectId !== null ? null : undefined);
+        } else if (workspaceTrimmed && !workspaceFromProjectConfig) {
+          metadata.workspace = workspaceTrimmed;
+        }
         if (createProjectId !== null) {
           // Atomic filing: the server sets first-class `project_id` at create.
           metadata.project_id = createProjectId;
@@ -5066,6 +5073,7 @@ export function NewChatLandingScreen() {
                     onSelectPending={handleSelectPending}
                     onCreateCustomAgent={() => setCreateAgentOpen(true)}
                     sandboxSelected={sandboxSelected}
+                    managedSandboxSupportsBundles={managedSandboxesEnabled}
                     triggerTooltip={
                       smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
                     }
