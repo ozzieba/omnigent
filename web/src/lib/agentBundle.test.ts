@@ -75,6 +75,47 @@ async function extractAgentsMd(file: File): Promise<string | null> {
 }
 
 describe("buildAgentBundle", () => {
+  it("uses the catalog read-only policy for any profile reference", async () => {
+    const yaml = await extractConfigYaml(
+      await buildAgentBundle({
+        name: "catalog-agent",
+        harness: "claude-sdk",
+        model: "claude-sonnet-4-20250514",
+        environmentProfile: "team-python@42",
+        environmentWorkspaceAccess: "read-only",
+      }),
+    );
+
+    expect(yaml).toContain('environment_profile: "team-python@42"');
+    expect(yaml).toContain('    write_paths: []');
+  });
+
+  it("uses the catalog read-write policy for any profile reference", async () => {
+    const yaml = await extractConfigYaml(
+      await buildAgentBundle({
+        name: "catalog-agent",
+        harness: "claude-sdk",
+        model: "claude-sonnet-4-20250514",
+        environmentProfile: "team-python@42",
+        environmentWorkspaceAccess: "read-write",
+      }),
+    );
+
+    expect(yaml).toContain('environment_profile: "team-python@42"');
+    expect(yaml).toContain('    write_paths: ["."]');
+  });
+
+  it("rejects a profile reference without its catalog workspace policy", async () => {
+    await expect(
+      buildAgentBundle({
+        name: "catalog-agent",
+        harness: "claude-sdk",
+        model: "claude-sonnet-4-20250514",
+        environmentProfile: "team-python@42",
+      }),
+    ).rejects.toThrow("The selected environment profile has no workspace access policy.");
+  });
+
   it("produces a tar.gz file with correct config.yaml for minimal input", async () => {
     const input: AgentBundleInput = {
       name: "test-agent",
