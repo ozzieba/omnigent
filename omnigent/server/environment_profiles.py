@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
-
 CapabilityState = Literal["available", "unavailable", "denied", "requestable"]
 
 
@@ -160,7 +159,8 @@ WORKSPACE_EDITABLE = replace(
     name="Editable workspace",
     description=(
         "Expose the session workspace with read-write access and a generated AGENTS.md "
-        "environment guide plus machine-readable capability catalog. No host mounts or credentials."
+        "environment guide plus machine-readable capability catalog. "
+        "No host mounts or credentials."
     ),
     access="read-write workspace only",
     capabilities=tuple(
@@ -213,20 +213,23 @@ WORKSPACE_READONLY_V2 = replace(
         "Omnigent session and agent-context discovery APIs are available; no host "
         "mounts or credentials are provided."
     ),
-    capabilities=tuple(
-        replace(
-            capability,
-            name="External service adapters",
-            reason=(
-                "No filesystem or SQL adapters are configured for Git hosting, databases, "
-                "Mattermost, wikis, or other external service catalogs."
-            ),
-        )
-        if capability.id == "service.catalogs"
-        else capability
-        for capability in WORKSPACE_READONLY.capabilities
-    )
-    + (OMNIGENT_SESSION_DISCOVERY, OMNIGENT_AGENT_CONTEXTS),
+    capabilities=(
+        *(
+            replace(
+                capability,
+                name="External service adapters",
+                reason=(
+                    "No filesystem or SQL adapters are configured for Git hosting, databases, "
+                    "Mattermost, wikis, or other external service catalogs."
+                ),
+            )
+            if capability.id == "service.catalogs"
+            else capability
+            for capability in WORKSPACE_READONLY.capabilities
+        ),
+        OMNIGENT_SESSION_DISCOVERY,
+        OMNIGENT_AGENT_CONTEXTS,
+    ),
 )
 
 WORKSPACE_EDITABLE_V2 = replace(
@@ -237,20 +240,23 @@ WORKSPACE_EDITABLE_V2 = replace(
         "guide/catalog. Omnigent session and agent-context discovery APIs are available; "
         "no host mounts or credentials are provided."
     ),
-    capabilities=tuple(
-        replace(
-            capability,
-            name="External service adapters",
-            reason=(
-                "No filesystem or SQL adapters are configured for Git hosting, databases, "
-                "Mattermost, wikis, or other external service catalogs."
-            ),
-        )
-        if capability.id == "service.catalogs"
-        else capability
-        for capability in WORKSPACE_EDITABLE.capabilities
-    )
-    + (OMNIGENT_SESSION_DISCOVERY, OMNIGENT_AGENT_CONTEXTS),
+    capabilities=(
+        *(
+            replace(
+                capability,
+                name="External service adapters",
+                reason=(
+                    "No filesystem or SQL adapters are configured for Git hosting, databases, "
+                    "Mattermost, wikis, or other external service catalogs."
+                ),
+            )
+            if capability.id == "service.catalogs"
+            else capability
+            for capability in WORKSPACE_EDITABLE.capabilities
+        ),
+        OMNIGENT_SESSION_DISCOVERY,
+        OMNIGENT_AGENT_CONTEXTS,
+    ),
 )
 
 _PROFILES = {

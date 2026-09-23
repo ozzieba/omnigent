@@ -2207,16 +2207,20 @@ async def _execute_subagent_tool(
     # list when it starts the child turn.
     # Try runner-local cache first, then fall back to server query.
     parent_agent_id = _runner_app.get_session_agent_id(conversation_id)
-    if parent_agent_id is None:
-        try:
-            sess_resp = await server_client.get(
-                f"/v1/sessions/{conversation_id}",
-                timeout=10.0,
-            )
-            if sess_resp.status_code == 200:
-                parent_agent_id = sess_resp.json().get("agent_id")
-        except (httpx.HTTPError, RuntimeError):
-            pass
+    parent_profile: str | None = None
+    try:
+        sess_resp = await server_client.get(
+            f"/v1/sessions/{conversation_id}",
+            timeout=10.0,
+        )
+        if sess_resp.status_code == 200:
+            parent_session = _string_object_dict(sess_resp.json())
+            if parent_session is not None:
+                if parent_agent_id is None:
+                    parent_agent_id = _optional_string(parent_session.get("agent_id"))
+                parent_profile = _optional_string(parent_session.get("environment_profile"))
+    except (httpx.HTTPError, RuntimeError):
+        pass
     if parent_agent_id is None:
         return "Error: cannot resolve parent agent_id for sub-agent dispatch"
 
@@ -2403,7 +2407,6 @@ async def _execute_subagent_tool(
         # The parent session's selected environment is trusted server-side
         # session metadata. Carry it to the child so every agent in the spawn
         # tree can discover the same capabilities and generated guide.
-        parent_profile = _optional_string(snap.get("environment_profile"))
         if parent_profile is not None:
             create_body["environment_profile"] = parent_profile
         if harness_override_canonical is not None:
@@ -4547,9 +4550,7 @@ async def _session_get_info_via_rest(
             "model": snap.get("model_override") or snap.get("llm_model"),
             "workspace": snap.get("workspace"),
             "environment_profile": _optional_string(snap.get("environment_profile")),
-            "environment_capabilities": _json_object_list(
-                snap.get("environment_capabilities")
-            ),
+            "environment_capabilities": _json_object_list(snap.get("environment_capabilities")),
             "git_branch": snap.get("git_branch"),
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick

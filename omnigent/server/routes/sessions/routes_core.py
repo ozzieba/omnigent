@@ -1990,9 +1990,7 @@ def register_core_routes(
                                 session_id,
                                 next_state,
                             )
-                            conv = conv.__class__(
-                                **{**conv.__dict__, "session_state": next_state}
-                            )
+                            conv = conv.__class__(**{**conv.__dict__, "session_state": next_state})
         else:
             conv = conv_for_collaboration_mode
             if conv is None:

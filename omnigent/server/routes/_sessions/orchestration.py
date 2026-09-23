@@ -8698,7 +8698,9 @@ async def _create_session_from_existing_agent(
                 conv.id,
                 {
                     **conv.session_state,
-                    "pending_initial_items": [item.model_dump(mode="json") for item in body.initial_items],
+                    "pending_initial_items": [
+                        item.model_dump(mode="json") for item in body.initial_items
+                    ],
                     "pending_initial_items_warning": "initial_items_seeded_not_dispatched",
                 },
             )
