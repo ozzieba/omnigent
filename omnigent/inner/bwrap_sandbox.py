@@ -95,25 +95,6 @@ _LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _PR_SET_NO_NEW_PRIVS = 38
-_CAP_SYS_ADMIN = 1 << 21
-
-
-def _has_cap_sys_admin() -> bool:
-    """Whether this Linux process can create a mount namespace as root.
-
-    Keep the pre-existing bwrap path if capability state is unavailable;
-    changing a privileged host to require user namespaces could break hosts
-    that intentionally disable them.
-    """
-    try:
-        with open("/proc/self/status", encoding="ascii") as status:
-            for line in status:
-                if line.startswith("CapEff:"):
-                    return bool(int(line.split()[1], 16) & _CAP_SYS_ADMIN)
-    except (OSError, ValueError, IndexError):
-        pass
-    return True
-
 
 # Top-level cwd dotfiles allowed through by default when the spec
 # doesn't override ``cwd_allow_hidden``. ``.venv`` is whitelisted so the
@@ -446,13 +427,6 @@ class BwrapSandboxBackend(SandboxBackend):
         cwd_resolved = cwd.resolve(strict=False)
         chdir_target = chdir.resolve(strict=False) if chdir is not None else cwd_resolved
         bwrap_args: list[str] = ["bwrap"]
-        # Root without CAP_SYS_ADMIN (for example inside a CI container)
-        # cannot create bwrap's mount namespace directly. Entering a user
-        # namespace first grants the namespace-local capability it needs.
-        # Root with CAP_SYS_ADMIN keeps bwrap's existing path: some hosts
-        # disable user namespaces while permitting privileged mount namespaces.
-        if os.geteuid() == 0 and not _has_cap_sys_admin():
-            bwrap_args.append("--unshare-user")
 
         for path in _DEFAULT_RO_DIRS:
             bwrap_args += ["--ro-bind-try", path, path]
