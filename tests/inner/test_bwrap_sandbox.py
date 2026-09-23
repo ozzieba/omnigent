@@ -473,6 +473,32 @@ def test_wrap_launcher_argv_unshare_net_follows_allow_network(
     assert ("--unshare-net" in argv) is should_unshare
 
 
+def test_wrap_launcher_argv_root_enters_user_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root without CAP_SYS_ADMIN must enter a user namespace for bwrap mounts."""
+    monkeypatch.setattr("omnigent.inner.bwrap_sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("omnigent.inner.bwrap_sandbox._has_cap_sys_admin", lambda: False)
+    backend = _make_backend()
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(tmp_path), tmp_path
+    )
+    assert argv[:2] == ["bwrap", "--unshare-user"]
+
+
+def test_wrap_launcher_argv_capable_root_preserves_mount_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Privileged root can run bwrap where unprivileged userns is disabled."""
+    monkeypatch.setattr("omnigent.inner.bwrap_sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("omnigent.inner.bwrap_sandbox._has_cap_sys_admin", lambda: True)
+    backend = _make_backend()
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(tmp_path), tmp_path
+    )
+    assert "--unshare-user" not in argv
+
+
 def test_wrap_launcher_argv_cwd_writable_when_write_root_matches(
     tmp_path: Path,
 ) -> None:
