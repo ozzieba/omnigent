@@ -52,7 +52,7 @@ installing it. Run this in the **new, versioned runner virtual environment**,
 never in the environment used by the active runner:
 
 ```sh
-DOCLOOP_WHEEL=/home/oz/docloop-dogfood/releases/0.2.7/docloop-0.2.7-py3-none-any.whl
+DOCLOOP_WHEEL=/home/oz/docloop-dogfood/releases/0.2.7-d959973/docloop-0.2.7-py3-none-any.whl
 printf '%s  %s\n' \
   eb74402a63c591196a10338c6b655fcf6c377f6ab78b433ceaf0c81ffdf0e434 \
   "$DOCLOOP_WHEEL" | sha256sum --check
