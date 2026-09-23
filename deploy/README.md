@@ -319,9 +319,12 @@ The `workspace-readonly@1` profile currently selects `omnigent-host@1`.
 Until that exact catalog revision is published, managed session creation with
 the profile is rejected. The profile image launcher does not inherit the
 deployment's passthrough env, Kubernetes harness Secret, PVC mounts, or Secret
-file mounts. The profile reference selects an image only; it grants no
-credentials, mounts, or service capabilities. The normal Kubernetes managed
-host path remains governed by the provider's existing configuration.
+file mounts. It uses the deliberately powerless `omnigent-runner` ServiceAccount
+with ServiceAccount token automount disabled. The server still projects its
+per-launch host-registration token Secret, which is required for the sandbox to
+register; profile selection grants no user credentials, mounts, or service
+capabilities. The normal Kubernetes managed host path remains governed by the
+provider's existing configuration.
 
 **The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. To use a custom image instead, build the same `host` target and point the provider config at it:
 

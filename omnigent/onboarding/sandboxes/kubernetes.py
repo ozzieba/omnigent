@@ -1072,6 +1072,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
+        allow_process_env_fallbacks: bool = True,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1080,7 +1081,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         typed wrappers are built on first use by :meth:`_load_clients` so that
         constructing the launcher is always safe (no cluster reachability
         required) and so tests can inject fakes before the real client is
-        created.
+        created. Set *allow_process_env_fallbacks* to ``False`` when an
+        operator-owned profile must not inherit process-configured sandbox env,
+        harness Secret, namespace, or ServiceAccount overrides.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -1095,6 +1098,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
         self._pod_ready_timeout_s = pod_ready_timeout_s
         self._runtime_class = runtime_class
+        self._allow_process_env_fallbacks = allow_process_env_fallbacks
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
@@ -1199,7 +1203,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         """
         return (
             self._namespace
-            or self._name_env_override(NAMESPACE_ENV_VAR, kind="label")
+            or (
+                self._name_env_override(NAMESPACE_ENV_VAR, kind="label")
+                if self._allow_process_env_fallbacks
+                else None
+            )
             or _DEFAULT_NAMESPACE
         )
 
@@ -1212,7 +1220,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         """
         return (
             self._secret_name
-            or self._name_env_override(SANDBOX_SECRET_ENV_VAR, kind="subdomain")
+            or (
+                self._name_env_override(SANDBOX_SECRET_ENV_VAR, kind="subdomain")
+                if self._allow_process_env_fallbacks
+                else None
+            )
             or None
         )
 
@@ -1225,7 +1237,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         """
         return (
             self._service_account
-            or self._name_env_override(SERVICE_ACCOUNT_ENV_VAR, kind="subdomain")
+            or (
+                self._name_env_override(SERVICE_ACCOUNT_ENV_VAR, kind="subdomain")
+                if self._allow_process_env_fallbacks
+                else None
+            )
             or _DEFAULT_SERVICE_ACCOUNT
         )
 
@@ -1246,6 +1262,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         """
         if self._env_names is not None:
             names: Sequence[str] = self._env_names
+        elif not self._allow_process_env_fallbacks:
+            names = ()
         else:
             names = [
                 name.strip()

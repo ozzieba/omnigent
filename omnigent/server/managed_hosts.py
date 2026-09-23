@@ -2726,7 +2726,7 @@ def _kubernetes_launcher_factory(
             # Kubernetes identity. The launcher disables token automounting;
             # the host's short-lived bootstrap token remains the only session
             # credential required for tunnel registration.
-            service_account=None,
+            service_account="omnigent-runner",
             node_selector=node_selector,
             kubeconfig=kubeconfig,
             in_cluster=in_cluster,
@@ -2735,6 +2735,7 @@ def _kubernetes_launcher_factory(
             secret_mounts=None,
             pod_ready_timeout_s=pod_ready_timeout_s,
             runtime_class=runtime_class,
+            allow_process_env_fallbacks=False,
         )
 
     return _build, _build_profile_image
