@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
 CapabilityState = Literal["available", "unavailable", "denied", "requestable"]
+WorkspaceAccess = Literal["read-only", "read-write"]
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class EnvironmentProfile:
     name: str
     description: str
     access: str
+    workspace_access: WorkspaceAccess
     capabilities: tuple[EnvironmentCapability, ...]
 
     @property
@@ -60,6 +62,7 @@ class EnvironmentProfile:
             "name": self.name,
             "description": self.description,
             "access": self.access,
+            "workspace_access": self.workspace_access,
             "capabilities": [capability.public_dict() for capability in self.capabilities],
         }
 
@@ -77,6 +80,7 @@ WORKSPACE_READONLY = EnvironmentProfile(
         "no host mounts or credentials."
     ),
     access="read-only",
+    workspace_access="read-only",
     capabilities=(
         EnvironmentCapability(
             id="session.workspace",
@@ -163,6 +167,7 @@ WORKSPACE_EDITABLE = replace(
         "No host mounts or credentials."
     ),
     access="read-write workspace only",
+    workspace_access="read-write",
     capabilities=tuple(
         replace(
             capability,
@@ -390,9 +395,12 @@ def validate_environment_profile_spec(reference: str, spec: object) -> bool:
 
     if not isinstance(spec, OSEnvSpec):
         return False
-    if reference in (WORKSPACE_READONLY.reference, WORKSPACE_READONLY_V2.reference):
+    profile = get_environment_profile(reference)
+    if profile is None:
+        return False
+    if profile.workspace_access == "read-only":
         expected_sandbox = replace(_default_sandbox_for_platform(), write_paths=[])
-    elif reference in (WORKSPACE_EDITABLE.reference, WORKSPACE_EDITABLE_V2.reference):
+    elif profile.workspace_access == "read-write":
         expected_sandbox = replace(_default_sandbox_for_platform(), write_paths=["."])
     else:
         return False

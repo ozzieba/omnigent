@@ -714,6 +714,7 @@ export interface EnvironmentProfile {
   name: string;
   description: string;
   access: string;
+  workspace_access: "read-only" | "read-write";
   capabilities: EnvironmentCapability[];
 }
 

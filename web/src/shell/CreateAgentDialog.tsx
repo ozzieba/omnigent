@@ -200,6 +200,9 @@ export function CreateAgentDialog({
       harness,
       model: model.trim(),
       environmentProfile: environmentProfile || undefined,
+      environmentWorkspaceAccess: environmentProfiles.find(
+        (profile) => profile.reference === environmentProfile,
+      )?.workspace_access,
       mcpServers: toMCPInputs(mcpEntries),
     });
     reset();
