@@ -82,7 +82,7 @@ COPY web/electron/package.json ./web/electron/
 RUN npm install -g pnpm@11.15.1
 RUN pnpm install --frozen-lockfile --filter web
 
-COPY web/ ./web/
+COPY --exclude=node_modules web/ ./web/
 RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────
