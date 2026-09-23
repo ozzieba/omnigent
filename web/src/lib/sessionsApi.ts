@@ -146,6 +146,7 @@ interface SessionResponseWire {
   labels?: Record<string, string>;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
+  environment_profile?: string | null;
   /**
    * Native-terminal CLI args the session launched with, e.g.
    * ``["--permission-mode", "plan"]``. Records only the LAUNCH flags —
@@ -320,6 +321,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     title: wire.title ?? null,
     labels: wire.labels,
     workspace: wire.workspace ?? null,
+    environmentProfile: wire.environment_profile ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
     items: wire.items ?? [],
@@ -669,6 +671,7 @@ export async function createBundledSession(
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
+    environment_profile?: string;
   } = {},
 ): Promise<{ id: string; warnings?: { code?: string; message?: string }[] }> {
   const form = new FormData();
@@ -691,6 +694,26 @@ export async function createBundledSession(
     warnings?: { code?: string; message?: string }[];
   };
   return { id: body.session_id, warnings: body.warnings };
+}
+
+/** Server-published immutable agent environment profile. */
+export interface EnvironmentProfile {
+  id: string;
+  revision: number;
+  reference: string;
+  name: string;
+  description: string;
+  access: string;
+}
+
+/** Fetch the catalog entries the signed-in user may select for new agents. */
+export async function listEnvironmentProfiles(): Promise<EnvironmentProfile[]> {
+  const response = await authenticatedFetch("/v1/environment-profiles");
+  if (!response.ok) {
+    throw new Error(`Failed to list environment profiles: ${response.status}`);
+  }
+  const body = (await response.json()) as { data?: EnvironmentProfile[] };
+  return body.data ?? [];
 }
 
 /**

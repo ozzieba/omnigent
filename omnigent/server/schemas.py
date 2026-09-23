@@ -1639,6 +1639,8 @@ class SessionCreateMetadata(BaseModel):
         provision on ``host_type: "managed"`` (one of the server's
         ``sandbox_providers``); ``None`` takes the server's first. Only
         valid with ``host_type: "managed"``.
+    :param environment_profile: Optional immutable catalog reference
+        (``profile-id@revision``) for a server-published agent environment.
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -1651,6 +1653,7 @@ class SessionCreateMetadata(BaseModel):
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
+    environment_profile: str | None = Field(default=None, min_length=3, max_length=128)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2089,6 +2092,8 @@ class SessionResponse(BaseModel):
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
+    :param environment_profile: Immutable server-published profile revision
+        selected when this session was created, e.g. ``workspace-readonly@1``.
     """
 
     id: str
@@ -2135,6 +2140,7 @@ class SessionResponse(BaseModel):
     # Source: :mod:`omnigent.runtime.pending_inputs`.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
+    environment_profile: str | None = None
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)

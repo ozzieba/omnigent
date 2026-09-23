@@ -8646,12 +8646,14 @@ def create_runner_app(
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        agent_spec: AgentSpec | None = None,
     ) -> JSONResponse:
         from omnigent.entities.pagination import paginate_in_memory
 
         filtered = resource_registry.list_resources(
             session_id,
             resource_type=resource_type,
+            agent_spec=agent_spec,
         )
         page = paginate_in_memory(
             filtered.data,
@@ -8681,6 +8683,7 @@ def create_runner_app(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ) -> JSONResponse:
+        spec = await _resolve_session_agent_spec(session_id)
         return _build_typed_list_response(
             session_id,
             "environment",
@@ -8688,6 +8691,7 @@ def create_runner_app(
             after=after,
             before=before,
             order=order,
+            agent_spec=spec,
         )
 
     def _environment_reach(root: str, agent_spec: AgentSpec | None) -> dict[str, object]:
@@ -8732,6 +8736,7 @@ def create_runner_app(
         resource = resource_registry.get_resource(
             session_id,
             environment_id,
+            agent_spec,
         )
         if resource is None or resource.type != "environment":
             return JSONResponse(

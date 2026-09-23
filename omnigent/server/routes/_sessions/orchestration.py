@@ -1135,6 +1135,7 @@ def _build_session_response(
         # (their message is already persisted into ``items``).
         pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
+        environment_profile=conv.environment_profile,
         git_branch=conv.git_branch,
         archived=conv.archived,
         # Replay the latest todo list for claude-native sessions.
@@ -8802,6 +8803,34 @@ def _create_session_from_bundle(
         bundle_bytes,
         enforce_handler_allowlist=not local_single_user_enabled(),
     )
+    environment_profile = metadata.environment_profile
+    if environment_profile is not None:
+        from omnigent.server.environment_profiles import (
+            get_environment_profile,
+            validate_workspace_readonly_spec,
+        )
+
+        if get_environment_profile(environment_profile) is None:
+            raise OmnigentError(
+                f"unknown environment profile revision {environment_profile!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if spec.params.get("environment_profile") != environment_profile:
+            raise OmnigentError(
+                "bundle environment_profile must match the selected catalog revision",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not validate_workspace_readonly_spec(spec.os_env):
+            raise OmnigentError(
+                "environment profile workspace-readonly@1 requires the exact "
+                "server-approved read-only workspace os_env policy",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    elif spec.params.get("environment_profile") is not None:
+        raise OmnigentError(
+            "bundle environment_profile requires a matching selected catalog revision",
+            code=ErrorCode.INVALID_INPUT,
+        )
     assert spec.name is not None
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:

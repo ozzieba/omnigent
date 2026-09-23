@@ -626,11 +626,14 @@ class SessionResourceRegistry:
             getattr(agent_spec, "os_env", None) if agent_spec is not None else None
         )
         has_os_env = agent_spec is None or primary_os_env_spec is not None
+        params = getattr(agent_spec, "params", {}) if agent_spec is not None else {}
+        profile = params.get("environment_profile") if isinstance(params, dict) else None
         page = list_session_resources_from_terminal_registry(
             session_id,
             self._terminal_registry,
             has_os_env=has_os_env,
             primary_os_env_spec=primary_os_env_spec,
+            environment_profile=profile if isinstance(profile, str) else None,
         )
         if resource_type is not None:
             return filter_resources_by_type(page, resource_type)
@@ -640,18 +643,17 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         resource_id: str,
+        agent_spec: AgentSpec | None = None,
     ) -> SessionResourceView | None:
         """Find a single resource by id.
 
         :param session_id: Session/conversation identifier.
         :param resource_id: Opaque resource id,
             e.g. ``"default"`` or ``"terminal_bash_s1"``.
+        :param agent_spec: Optional owning agent spec, used to describe its profile.
         :returns: The matching resource or ``None``.
         """
-        page = list_session_resources_from_terminal_registry(
-            session_id,
-            self._terminal_registry,
-        )
+        page = self.list_resources(session_id, agent_spec=agent_spec)
         return get_resource_by_id(page, resource_id)
 
     async def get_terminal_resource(
@@ -813,6 +815,26 @@ class SessionResourceRegistry:
                 raise ValueError(
                     "Agent spec has no os_env; cannot create a primary filesystem environment."
                 )
+            profile = getattr(agent_spec, "params", {}).get("environment_profile")
+            if profile is not None:
+                from omnigent.server.environment_profiles import (
+                    get_environment_profile,
+                    validate_workspace_readonly_spec,
+                )
+
+                valid_profile = get_environment_profile(str(profile)) is not None
+                valid_policy = validate_workspace_readonly_spec(spec_os_env)
+                if not (valid_profile and valid_policy):
+                    raise ValueError(
+                        "agent environment profile is unknown or does not match its policy"
+                    )
+                if spec_os_env.sandbox is None or spec_os_env.sandbox.type not in (
+                    "linux_bwrap",
+                    "darwin_seatbelt",
+                ):
+                    raise ValueError(
+                        "workspace-readonly@1 requires Linux bwrap or macOS seatbelt filesystem isolation"
+                    )
             # Precedence per designs/SESSION_WORKSPACE_SELECTION.md:
             # runner_workspace (env-var-driven) ALWAYS wins when set.
             # Otherwise the spec's absolute cwd wins; otherwise we

@@ -33,6 +33,8 @@ export interface AgentBundleInput {
   model: string;
   /** MCP server declarations to include as inline tools entries. */
   mcpServers?: MCPServerInput[];
+  /** Immutable server catalog reference; the server validates the matching fixed policy. */
+  environmentProfile?: string;
 }
 
 /**
@@ -56,6 +58,19 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   lines.push(`  model: ${input.model}`);
   lines.push("  config:");
   lines.push(`    harness: ${input.harness}`);
+  if (input.environmentProfile === "workspace-readonly@1") {
+    lines.push("");
+    lines.push("params:");
+    lines.push(`  environment_profile: ${yamlQuote(input.environmentProfile)}`);
+    lines.push("");
+    lines.push("os_env:");
+    lines.push("  type: caller_process");
+    lines.push("  cwd: .");
+    lines.push("  sandbox:");
+    lines.push("    type: auto");
+    lines.push("    write_paths: []");
+    lines.push("    allow_network: true");
+  }
   lines.push("");
 
   lines.push("tools:");

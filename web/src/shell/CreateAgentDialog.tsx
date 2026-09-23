@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { PlusIcon, TrashIcon } from "lucide-react";
 import {
   Dialog,
@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/select";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
+import { listEnvironmentProfiles, type EnvironmentProfile } from "@/lib/sessionsApi";
 
 /**
  * Harness options for the picker. "default" uses the server's default
@@ -137,6 +138,28 @@ export function CreateAgentDialog({
   const [model, setModel] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
+  const [environmentProfiles, setEnvironmentProfiles] = useState<EnvironmentProfile[]>([]);
+  const [environmentProfile, setEnvironmentProfile] = useState("");
+  const [environmentProfilesError, setEnvironmentProfilesError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let current = true;
+    void listEnvironmentProfiles().then(
+      (profiles) => {
+        if (!current) return;
+        setEnvironmentProfiles(profiles);
+        setEnvironmentProfilesError(null);
+        setEnvironmentProfile((selected) => selected || profiles[0]?.reference || "");
+      },
+      () => {
+        if (current) setEnvironmentProfilesError("Environment profiles are unavailable.");
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [open]);
 
   function reset() {
     setName("");
@@ -146,6 +169,7 @@ export function CreateAgentDialog({
     setModel("");
     setMcpEntries([]);
     setNextKey(0);
+    setEnvironmentProfile("");
   }
 
   function handleOpenChange(next: boolean) {
@@ -176,6 +200,7 @@ export function CreateAgentDialog({
       instructions: instructions.trim() || undefined,
       harness,
       model: model.trim(),
+      environmentProfile: environmentProfile || undefined,
       mcpServers: toMCPInputs(mcpEntries),
     });
     reset();
@@ -252,6 +277,33 @@ export function CreateAgentDialog({
                 ))}
               </SelectContent>
             </Select>
+          </div>
+
+          {/* Server-owned environment profile */}
+          <div className="flex flex-col gap-1.5">
+            <label className="text-sm font-medium text-muted-foreground">Environment</label>
+            <Select
+              value={environmentProfile || "none"}
+              onValueChange={(value) => setEnvironmentProfile(value === "none" ? "" : value)}
+              componentId="create_agent.environment_profile"
+              valueHasNoPii
+            >
+              <SelectTrigger data-testid="create-agent-environment-profile" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">No profile</SelectItem>
+                {environmentProfiles.map((profile) => (
+                  <SelectItem key={profile.reference} value={profile.reference}>
+                    {profile.name} ({profile.reference})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {environmentProfiles.find((profile) => profile.reference === environmentProfile)
+                ?.description ?? environmentProfilesError ?? "Select a published environment profile."}
+            </p>
           </div>
 
           {/* Model */}
