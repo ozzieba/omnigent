@@ -3,6 +3,39 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from typing import Literal
+
+
+CapabilityState = Literal["available", "unavailable", "denied", "requestable"]
+
+
+@dataclass(frozen=True)
+class EnvironmentCapability:
+    """One interface/resource fact shown to the user before launch.
+
+    A catalog entry describes what the selected profile really supplies. It
+    does not resolve paths or credentials, and a profile cannot grant itself
+    access by listing a capability as requestable.
+    """
+
+    id: str
+    name: str
+    state: CapabilityState
+    interfaces: tuple[str, ...]
+    access: str
+    authorization_owner: str
+    reason: str
+
+    def public_dict(self) -> dict[str, str | list[str]]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "state": self.state,
+            "interfaces": list(self.interfaces),
+            "access": self.access,
+            "authorization_owner": self.authorization_owner,
+            "reason": self.reason,
+        }
 
 
 @dataclass(frozen=True)
@@ -14,12 +47,13 @@ class EnvironmentProfile:
     name: str
     description: str
     access: str
+    capabilities: tuple[EnvironmentCapability, ...]
 
     @property
     def reference(self) -> str:
         return f"{self.id}@{self.revision}"
 
-    def public_dict(self) -> dict[str, str | int]:
+    def public_dict(self) -> dict[str, object]:
         return {
             "id": self.id,
             "revision": self.revision,
@@ -27,6 +61,7 @@ class EnvironmentProfile:
             "name": self.name,
             "description": self.description,
             "access": self.access,
+            "capabilities": [capability.public_dict() for capability in self.capabilities],
         }
 
 
@@ -41,12 +76,59 @@ WORKSPACE_READONLY = EnvironmentProfile(
         "no additional mounts or credentials."
     ),
     access="read-only",
+    capabilities=(
+        EnvironmentCapability(
+            id="session.workspace",
+            name="Session workspace",
+            state="available",
+            interfaces=("shell", "filesystem-api"),
+            access="read-only",
+            authorization_owner="session owner",
+            reason="Only the session workspace is exposed, with OS-level read-only isolation.",
+        ),
+        EnvironmentCapability(
+            id="host.mounts",
+            name="Host workspaces and mounts",
+            state="unavailable",
+            interfaces=("filesystem", "ssh"),
+            access="none",
+            authorization_owner="platform operator",
+            reason="No host mounts or SSH credentials are configured in this profile.",
+        ),
+        EnvironmentCapability(
+            id="cloud.credentials",
+            name="Cloud credentials and secrets",
+            state="unavailable",
+            interfaces=("credential broker", "virtual files"),
+            access="none",
+            authorization_owner="user and platform operator",
+            reason="No credential broker or per-resource grant is configured.",
+        ),
+        EnvironmentCapability(
+            id="infrastructure.control",
+            name="Kubernetes and service control",
+            state="unavailable",
+            interfaces=("kubectl", "service APIs"),
+            access="none",
+            authorization_owner="platform operator",
+            reason="No cluster configuration or control-plane authorization is configured.",
+        ),
+        EnvironmentCapability(
+            id="service.catalogs",
+            name="Git, databases, chat, and service catalogs",
+            state="unavailable",
+            interfaces=("filesystem", "CLI", "SQLite/DuckDB"),
+            access="none",
+            authorization_owner="resource owner",
+            reason="No service adapters, indexes, or resource grants are configured.",
+        ),
+    ),
 )
 
 _PROFILES = {WORKSPACE_READONLY.reference: WORKSPACE_READONLY}
 
 
-def list_environment_profiles() -> list[dict[str, str | int]]:
+def list_environment_profiles() -> list[dict[str, object]]:
     """Return the published catalog, ordered by stable reference."""
     ordered = sorted(_PROFILES.values(), key=lambda profile: profile.reference)
     return [profile.public_dict() for profile in ordered]

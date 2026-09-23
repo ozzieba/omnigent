@@ -304,6 +304,28 @@ export function CreateAgentDialog({
               {environmentProfiles.find((profile) => profile.reference === environmentProfile)
                 ?.description ?? environmentProfilesError ?? "Select a published environment profile."}
             </p>
+            {environmentProfiles.find((profile) => profile.reference === environmentProfile)
+              ?.capabilities?.length ? (
+              <ul className="mt-1 flex flex-col gap-1.5" aria-label="Environment capabilities">
+                {environmentProfiles
+                  .find((profile) => profile.reference === environmentProfile)!
+                  .capabilities.map((capability) => (
+                    <li key={capability.id} className="rounded border px-2 py-1.5 text-xs">
+                      <div className="flex flex-wrap items-baseline gap-x-2">
+                        <span className="font-medium">{capability.name}</span>
+                        <span className="text-muted-foreground">
+                          {capability.state} · access: {capability.access}
+                        </span>
+                      </div>
+                      <p className="text-muted-foreground">{capability.reason}</p>
+                      <p className="text-muted-foreground">
+                        Interfaces: {capability.interfaces.join(", ")} · authorization owner:{" "}
+                        {capability.authorization_owner}
+                      </p>
+                    </li>
+                  ))}
+              </ul>
+            ) : null}
           </div>
 
           {/* Model */}

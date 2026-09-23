@@ -697,6 +697,16 @@ export async function createBundledSession(
 }
 
 /** Server-published immutable agent environment profile. */
+export interface EnvironmentCapability {
+  id: string;
+  name: string;
+  state: "available" | "unavailable" | "denied" | "requestable";
+  interfaces: string[];
+  access: string;
+  authorization_owner: string;
+  reason: string;
+}
+
 export interface EnvironmentProfile {
   id: string;
   revision: number;
@@ -704,6 +714,7 @@ export interface EnvironmentProfile {
   name: string;
   description: string;
   access: string;
+  capabilities: EnvironmentCapability[];
 }
 
 /** Fetch the catalog entries the signed-in user may select for new agents. */
