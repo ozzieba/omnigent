@@ -2284,6 +2284,10 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
         lambda family: family != GEMINI_FAMILY,
     )
     monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
+    # The overview reads ambient GitHub credentials; pin the unconfigured state
+    # so CI runner tokens cannot turn this row into a ready, hint-free row.
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
     # Kimi's row consults a combined auth probe; force "not configured" so the
     # hint is asserted deterministically.
     monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
