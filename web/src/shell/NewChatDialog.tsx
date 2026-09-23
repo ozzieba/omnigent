@@ -5448,8 +5448,7 @@ export function NewChatLandingScreen() {
                           profile.managed_host_image.state === "available";
                         const disabled =
                           sandboxSelected &&
-                          profile.managed_host_image_reference !== null &&
-                          !managedImageReady;
+                          (profile.managed_host_image_reference === null || !managedImageReady);
                         return (
                           <DropdownMenuItem
                             key={profile.reference}

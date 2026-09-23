@@ -8390,6 +8390,24 @@ async def _create_session_from_existing_agent(
     selected_environment_profile = body.environment_profile or inherited_environment_profile
     if inherited_environment_profile is not None:
         environment_runtime_ref = inherited_environment_runtime_ref
+        if body.host_type == "managed":
+            sandbox_config = getattr(request.app.state, "sandbox_config", None)
+            selected_provider = (
+                sandbox_config.for_provider(body.sandbox_provider)
+                if sandbox_config is not None
+                else None
+            )
+            if (
+                environment_runtime_ref is None
+                or selected_provider is None
+                or selected_provider.provider != "kubernetes"
+                or sandbox_config.managed_host_image(environment_runtime_ref) is None
+            ):
+                raise OmnigentError(
+                    "the parent's selected environment profile has no managed image "
+                    "published for the selected Kubernetes provider",
+                    code=ErrorCode.INVALID_INPUT,
+                )
     else:
         from omnigent.server.managed_hosts import resolve_profile_runtime_reference
 

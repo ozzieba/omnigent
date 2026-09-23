@@ -677,8 +677,12 @@ def resolve_profile_runtime_reference(
     if profile is None:
         raise ValueError(f"unknown environment profile revision {profile_reference!r}")
     runtime_reference = profile.managed_host_image_reference
-    if not managed or runtime_reference is None:
+    if not managed:
         return runtime_reference
+    if runtime_reference is None:
+        raise ValueError(
+            f"environment profile {profile_reference!r} has no published managed-host image reference"
+        )
     selected = deployment.for_provider(provider) if deployment is not None else None
     if selected is None or selected.provider != "kubernetes":
         raise ValueError(
