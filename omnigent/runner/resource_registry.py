@@ -12,6 +12,7 @@ See ``designs/SESSION_RESOURCES_API_DESIGN.md`` §Runner internal model.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -780,14 +781,30 @@ class SessionResourceRegistry:
         if existing is not None:
             return existing
 
-        from omnigent.server.environment_profiles import environment_profile_agent_guide
+        from omnigent.server.environment_profiles import (
+            environment_profile_agent_guide,
+            environment_profile_catalog,
+        )
 
         tempdir = tempfile.TemporaryDirectory(prefix="omnigent-environment-")
-        path = Path(tempdir.name) / "AGENTS.md"
-        guide = environment_profile_agent_guide(reference, filesystem_path=str(path))
-        if guide is None:
+        root = Path(tempdir.name)
+        path = root / "AGENTS.md"
+        catalog_path = root / "resources" / "catalog.json"
+        guide = environment_profile_agent_guide(
+            reference,
+            filesystem_path=str(path),
+            catalog_path=str(catalog_path),
+        )
+        catalog = environment_profile_catalog(reference)
+        if guide is None or catalog is None:
             tempdir.cleanup()
             return None
+        catalog_path.parent.mkdir(mode=0o700)
+        catalog_path.write_text(
+            json.dumps(catalog, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        catalog_path.chmod(0o444)
         path.write_text(guide + "\n", encoding="utf-8")
         path.chmod(0o444)
         self._environment_guide_dirs[session_id] = tempdir

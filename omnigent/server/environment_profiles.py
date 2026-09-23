@@ -74,7 +74,8 @@ WORKSPACE_READONLY = EnvironmentProfile(
     name="Read-only workspace",
     description=(
         "Expose the session workspace and a generated AGENTS.md environment "
-        "guide to OS tools as read-only; no host mounts or credentials."
+        "guide plus a machine-readable capability catalog as read-only; "
+        "no host mounts or credentials."
     ),
     access="read-only",
     capabilities=(
@@ -100,6 +101,18 @@ WORKSPACE_READONLY = EnvironmentProfile(
             reason=(
                 "A server-generated guide is mounted from a private per-session "
                 "temporary directory outside the workspace."
+            ),
+        ),
+        EnvironmentCapability(
+            id="agent.environment-catalog",
+            name="Environment capability catalog",
+            state="available",
+            interfaces=("resources/catalog.json", "jq", "sys_session_get_info"),
+            access="read-only",
+            authorization_owner="platform",
+            reason=(
+                "The JSON file mirrors this profile's availability and authorization metadata; "
+                "it contains no credentials and does not grant access to unavailable services."
             ),
         ),
         EnvironmentCapability(
@@ -155,10 +168,23 @@ def get_environment_profile(reference: str) -> EnvironmentProfile | None:
     return _PROFILES.get(reference)
 
 
+def environment_profile_catalog(reference: str) -> dict[str, object] | None:
+    """Return the machine-readable, credential-free catalog for one profile."""
+    profile = get_environment_profile(reference)
+    if profile is None:
+        return None
+    return {
+        "schema_version": 1,
+        "kind": "omnigent.environment-profile",
+        "profile": profile.public_dict(),
+    }
+
+
 def environment_profile_agent_guide(
     reference: str,
     *,
     filesystem_path: str | None = None,
+    catalog_path: str | None = None,
 ) -> str | None:
     """Render trusted profile capability metadata for an agent system prompt.
 
@@ -180,6 +206,12 @@ def environment_profile_agent_guide(
         lines.append(
             "A read-only `AGENTS.md` copy of this environment guide is mounted at "
             f"`{filesystem_path}`."
+        )
+    if catalog_path is not None:
+        lines.append(
+            "A read-only JSON capability catalog is mounted at "
+            f"`{catalog_path}`; query it with `jq` or read it with `sys_os_read`. "
+            "It describes grants but does not grant them."
         )
     for capability in profile.capabilities:
         interfaces = ", ".join(capability.interfaces)
