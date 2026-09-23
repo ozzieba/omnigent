@@ -150,7 +150,6 @@ export function CreateAgentDialog({
         if (!current) return;
         setEnvironmentProfiles(profiles);
         setEnvironmentProfilesError(null);
-        setEnvironmentProfile((selected) => selected || profiles[0]?.reference || "");
       },
       () => {
         if (current) setEnvironmentProfilesError("Environment profiles are unavailable.");
