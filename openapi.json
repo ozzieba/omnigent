@@ -3339,6 +3339,431 @@
         "title": "QueuedEvent",
         "type": "object"
       },
+      "QuotaBurstPolicy": {
+        "description": "The controller's burst policy, as the slider's authoritative value.",
+        "properties": {
+          "adaptive_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adaptive Enabled"
+          },
+          "initial_burst_factor": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Initial Burst Factor"
+          },
+          "max_burst_factor": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Burst Factor"
+          }
+        },
+        "title": "QuotaBurstPolicy",
+        "type": "object"
+      },
+      "QuotaConfigResponse": {
+        "description": "Authoritative controller policy returned to the browser.",
+        "properties": {
+          "adaptive_enabled": {
+            "title": "Adaptive Enabled",
+            "type": "boolean"
+          },
+          "current_burst_factors": {
+            "additionalProperties": {
+              "format": "double",
+              "minimum": 1.0,
+              "type": "number"
+            },
+            "title": "Current Burst Factors",
+            "type": "object"
+          },
+          "initial_burst_factor": {
+            "format": "double",
+            "minimum": 1.0,
+            "title": "Initial Burst Factor",
+            "type": "number"
+          },
+          "max_burst_factor": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Burst Factor"
+          }
+        },
+        "required": [
+          "adaptive_enabled",
+          "initial_burst_factor"
+        ],
+        "title": "QuotaConfigResponse",
+        "type": "object"
+      },
+      "QuotaConfigUpdate": {
+        "description": "Browser-writable subset of the controller's burst policy.",
+        "properties": {
+          "adaptive_enabled": {
+            "title": "Adaptive Enabled",
+            "type": "boolean"
+          },
+          "max_burst_factor": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Burst Factor"
+          }
+        },
+        "required": [
+          "adaptive_enabled"
+        ],
+        "title": "QuotaConfigUpdate",
+        "type": "object"
+      },
+      "QuotaStatus": {
+        "description": "Everything the LLMQ panel renders.",
+        "properties": {
+          "active_reservations": {
+            "default": 0,
+            "format": "int64",
+            "title": "Active Reservations",
+            "type": "integer"
+          },
+          "burst": {
+            "$ref": "#/components/schemas/QuotaBurstPolicy"
+          },
+          "generated_at": {
+            "format": "double",
+            "title": "Generated At",
+            "type": "number"
+          },
+          "observed_at": {
+            "format": "double",
+            "title": "Observed At",
+            "type": "number"
+          },
+          "windows": {
+            "items": {
+              "$ref": "#/components/schemas/QuotaWindow"
+            },
+            "title": "Windows",
+            "type": "array"
+          },
+          "workstreams": {
+            "items": {
+              "$ref": "#/components/schemas/QuotaWorkstream"
+            },
+            "title": "Workstreams",
+            "type": "array"
+          }
+        },
+        "required": [
+          "generated_at",
+          "observed_at",
+          "windows",
+          "workstreams",
+          "burst"
+        ],
+        "title": "QuotaStatus",
+        "type": "object"
+      },
+      "QuotaWaitInfo": {
+        "description": "Safe numeric telemetry for a quota-delayed turn.",
+        "properties": {
+          "admission_delay_seconds": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Admission Delay Seconds"
+          },
+          "burst_multiplier": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 1,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Burst Multiplier"
+          },
+          "current_rate_ppm_per_second": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Current Rate Ppm Per Second"
+          },
+          "linear_schedule_delta_ppm": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Linear Schedule Delta Ppm"
+          }
+        },
+        "title": "QuotaWaitInfo",
+        "type": "object"
+      },
+      "QuotaWindow": {
+        "description": "One provider rate-limit window (e.g. Anthropic's 5-hour bucket).",
+        "properties": {
+          "burst_factor": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Burst Factor"
+          },
+          "hard_allowed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hard Allowed"
+          },
+          "lane": {
+            "title": "Lane",
+            "type": "string"
+          },
+          "limit_id": {
+            "title": "Limit Id",
+            "type": "string"
+          },
+          "model_scope": {
+            "title": "Model Scope",
+            "type": "string"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "resets_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resets At"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "used_ppm": {
+            "format": "int64",
+            "title": "Used Ppm",
+            "type": "integer"
+          },
+          "window_name": {
+            "title": "Window Name",
+            "type": "string"
+          },
+          "window_seconds": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Seconds"
+          }
+        },
+        "required": [
+          "provider",
+          "lane",
+          "limit_id",
+          "window_name",
+          "model_scope",
+          "used_ppm",
+          "window_seconds",
+          "resets_at",
+          "hard_allowed",
+          "source",
+          "observed_at"
+        ],
+        "title": "QuotaWindow",
+        "type": "object"
+      },
+      "QuotaWorkstream": {
+        "description": "One fair-share bucket, with its current in-flight load.",
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "active_estimated_ppm": {
+            "default": 0,
+            "format": "int64",
+            "title": "Active Estimated Ppm",
+            "type": "integer"
+          },
+          "active_reservations": {
+            "default": 0,
+            "format": "int64",
+            "title": "Active Reservations",
+            "type": "integer"
+          },
+          "borrow_after_seconds": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Borrow After Seconds"
+          },
+          "explicit_share_ppm": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Explicit Share Ppm"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen At"
+          },
+          "oldest_active_age_seconds": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Active Age Seconds"
+          },
+          "weight": {
+            "format": "double",
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "weight",
+          "explicit_share_ppm",
+          "active",
+          "borrow_after_seconds",
+          "last_seen_at"
+        ],
+        "title": "QuotaWorkstream",
+        "type": "object"
+      },
       "ReadStatePutRequest": {
         "additionalProperties": false,
         "description": "Request body for `PUT /v1/sessions/{session_id}/read-state`.\n\nSets the *calling user's* read tracking for one session. Mirrors the\ntwo values the web client keeps per session: a \"last seen\" wall-clock\nbaseline (seconds since epoch) and an explicit \"marked unread\"\noverride. The unread dot shows when `updated_at > last_seen` and the\nsession is finished; `unread` separately pins the override so the\nthread the user is *viewing* (or a running one) still surfaces the dot\nwhere the automatic \"seen\" logic would otherwise suppress it.",
@@ -6459,6 +6884,17 @@
             ],
             "default": null,
             "description": "Machine-readable failure detail, present only when `status == \"failed\"`. Carries the message the runner attached when a turn died \u2014 most importantly a SETUP-phase failure (spec resolution, spawn-env build) that ends the turn before any `response.failed` event is emitted. `None` for every non-failed transition. Clients render `error.message` as the terminal error line; without it a setup failure shows as a silent end."
+          },
+          "quota_wait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuotaWaitInfo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "response_id": {
             "anyOf": [
@@ -9649,6 +10085,87 @@
         "summary": "Update Project",
         "tags": [
           "projects"
+        ]
+      }
+    },
+    "/v1/quota/config": {
+      "get": {
+        "operationId": "get_quota_config_v1_quota_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Quota Config",
+        "tags": [
+          "quota"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_quota_config_v1_quota_config_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuotaConfigUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Quota Config",
+        "tags": [
+          "quota"
+        ]
+      }
+    },
+    "/v1/quota/status": {
+      "get": {
+        "operationId": "get_quota_status_v1_quota_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Quota Status",
+        "tags": [
+          "quota"
         ]
       }
     },
