@@ -60,7 +60,9 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   lines.push(`    harness: ${input.harness}`);
   if (
     input.environmentProfile === "workspace-readonly@1" ||
-    input.environmentProfile === "workspace-editable@1"
+    input.environmentProfile === "workspace-readonly@2" ||
+    input.environmentProfile === "workspace-editable@1" ||
+    input.environmentProfile === "workspace-editable@2"
   ) {
     lines.push("");
     lines.push("params:");
@@ -72,7 +74,8 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
     lines.push("  sandbox:");
     lines.push("    type: auto");
     lines.push(
-      input.environmentProfile === "workspace-editable@1"
+      input.environmentProfile === "workspace-editable@1" ||
+      input.environmentProfile === "workspace-editable@2"
         ? '    write_paths: ["."]'
         : "    write_paths: []",
     );

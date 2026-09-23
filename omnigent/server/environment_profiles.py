@@ -178,15 +178,100 @@ WORKSPACE_EDITABLE = replace(
     ),
 )
 
+OMNIGENT_SESSION_DISCOVERY = EnvironmentCapability(
+    id="omnigent.sessions",
+    name="Omnigent sessions",
+    state="available",
+    interfaces=("sys_session_list", "sys_session_get_info", "sys_session_get_history"),
+    access="scoped read-only",
+    authorization_owner="session owner and server permission policy",
+    reason=(
+        "These read tools are registered for every agent and return only sessions the "
+        "current user is authorized to access. Spawn and session-creation tools remain "
+        "separately gated by the agent spec."
+    ),
+)
+
+OMNIGENT_AGENT_CONTEXTS = EnvironmentCapability(
+    id="omnigent.agent-contexts",
+    name="Omnigent agent contexts",
+    state="available",
+    interfaces=("sys_agent_list", "sys_agent_get", "sys_agent_download"),
+    access="scoped read-only",
+    authorization_owner="session owner and server permission policy",
+    reason=(
+        "Discover built-in, local, and accessible session-bound agents. Bundle reads "
+        "are restricted by the server's per-user session permissions."
+    ),
+)
+
+WORKSPACE_READONLY_V2 = replace(
+    WORKSPACE_READONLY,
+    revision=2,
+    description=(
+        "Expose the session workspace and generated environment guide/catalog. "
+        "Omnigent session and agent-context discovery APIs are available; no host "
+        "mounts or credentials are provided."
+    ),
+    capabilities=tuple(
+        replace(
+            capability,
+            name="External service adapters",
+            reason=(
+                "No filesystem or SQL adapters are configured for Git hosting, databases, "
+                "Mattermost, wikis, or other external service catalogs."
+            ),
+        )
+        if capability.id == "service.catalogs"
+        else capability
+        for capability in WORKSPACE_READONLY.capabilities
+    )
+    + (OMNIGENT_SESSION_DISCOVERY, OMNIGENT_AGENT_CONTEXTS),
+)
+
+WORKSPACE_EDITABLE_V2 = replace(
+    WORKSPACE_EDITABLE,
+    revision=2,
+    description=(
+        "Expose the session workspace with read-write access and a generated environment "
+        "guide/catalog. Omnigent session and agent-context discovery APIs are available; "
+        "no host mounts or credentials are provided."
+    ),
+    capabilities=tuple(
+        replace(
+            capability,
+            name="External service adapters",
+            reason=(
+                "No filesystem or SQL adapters are configured for Git hosting, databases, "
+                "Mattermost, wikis, or other external service catalogs."
+            ),
+        )
+        if capability.id == "service.catalogs"
+        else capability
+        for capability in WORKSPACE_EDITABLE.capabilities
+    )
+    + (OMNIGENT_SESSION_DISCOVERY, OMNIGENT_AGENT_CONTEXTS),
+)
+
 _PROFILES = {
     profile.reference: profile
-    for profile in (WORKSPACE_READONLY, WORKSPACE_EDITABLE)
+    for profile in (
+        WORKSPACE_READONLY,
+        WORKSPACE_EDITABLE,
+        WORKSPACE_READONLY_V2,
+        WORKSPACE_EDITABLE_V2,
+    )
 }
 
 
 def list_environment_profiles() -> list[dict[str, object]]:
-    """Return the published catalog, ordered by stable reference."""
-    ordered = sorted(_PROFILES.values(), key=lambda profile: profile.reference)
+    """Return the latest profile revision for each profile id."""
+    latest: dict[str, EnvironmentProfile] = {}
+    for profile in _PROFILES.values():
+        current = latest.get(profile.id)
+        if current is None or profile.revision > current.revision:
+            latest[profile.id] = profile
+    ordered = sorted(latest.values(), key=lambda profile: profile.reference)
     return [profile.public_dict() for profile in ordered]
 
 
@@ -276,9 +361,9 @@ def validate_environment_profile_spec(reference: str, spec: object) -> bool:
 
     if not isinstance(spec, OSEnvSpec):
         return False
-    if reference == WORKSPACE_READONLY.reference:
+    if reference in (WORKSPACE_READONLY.reference, WORKSPACE_READONLY_V2.reference):
         expected_sandbox = replace(_default_sandbox_for_platform(), write_paths=[])
-    elif reference == WORKSPACE_EDITABLE.reference:
+    elif reference in (WORKSPACE_EDITABLE.reference, WORKSPACE_EDITABLE_V2.reference):
         expected_sandbox = replace(_default_sandbox_for_platform(), write_paths=["."])
     else:
         return False
