@@ -7,6 +7,7 @@ import base64
 import contextlib
 import socket
 import ssl
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1508,12 +1509,15 @@ class _CapturedRequest:
     :param method: The request method the upstream received, e.g.
         ``"GET"`` or ``"TRACE"``, or ``None`` when the request line could
         not be parsed.
+    :param target: The request target received by the upstream, or ``None``
+        when the request line could not be parsed.
     """
 
     authorization: str | None
     connection: list[str] = field(default_factory=list)
     max_forwards: str | None = None
     method: str | None = None
+    target: str | None = None
 
 
 async def _start_capturing_upstream(captured: list[_CapturedRequest]) -> asyncio.Server:
@@ -1535,8 +1539,12 @@ async def _start_capturing_upstream(captured: list[_CapturedRequest]) -> asyncio
         max_forwards: str | None = None
         lines = head.split(b"\r\n")
         method: str | None = None
+        target: str | None = None
         if lines and lines[0]:
-            method = lines[0].split(b" ", 1)[0].decode("latin-1")
+            request_line = lines[0].split(b" ", 2)
+            method = request_line[0].decode("latin-1")
+            if len(request_line) > 1:
+                target = request_line[1].decode("latin-1")
         for line in lines:
             if line[:14].lower() == b"authorization:":
                 auth = line.partition(b":")[2].strip().decode("latin-1")
@@ -1550,6 +1558,7 @@ async def _start_capturing_upstream(captured: list[_CapturedRequest]) -> asyncio
                 connection=connection,
                 max_forwards=max_forwards,
                 method=method,
+                target=target,
             )
         )
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
@@ -1564,6 +1573,7 @@ async def _proxied_http_get(
     proxy_port: int,
     upstream_port: int,
     authorization: str | None,
+    path: str = "/probe",
 ) -> bytes:
     """Send one plain-HTTP GET through the proxy, optionally authenticated.
 
@@ -1573,12 +1583,13 @@ async def _proxied_http_get(
         would send (carrying a synthetic placeholder), or ``None`` to
         send a bare request with no ``Authorization`` header — the
         swap-on-access client shape.
+    :param path: Request path sent to the upstream.
     :returns: The raw response bytes the client received from the proxy.
     """
     reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
     auth_line = f"Authorization: {authorization}\r\n" if authorization is not None else ""
     request = (
-        f"GET http://127.0.0.1:{upstream_port}/probe HTTP/1.1\r\n"
+        f"GET http://127.0.0.1:{upstream_port}{path} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{upstream_port}\r\n"
         f"{auth_line}"
         "Connection: close\r\n"
@@ -1977,11 +1988,13 @@ async def test_credential_rewrite_injects_on_access_without_header(
         credential_rewrites=[rule],
     )
     proxy_port = await proxy.start_tcp()
+    request_path = f"/credential-rewrite-{uuid.uuid4().hex}"
     try:
         response = await _proxied_http_get(
             proxy_port=proxy_port,
             upstream_port=upstream_port,
             authorization=None,
+            path=request_path,
         )
     finally:
         await proxy.stop()
@@ -1989,10 +2002,13 @@ async def test_credential_rewrite_injects_on_access_without_header(
         await upstream.wait_closed()
 
     assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
-    assert len(captured) == 1
+    own_requests = [
+        request for request in captured if (request.target or "").endswith(request_path)
+    ]
+    assert len(own_requests) == 1
     # The proxy synthesized the Authorization header from the rule — the
     # client sent none.
-    assert captured[0].authorization == "Bearer real-secret-value"
+    assert own_requests[0].authorization == "Bearer real-secret-value"
 
 
 # ---------------------------------------------------------------------------
