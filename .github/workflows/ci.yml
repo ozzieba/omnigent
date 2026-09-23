@@ -67,8 +67,8 @@ jobs:
           - group: inner-rest
             # This repo-scoped runner gives Bubblewrap mount/net namespace
             # capabilities and unconfined seccomp/AppArmor. Its test jobs have
-            # no Docker socket or host bind mounts; other shards use the
-            # general runner without these capabilities.
+            # no Docker socket or host bind mounts. The runner-app shard also
+            # uses this runner for its real Bubblewrap filesystem test.
             runner: ubuntu-bwrap
             paths: tests/inner
           - group: tools
@@ -122,7 +122,7 @@ jobs:
           # the floor drops from ~500s to ~100s). Both dirs' conftests are
           # function-scoped, so splitting a file across workers is safe.
           - group: runner-app
-            runner: ubuntu-latest
+            runner: ubuntu-bwrap
             paths: tests/runner
             dist: worksteal
           - group: stores
