@@ -195,6 +195,10 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 #     never reference it.
 FROM python:${PYTHON_VERSION}-slim AS host
 ARG NPM_CONFIG_REGISTRY=
+ARG KUBECTL_VERSION=v1.36.4
+ARG KUBECTL_SHA256_AMD64=8b8f088da2dab964f853b38464033b1be15ede2839eca751482357c45abdd05a
+ARG KUBECTL_SHA256_ARM64=0ecf44450ee6063bf19dd166a103ee6df4a9034455c2abce626e6eea657d73fb
+ARG TARGETARCH
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
 # IS_SANDBOX: devcontainer-convention flag consulted by Claude Code —
@@ -214,6 +218,20 @@ RUN apt-get update \
       jq sqlite3 \
       iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
+
+# Kubernetes CLI for agent infrastructure workflows. Pin the version and
+# verify the upstream release checksum for each published architecture.
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) asset_arch=amd64; sha="${KUBECTL_SHA256_AMD64}" ;; \
+      arm64) asset_arch=arm64; sha="${KUBECTL_SHA256_ARM64}" ;; \
+      *) echo "ERROR: unsupported kubectl architecture '${TARGETARCH}'" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${asset_arch}/kubectl"; \
+    echo "${sha}  /usr/local/bin/kubectl" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/kubectl; \
+    kubectl version --client=true --output=yaml
 
 # The builder installs uv for project builds; ship it in the runtime sandbox
 # as well so agents can manage isolated Python tools and project environments.
