@@ -153,13 +153,13 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
-# Docloop is a separate harness distribution. Keep the proven 0.2.6 wheel
+# Docloop is a separate harness distribution. Keep the released 0.2.7 wheel
 # pinned in the build context so the server image discovers its community
 # harness contribution at spec-load time.
-COPY deploy/docker/vendor/docloop-0.2.6-py3-none-any.whl /tmp/docloop-0.2.6-py3-none-any.whl
-RUN echo "26e968a1c465a0a77834cb1a1790dda256fd840d512ada997472e161b05f6503  /tmp/docloop-0.2.6-py3-none-any.whl" | sha256sum -c - \
- && uv pip install --no-cache-dir /tmp/docloop-0.2.6-py3-none-any.whl \
- && rm -f /tmp/docloop-0.2.6-py3-none-any.whl \
+COPY deploy/docker/vendor/docloop-0.2.7-py3-none-any.whl /tmp/docloop-0.2.7-py3-none-any.whl
+RUN echo "cdd78b6345334db717da35eb5b2a8ac7fc40d71d77a2035d515f8caced882a6f  /tmp/docloop-0.2.7-py3-none-any.whl" | sha256sum -c - \
+ && uv pip install --no-cache-dir /tmp/docloop-0.2.7-py3-none-any.whl \
+ && rm -f /tmp/docloop-0.2.7-py3-none-any.whl \
  && python -c "from importlib.metadata import entry_points; from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES; eps = entry_points(group='omnigent.community.harness'); assert any(ep.name == 'docloop' and ep.value == 'docloop.omnigent:contribution' for ep in eps), [(ep.name, ep.value) for ep in eps]; assert 'docloop' in OMNIGENT_HARNESSES, sorted(OMNIGENT_HARNESSES)"
 
 # Optional managed-sandbox provider extras for the SERVER (the launcher imports
