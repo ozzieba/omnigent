@@ -26,6 +26,11 @@ profile reference and its capability manifest, including unavailable
 interfaces and authorization owners. This is discovery metadata; it does not
 grant capabilities or mount resources into the environment.
 
+On each turn, Omnigent also appends a server-generated environment guide to
+the agent's system instructions. It is derived from the selected profile and
+is equivalent in purpose to an `AGENTS.md` environment section, but it is not
+currently a separate file mounted into the workspace.
+
 ## Adding a profile revision
 
 Add a new revision rather than changing the meaning of a published reference.

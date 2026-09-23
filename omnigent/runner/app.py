@@ -1178,6 +1178,24 @@ class InstructionComposition:
     composed: str | None
 
 
+def _append_environment_profile_guide(
+    instructions: str | None,
+    spec: AgentSpec,
+) -> str | None:
+    """Append the selected server-owned environment contract to agent context."""
+    reference = spec.params.get("environment_profile")
+    if not isinstance(reference, str):
+        return instructions
+    from omnigent.server.environment_profiles import environment_profile_agent_guide
+
+    guide = environment_profile_agent_guide(reference)
+    if guide is None:
+        return instructions
+    if instructions is None or not instructions.strip():
+        return guide
+    return f"{instructions.rstrip()}\n\n{guide}"
+
+
 # Harnesses whose executor reads the wire ``instructions`` field itself and
 # needs the gated ``InstructionComposition.composed`` value there instead of
 # the default fallback-including composed-per-turn string — opencode-native
@@ -7059,6 +7077,7 @@ def create_runner_app(
                     _raw_per_request_instructions,
                     [],
                 )
+            instructions = _append_environment_profile_guide(instructions, cached_spec)
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
             if _authored_bg and harness_name:
@@ -7621,6 +7640,9 @@ def create_runner_app(
                                 _instr_spec_ds, _per_req_instr, []
                             ),
                         )
+                        _ic_ds.composed = _append_environment_profile_guide(
+                            _ic_ds.composed, _instr_spec_ds
+                        )
                         # Gated harnesses get nullable — skip the fallback literal.
                         if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                             _instr_val = _ic_ds.composed
@@ -7629,8 +7651,9 @@ def create_runner_app(
                         elif _ic_ds.composed is not None:
                             _instr_body = {
                                 **body,
-                                "instructions": build_instructions(
-                                    _instr_spec_ds, _per_req_instr, []
+                                "instructions": _append_environment_profile_guide(
+                                    build_instructions(_instr_spec_ds, _per_req_instr, []),
+                                    _instr_spec_ds,
                                 ),
                             }
                         if _authored_ds and harness_name:

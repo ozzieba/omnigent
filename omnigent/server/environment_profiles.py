@@ -139,6 +139,33 @@ def get_environment_profile(reference: str) -> EnvironmentProfile | None:
     return _PROFILES.get(reference)
 
 
+def environment_profile_agent_guide(reference: str) -> str | None:
+    """Render trusted profile capability metadata for an agent system prompt.
+
+    This is generated from the same immutable catalog shown in New Agent. It
+    describes capabilities but does not grant them or reveal user credentials.
+    """
+    profile = get_environment_profile(reference)
+    if profile is None:
+        return None
+
+    lines = [
+        "## Omnigent agent environment",
+        f"Profile: {profile.name} (`{profile.reference}`; {profile.access}).",
+        profile.description,
+        "Inspect this session's profile at any time with `sys_session_get_info`.",
+        "Only capabilities marked available below are present in this environment.",
+    ]
+    for capability in profile.capabilities:
+        interfaces = ", ".join(capability.interfaces)
+        lines.append(
+            f"- **{capability.state}: {capability.name}** (`{capability.id}`); "
+            f"access: {capability.access}; interfaces: {interfaces}; "
+            f"authorization owner: {capability.authorization_owner}. {capability.reason}"
+        )
+    return "\n".join(lines)
+
+
 def validate_workspace_readonly_spec(spec: object) -> bool:
     """Accept only the fixed, cross-platform read-only workspace policy."""
     from omnigent.inner.datamodel import OSEnvSpec
