@@ -65,9 +65,10 @@ jobs:
               --ignore=tests/runtime/policies
             dist: worksteal
           - group: inner-rest
-            # Bubblewrap's user namespaces are blocked by the default Docker
-            # seccomp profile; this runner opens them without mounting Docker
-            # into the test job.
+            # This repo-scoped runner gives Bubblewrap mount/net namespace
+            # capabilities and unconfined seccomp/AppArmor. Its test jobs have
+            # no Docker socket or host bind mounts; other shards use the
+            # general runner without these capabilities.
             runner: ubuntu-bwrap
             paths: tests/inner
           - group: tools
