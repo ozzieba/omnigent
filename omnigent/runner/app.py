@@ -1181,14 +1181,18 @@ class InstructionComposition:
 def _append_environment_profile_guide(
     instructions: str | None,
     spec: AgentSpec,
+    *,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
 ) -> str | None:
     """Append the selected server-owned environment contract to agent context."""
     reference = spec.params.get("environment_profile")
     if not isinstance(reference, str):
         return instructions
+    filesystem_path = resource_registry.ensure_environment_profile_guide(session_id, reference)
     from omnigent.server.environment_profiles import environment_profile_agent_guide
 
-    guide = environment_profile_agent_guide(reference)
+    guide = environment_profile_agent_guide(reference, filesystem_path=filesystem_path)
     if guide is None:
         return instructions
     if instructions is None or not instructions.strip():
@@ -3576,6 +3580,10 @@ def create_runner_app(
                     )
                 if _start_verdict.data is not None:
                     _apply_sandbox_override_from_verdict(spec, _start_verdict.data)
+
+            profile = spec.params.get("environment_profile")
+            if isinstance(profile, str):
+                resource_registry.ensure_environment_profile_guide(session_id, profile)
 
             await _ensure_session_subagent_router(
                 session_id,
@@ -7077,7 +7085,12 @@ def create_runner_app(
                     _raw_per_request_instructions,
                     [],
                 )
-            instructions = _append_environment_profile_guide(instructions, cached_spec)
+            instructions = _append_environment_profile_guide(
+                instructions,
+                cached_spec,
+                session_id=conv,
+                resource_registry=resource_registry,
+            )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
             if _authored_bg and harness_name:
@@ -7641,7 +7654,10 @@ def create_runner_app(
                             ),
                         )
                         _ic_ds.composed = _append_environment_profile_guide(
-                            _ic_ds.composed, _instr_spec_ds
+                            _ic_ds.composed,
+                            _instr_spec_ds,
+                            session_id=conv_id,
+                            resource_registry=resource_registry,
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
                         if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
@@ -7654,6 +7670,8 @@ def create_runner_app(
                                 "instructions": _append_environment_profile_guide(
                                     build_instructions(_instr_spec_ds, _per_req_instr, []),
                                     _instr_spec_ds,
+                                    session_id=conv_id,
+                                    resource_registry=resource_registry,
                                 ),
                             }
                         if _authored_ds and harness_name:

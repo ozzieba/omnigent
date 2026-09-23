@@ -65,15 +65,16 @@ class EnvironmentProfile:
         }
 
 
-# This first profile exposes only the selected workspace. Linux bwrap and
-# macOS seatbelt both mount cwd read-only unless a write grant is declared.
+# This first profile exposes the selected workspace and a generated,
+# read-only environment guide. Linux bwrap and macOS seatbelt both mount cwd
+# read-only unless a write grant is declared.
 WORKSPACE_READONLY = EnvironmentProfile(
     id="workspace-readonly",
     revision=1,
     name="Read-only workspace",
     description=(
-        "Expose the session workspace to OS tools as read-only; "
-        "no additional mounts or credentials."
+        "Expose the session workspace and a generated AGENTS.md environment "
+        "guide to OS tools as read-only; no host mounts or credentials."
     ),
     access="read-only",
     capabilities=(
@@ -84,7 +85,22 @@ WORKSPACE_READONLY = EnvironmentProfile(
             interfaces=("shell", "filesystem-api"),
             access="read-only",
             authorization_owner="session owner",
-            reason="Only the session workspace is exposed, with OS-level read-only isolation.",
+            reason=(
+                "The session workspace has OS-level read-only isolation. The generated "
+                "environment guide is exposed separately under its own capability."
+            ),
+        ),
+        EnvironmentCapability(
+            id="agent.environment-guide",
+            name="Environment guide",
+            state="available",
+            interfaces=("AGENTS.md", "sys_os_read", "shell"),
+            access="read-only",
+            authorization_owner="platform",
+            reason=(
+                "A server-generated guide is mounted from a private per-session "
+                "temporary directory outside the workspace."
+            ),
         ),
         EnvironmentCapability(
             id="host.mounts",
@@ -139,7 +155,11 @@ def get_environment_profile(reference: str) -> EnvironmentProfile | None:
     return _PROFILES.get(reference)
 
 
-def environment_profile_agent_guide(reference: str) -> str | None:
+def environment_profile_agent_guide(
+    reference: str,
+    *,
+    filesystem_path: str | None = None,
+) -> str | None:
     """Render trusted profile capability metadata for an agent system prompt.
 
     This is generated from the same immutable catalog shown in New Agent. It
@@ -156,6 +176,11 @@ def environment_profile_agent_guide(reference: str) -> str | None:
         "Inspect this session's profile at any time with `sys_session_get_info`.",
         "Only capabilities marked available below are present in this environment.",
     ]
+    if filesystem_path is not None:
+        lines.append(
+            "A read-only `AGENTS.md` copy of this environment guide is mounted at "
+            f"`{filesystem_path}`."
+        )
     for capability in profile.capabilities:
         interfaces = ", ".join(capability.interfaces)
         lines.append(

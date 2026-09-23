@@ -15,10 +15,11 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -347,6 +348,8 @@ class SessionResourceRegistry:
         self._runner_workspace = runner_workspace
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
+        self._environment_guide_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
+        self._environment_guide_paths: dict[str, Path] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, bool] = TTLCache(
@@ -762,6 +765,35 @@ class SessionResourceRegistry:
             self._primary_envs[session_id] = os_env
             return os_env
 
+    def ensure_environment_profile_guide(self, session_id: str, reference: str) -> str | None:
+        """Create or return the read-only, session-scoped profile AGENTS.md."""
+        with self._lock:
+            path = self._ensure_environment_profile_guide_locked(session_id, reference)
+            return str(path) if path is not None else None
+
+    def _ensure_environment_profile_guide_locked(
+        self,
+        session_id: str,
+        reference: str,
+    ) -> Path | None:
+        existing = self._environment_guide_paths.get(session_id)
+        if existing is not None:
+            return existing
+
+        from omnigent.server.environment_profiles import environment_profile_agent_guide
+
+        tempdir = tempfile.TemporaryDirectory(prefix="omnigent-environment-")
+        path = Path(tempdir.name) / "AGENTS.md"
+        guide = environment_profile_agent_guide(reference, filesystem_path=str(path))
+        if guide is None:
+            tempdir.cleanup()
+            return None
+        path.write_text(guide + "\n", encoding="utf-8")
+        path.chmod(0o444)
+        self._environment_guide_dirs[session_id] = tempdir
+        self._environment_guide_paths[session_id] = path
+        return path
+
     def _create_primary_env(
         self,
         session_id: str,
@@ -835,6 +867,18 @@ class SessionResourceRegistry:
                     raise ValueError(
                         "workspace-readonly@1 requires Linux bwrap or macOS seatbelt filesystem isolation"
                     )
+                guide_path = self._ensure_environment_profile_guide_locked(
+                    session_id, str(profile)
+                )
+                if guide_path is None:
+                    raise ValueError("environment profile has no generated AGENTS.md guide")
+                guide_root = str(guide_path.parent)
+                read_paths = list(spec_os_env.sandbox.read_paths or [])
+                if guide_root not in read_paths:
+                    read_paths.append(guide_root)
+                effective_sandbox = replace(spec_os_env.sandbox, read_paths=read_paths)
+            else:
+                effective_sandbox = spec_os_env.sandbox
             # Precedence per designs/SESSION_WORKSPACE_SELECTION.md:
             # runner_workspace (env-var-driven) ALWAYS wins when set.
             # Otherwise the spec's absolute cwd wins; otherwise we
@@ -850,7 +894,7 @@ class SessionResourceRegistry:
             effective_spec = OSEnvSpec(
                 type=spec_os_env.type,
                 cwd=cwd,
-                sandbox=spec_os_env.sandbox,
+                sandbox=effective_sandbox,
                 fork=spec_os_env.fork,
                 start_in_scratch=spec_os_env.start_in_scratch,
             )
@@ -1639,6 +1683,8 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             primary = self._primary_envs.pop(session_id, None)
+            environment_guide_dir = self._environment_guide_dirs.pop(session_id, None)
+            self._environment_guide_paths.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
                 self._terminal_roles.pop(key, None)
@@ -1664,6 +1710,14 @@ class SessionResourceRegistry:
             except Exception:
                 _logger.exception(
                     "Error cleaning up terminals for session=%s",
+                    session_id,
+                )
+        if environment_guide_dir is not None:
+            try:
+                environment_guide_dir.cleanup()
+            except Exception:
+                _logger.exception(
+                    "Error cleaning environment guide for session=%s",
                     session_id,
                 )
 

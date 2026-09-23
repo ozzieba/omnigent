@@ -9,10 +9,11 @@ access, and credentials are never stored in a profile.
 ## Current profile
 
 `workspace-readonly@1` is the only published profile. It gives the selected
-agent read-only access to its session workspace through its OS environment.
-It does not expose host filesystems or mounts, SSH credentials, cloud
-credentials, Kubernetes, service APIs, or service indexes. Those capabilities
-are listed as unavailable in the catalog and New Agent screen.
+agent read-only access to its session workspace and a generated environment
+`AGENTS.md` guide through its OS environment. It does not expose host
+filesystems or mounts, SSH credentials, cloud credentials, Kubernetes,
+service APIs, or service indexes. Those capabilities are listed as unavailable
+in the catalog and New Agent screen.
 
 The server validates the selected profile against the exact profile revision,
 the bundle's declared `environment_profile`, and the fixed read-only OS
@@ -26,10 +27,13 @@ profile reference and its capability manifest, including unavailable
 interfaces and authorization owners. This is discovery metadata; it does not
 grant capabilities or mount resources into the environment.
 
-On each turn, Omnigent also appends a server-generated environment guide to
-the agent's system instructions. It is derived from the selected profile and
-is equivalent in purpose to an `AGENTS.md` environment section, but it is not
-currently a separate file mounted into the workspace.
+On each turn, Omnigent appends a server-generated environment guide to the
+agent's system instructions. The runner stores the same guide as a session
+scoped `AGENTS.md` in a private temporary directory and adds that directory as
+a read-only sandbox grant. The exact path is included in the guide for
+`sys_os_read` and shell access. The generated file is outside the user's
+workspace and is recreated when the runner reinitializes the session; it is
+not portable workspace state.
 
 ## Adding a profile revision
 
