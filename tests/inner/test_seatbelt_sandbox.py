@@ -1231,6 +1231,7 @@ def test_helper_boots_when_interpreter_lives_under_home_uv_layout(
 
 def test_ensure_executable_visible_two_hop_proxy_finds_cpython_install_root(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Regression for uv tool-install two-hop symlink layout (issue #3237).
@@ -1253,6 +1254,15 @@ def test_ensure_executable_visible_two_hop_proxy_finds_cpython_install_root(
     import uuid
 
     home = Path.home()
+    # CI runs as root, whose HOME is /root; production policy does not list
+    # /root as a shared unsafe ancestor. Make the unsafe-ancestor premise of
+    # this regression explicit so the narrow fallback is tested there too.
+    topmost_home = Path(home.anchor) / home.parts[1]
+    unsafe_ancestors = _UNSAFE_WIDEN_ANCESTORS | {str(topmost_home)}
+    monkeypatch.setattr(
+        "omnigent.inner.seatbelt_sandbox._UNSAFE_WIDEN_ANCESTORS",
+        frozenset(unsafe_ancestors),
+    )
 
     # Layer 1 — CPython install root (the real target).  Lives under HOME
     # so topmost ancestor is in _UNSAFE_WIDEN_ANCESTORS and the narrow-
@@ -1291,7 +1301,7 @@ def test_ensure_executable_visible_two_hop_proxy_finds_cpython_install_root(
             "the exec inside the sandbox."
         )
         for extra in extras:
-            assert str(extra) not in _UNSAFE_WIDEN_ANCESTORS, (
+            assert str(extra) not in unsafe_ancestors, (
                 f"_ensure_executable_visible granted an unsafe broad ancestor "
                 f"{extra!r} instead of the narrow CPython install root."
             )

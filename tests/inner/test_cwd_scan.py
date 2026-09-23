@@ -780,7 +780,9 @@ def test_missing_cwd_returns_empty_list(tmp_path: Path) -> None:
     assert entries == []
 
 
-def test_unreadable_subdirectory_is_skipped_silently(tmp_path: Path) -> None:
+def test_unreadable_subdirectory_is_skipped_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     A subdirectory that can't be opened (e.g. permission denied)
     is skipped without raising. The parent stays in the safe set,
@@ -790,14 +792,18 @@ def test_unreadable_subdirectory_is_skipped_silently(tmp_path: Path) -> None:
     sub = tmp_path / "locked"
     sub.mkdir()
     (sub / ".env").write_text("masked-if-readable")
-    # Drop read+execute permissions so os.scandir raises PermissionError
-    # inside the walker; the walker is contractually required to
-    # swallow this rather than propagate.
-    sub.chmod(0o000)
-    try:
+    # Simulate the scandir failure directly: chmod(0) is still readable by
+    # root, which is how Forgejo's job container runs this test.
+    real_scandir = os.scandir
+
+    def scandir_with_locked_subdir(path: os.PathLike[str] | str):
+        if Path(path) == sub:
+            raise PermissionError(f"cannot scan {sub}")
+        return real_scandir(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "scandir", scandir_with_locked_subdir)
         entries = _scan(tmp_path)
-    finally:
-        sub.chmod(0o700)
     # The locked subdirectory itself is a non-dot dir with a non-
     # escaping target (cwd), so it's not in the result; the .env
     # inside is unreachable and also absent. The contract is
