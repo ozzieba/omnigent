@@ -1975,7 +1975,7 @@ def test_handle_stat_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     assert result.canonical_path == os.path.realpath(target)
 
 
-def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
+async def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     """
     A spawned runner inherits only allowlisted host env vars — process
     essentials pass through, the host owner's NON-HARNESS secrets do
