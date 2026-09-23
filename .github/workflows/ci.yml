@@ -235,12 +235,11 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # Forgejo-patched v4.3.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: pytest-${{ matrix.group }}-${{ github.run_id }}
           path: artifacts/
           retention-days: 14
-          include-hidden-files: true  # the per-shard .coverage.<group> dotfile
 
   stores-postgres:
     name: Pytest (stores-postgres)
@@ -284,7 +283,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-postgres.xml
       - if: always()
-        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db
         with:
           name: pytest-stores-postgres-${{ github.run_id }}
           path: artifacts/
@@ -334,7 +333,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-mysql.xml
       - if: always()
-        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db
         with:
           name: pytest-stores-mysql-${{ github.run_id }}
           path: artifacts/
@@ -426,7 +425,7 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # Forgejo-patched v4.3.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: pytest-codex-parity-${{ github.run_id }}
           path: artifacts/
@@ -460,11 +459,9 @@ jobs:
         run: pip install "coverage>=7"
 
       - name: Download shard coverage data
-        uses: https://code.forgejo.org/forgejo/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427  # Forgejo-patched v4.1.4
+        uses: https://code.forgejo.org/forgejo/download-artifact@246d7188e736d3686f6d19628d253ede9697bd55  # Forgejo v3-node20
         with:
-          pattern: pytest-*
           path: covdata
-          merge-multiple: true
 
       - name: Combine + report
         shell: bash
@@ -486,7 +483,7 @@ jobs:
 
       - name: Upload coverage summary
         if: always()
-        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # Forgejo-patched v4.3.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: coverage-summary-${{ github.run_id }}
           path: coverage-summary/
