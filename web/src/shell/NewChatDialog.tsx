@@ -250,7 +250,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import {
+  createBundledSession,
+  launchRunner,
+  listEnvironmentProfiles,
+  type EnvironmentProfile,
+} from "@/lib/sessionsApi";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -2023,6 +2028,7 @@ interface LandingDraft {
   selectedHostId: string | null;
   sandboxSelected: boolean;
   sandboxProvider: string | null;
+  environmentProfile: string | null;
   sandboxRepoUrl: string;
   sandboxRepoBranch: string;
   workspace: string;
@@ -2183,6 +2189,7 @@ export function NewChatLandingScreen() {
           selectedHostId: null,
           sandboxSelected: false,
           sandboxProvider: null,
+          environmentProfile: null,
           // The repo inputs compose the managed create's workspace string, so
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
@@ -2325,6 +2332,15 @@ export function NewChatLandingScreen() {
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
+  const [environmentProfiles, setEnvironmentProfiles] = useState<EnvironmentProfile[]>([]);
+  const environmentProfilesLoadedRef = useRef(false);
+  const loadEnvironmentProfiles = useCallback(() => {
+    if (environmentProfilesLoadedRef.current) return;
+    environmentProfilesLoadedRef.current = true;
+    void listEnvironmentProfiles().then(setEnvironmentProfiles, () => {
+      environmentProfilesLoadedRef.current = false;
+    });
+  }, []);
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers
@@ -2397,6 +2413,9 @@ export function NewChatLandingScreen() {
   // seed and for a single-provider server that names no provider.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => restoredDraft?.sandboxProvider ?? null,
+  );
+  const [environmentProfile, setEnvironmentProfile] = useState<string | null>(
+    () => restoredDraft?.environmentProfile ?? null,
   );
   const {
     data: hostClaudeModelOptions,
@@ -2621,6 +2640,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     sandboxSelected,
     sandboxProvider,
+    environmentProfile,
     sandboxRepoUrl,
     sandboxRepoBranch,
     workspace,
@@ -4405,6 +4425,7 @@ export function NewChatLandingScreen() {
             ...(sandboxSelected
               ? {
                   host_type: "managed",
+                  environment_profile: environmentProfile ?? undefined,
                   // On a `project_id` create an ABSENT workspace would be
                   // default-filled with the config's path workspace, which a
                   // managed create rejects — pin an explicit null instead
@@ -5402,6 +5423,58 @@ export function NewChatLandingScreen() {
                       </DropdownMenuItem>
                     );
                   })}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuSub
+                    onOpenChange={(open) => {
+                      if (open) loadEnvironmentProfiles();
+                    }}
+                  >
+                    <DropdownMenuSubTrigger
+                      disabled={!sandboxSelected}
+                      data-testid="new-chat-environment-profile-menu"
+                    >
+                      Environment profile{environmentProfile ? ` · ${environmentProfile}` : ""}
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 overflow-y-auto">
+                      <DropdownMenuItem
+                        onSelect={() => setEnvironmentProfile(null)}
+                        data-testid="new-chat-environment-profile-none"
+                      >
+                        No profile
+                      </DropdownMenuItem>
+                      {environmentProfiles.map((profile) => {
+                        const managedImageReady =
+                          sandboxProvider === "kubernetes" &&
+                          profile.managed_host_image.state === "available";
+                        const disabled =
+                          sandboxSelected &&
+                          profile.managed_host_image_reference !== null &&
+                          !managedImageReady;
+                        return (
+                          <DropdownMenuItem
+                            key={profile.reference}
+                            disabled={disabled}
+                            onSelect={() => setEnvironmentProfile(profile.reference)}
+                            data-testid={`new-chat-environment-profile-${profile.id}`}
+                          >
+                            <span className="flex flex-col">
+                              <span>
+                                {profile.name} ({profile.reference})
+                              </span>
+                              {profile.managed_host_image_reference && (
+                                <span className="text-xs text-muted-foreground">
+                                  Managed image: {profile.managed_host_image.state}
+                                  {profile.managed_host_image.image
+                                    ? ` · ${profile.managed_host_image.image}`
+                                    : ""}
+                                </span>
+                              )}
+                            </span>
+                          </DropdownMenuItem>
+                        );
+                      })}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
                   {/* Desktop shell, machine not in the list yet: offer to connect
                     it in one click. */}
                   {showConnectThisMachine && (

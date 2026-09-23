@@ -1390,6 +1390,9 @@ class _SessionCreateRequestBase(BaseModel):
         provision on, e.g. ``"modal"`` — one of the names ``GET /v1/info``
         reports in ``sandbox_providers``. Only valid with
         ``host_type: "managed"``; ``None`` takes the server's first.
+    :param environment_profile: Optional immutable server-published profile
+        revision. A managed Kubernetes image, when selected by that profile,
+        is resolved from the server's image catalog.
     :param workspace: Where the session works. For external hosts:
         an absolute path on the host where the runner should start,
         e.g. ``"/Users/corey/universe/src/foo"``. Required when
@@ -1486,6 +1489,7 @@ class _SessionCreateRequestBase(BaseModel):
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
     sandbox_provider: str | None = None
+    environment_profile: str | None = Field(default=None, min_length=3, max_length=128)
     workspace: str | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
@@ -2094,6 +2098,8 @@ class SessionResponse(BaseModel):
         snapshots independently of lifecycle status.
     :param environment_profile: Immutable server-published profile revision
         selected when this session was created, e.g. ``workspace-readonly@1``.
+    :param environment_runtime_ref: Immutable managed-host runtime image catalog
+        revision resolved by the server, or ``None`` when no managed image was selected.
     :param environment_capabilities: Public capability catalog for the
         selected environment profile. This lets agents inspect the actual
         interfaces and authorization state available to their session.
@@ -2144,6 +2150,7 @@ class SessionResponse(BaseModel):
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     environment_profile: str | None = None
+    environment_runtime_ref: str | None = None
     environment_capabilities: list[dict[str, Any]] = Field(default_factory=list)
     git_branch: str | None = None
     archived: bool = False

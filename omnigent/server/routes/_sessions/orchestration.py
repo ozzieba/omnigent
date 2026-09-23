@@ -1145,6 +1145,7 @@ def _build_session_response(
         pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
         environment_profile=conv.environment_profile,
+        environment_runtime_ref=conv.environment_runtime_ref,
         environment_capabilities=environment_capabilities,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -2903,6 +2904,7 @@ async def _run_managed_launch(
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
     project_store: ProjectStore | None = None,
+    runtime_image_reference: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2988,6 +2990,7 @@ async def _run_managed_launch(
         relaunch_host=relaunch_host,
         provider=provider,
         agent_name=agent_name,
+        runtime_image_reference=runtime_image_reference,
     )
     if managed is None:
         return
@@ -3594,6 +3597,7 @@ def _kick_managed_relaunch(
             agent_store=agent_store,
             agent_id=conv.agent_id,
             project_store=getattr(app_state, "project_store", None),
+            runtime_image_reference=conv.environment_runtime_ref,
         )
     )
     _managed_launch_tasks.add(relaunch_task)
@@ -8349,11 +8353,13 @@ async def _create_session_from_existing_agent(
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
     inherited_environment_profile: str | None = None
+    inherited_environment_runtime_ref: str | None = None
     if body.parent_session_id is not None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
             inherited_environment_profile = parent_conv.environment_profile
+            inherited_environment_runtime_ref = parent_conv.environment_runtime_ref
             # A child the caller binds to an explicit host/workspace runs on
             # a runner that host launches there. Pinning it to the parent's
             # runner instead would execute it in the parent's process and
@@ -8371,6 +8377,31 @@ async def _create_session_from_existing_agent(
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
+
+    if (
+        body.environment_profile is not None
+        and inherited_environment_profile is not None
+        and body.environment_profile != inherited_environment_profile
+    ):
+        raise OmnigentError(
+            "a child session must use its parent's immutable environment profile",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    selected_environment_profile = body.environment_profile or inherited_environment_profile
+    if inherited_environment_profile is not None:
+        environment_runtime_ref = inherited_environment_runtime_ref
+    else:
+        from omnigent.server.managed_hosts import resolve_profile_runtime_reference
+
+        try:
+            environment_runtime_ref = resolve_profile_runtime_reference(
+                selected_environment_profile,
+                deployment=getattr(request.app.state, "sandbox_config", None),
+                provider=body.sandbox_provider,
+                managed=body.host_type == "managed",
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must
@@ -8507,7 +8538,8 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
             project_id=project_resolution.project_id,
-            environment_profile=inherited_environment_profile,
+            environment_profile=selected_environment_profile,
+            environment_runtime_ref=environment_runtime_ref,
         )
     except NameAlreadyExistsError as exc:
         if (
@@ -8875,6 +8907,7 @@ def _create_session_from_bundle(
     metadata: SessionCreateMetadata,
     bundle_bytes: bytes,
     runner_id: str | None = None,
+    environment_runtime_ref: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -8981,6 +9014,7 @@ def _create_session_from_bundle(
         agent_bundle_location=agent_bundle_location,
         agent_description=spec.description,
         runner_id=runner_id,
+        environment_runtime_ref=environment_runtime_ref,
     )
 
 

@@ -247,6 +247,7 @@ def _to_conversation(
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         project_id=meta.project_id if meta else None,
         environment_profile=meta.environment_profile if meta else None,
+        environment_runtime_ref=meta.environment_runtime_ref if meta else None,
     )
 
 
@@ -309,6 +310,7 @@ def _new_session_metadata_row(
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
     environment_profile: str | None = None,
+    environment_runtime_ref: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -330,6 +332,7 @@ def _new_session_metadata_row(
         runner_id=runner_id,
         project_id=project_id,
         environment_profile=environment_profile,
+        environment_runtime_ref=environment_runtime_ref,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -891,6 +894,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str | None = None,
         project_id: str | None = None,
         environment_profile: str | None = None,
+        environment_runtime_ref: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1024,6 +1028,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ),
                 project_id=project_id,
                 environment_profile=environment_profile,
+                environment_runtime_ref=environment_runtime_ref,
             )
             with self._session("insert_conversation_metadata") as meta_sess:
                 meta_sess.add(meta)
@@ -3341,6 +3346,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         runner_id: str | None = None,
         project_id: str | None = None,
         environment_profile: str | None = None,
+        environment_runtime_ref: str | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -3409,6 +3415,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             runner_id=runner_id,
             project_id=project_id,
             environment_profile=environment_profile,
+            environment_runtime_ref=environment_runtime_ref,
         )
 
     def _create_session_with_agent_with_id(
@@ -3428,6 +3435,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         runner_id: str | None = None,
         project_id: str | None = None,
         environment_profile: str | None = None,
+        environment_runtime_ref: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -3477,6 +3485,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             runner_id=runner_id,
             project_id=project_id,
             environment_profile=environment_profile,
+            environment_runtime_ref=environment_runtime_ref,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
         )

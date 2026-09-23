@@ -705,6 +705,11 @@ function mockAgents(agents: AvailableAgent[]) {
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
+  authenticatedFetchMock.mockImplementation(async (url) =>
+    url === "/v1/environment-profiles"
+      ? new Response(JSON.stringify({ data: [] }), { status: 200 })
+      : new Response("{}", { status: 200 }),
+  );
   useHostsMock.mockReset();
   useHostModelOptionsMock.mockReset();
   useAvailableAgentsMock.mockReset();
@@ -2568,6 +2573,57 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     // The resolved create navigates without surfacing an error.
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
+  });
+
+  it("sends the selected published environment profile with a managed create", async () => {
+    const image = `ghcr.io/oz/omnigent-host@sha256:${"d".repeat(64)}`;
+    authenticatedFetchMock.mockImplementation(async (url) => {
+      if (url === "/v1/environment-profiles") {
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "workspace-readonly",
+                revision: 1,
+                reference: "workspace-readonly@1",
+                name: "Read-only workspace",
+                description: "Read-only workspace environment",
+                access: "read-only",
+                managed_host_image_reference: "omnigent-host@1",
+                managed_host_image: {
+                  reference: "omnigent-host@1",
+                  state: "available",
+                  image,
+                  reason: "Published by the Kubernetes operator.",
+                },
+                capabilities: [],
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ id: "conv_profile" }), { status: 200 });
+    });
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.pointerMove(screen.getByTestId("new-chat-environment-profile-menu"), {
+      pointerType: "mouse",
+    });
+    const profile = await screen.findByTestId("new-chat-environment-profile-workspace-readonly");
+    fireEvent.click(profile);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "inspect safely" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.environment_profile).toBe("workspace-readonly@1");
+    expect(body.image).toBeUndefined();
+    expect(body.image_ref).toBeUndefined();
   });
 
   it("shows the default hero heading in the normal new-session flow (no project)", async () => {

@@ -334,6 +334,25 @@ export function CreateAgentDialog({
               </div>
             ) : null}
             {environmentProfiles.find((profile) => profile.reference === environmentProfile)
+              ?.managed_host_image_reference && (
+              <p className="text-xs text-muted-foreground" data-testid="create-agent-managed-image">
+                Managed runtime{" "}
+                {
+                  environmentProfiles.find((profile) => profile.reference === environmentProfile)!
+                    .managed_host_image_reference
+                }
+                :{" "}
+                {
+                  environmentProfiles.find((profile) => profile.reference === environmentProfile)!
+                    .managed_host_image.state
+                }
+                {environmentProfiles.find((profile) => profile.reference === environmentProfile)!
+                  .managed_host_image.image
+                  ? ` · ${environmentProfiles.find((profile) => profile.reference === environmentProfile)!.managed_host_image.image}`
+                  : ` · ${environmentProfiles.find((profile) => profile.reference === environmentProfile)!.managed_host_image.reason}`}
+              </p>
+            )}
+            {environmentProfiles.find((profile) => profile.reference === environmentProfile)
               ?.capabilities?.length ? (
               <ul className="mt-1 flex flex-col gap-1.5" aria-label="Environment capabilities">
                 {environmentProfiles

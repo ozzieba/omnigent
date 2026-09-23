@@ -147,6 +147,7 @@ interface SessionResponseWire {
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   environment_profile?: string | null;
+  environment_runtime_ref?: string | null;
   /**
    * Native-terminal CLI args the session launched with, e.g.
    * ``["--permission-mode", "plan"]``. Records only the LAUNCH flags —
@@ -322,6 +323,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     labels: wire.labels,
     workspace: wire.workspace ?? null,
     environmentProfile: wire.environment_profile ?? null,
+    environmentRuntimeRef: wire.environment_runtime_ref ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
     items: wire.items ?? [],
@@ -736,6 +738,13 @@ export interface EnvironmentProfile {
   access: string;
   workspace_access: "read-only" | "read-write";
   runtime_manifest: RuntimeManifest | null;
+  managed_host_image_reference: string | null;
+  managed_host_image: {
+    reference: string | null;
+    state: "available" | "unavailable";
+    image: string | null;
+    reason: string;
+  };
   capabilities: EnvironmentCapability[];
 }
 

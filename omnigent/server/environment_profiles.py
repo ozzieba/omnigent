@@ -55,6 +55,7 @@ class EnvironmentProfile:
     workspace_access: WorkspaceAccess
     capabilities: tuple[EnvironmentCapability, ...]
     runtime_manifest_reference: str
+    managed_host_image_reference: str | None = None
 
     @property
     def reference(self) -> str:
@@ -73,6 +74,7 @@ class EnvironmentProfile:
             "runtime_manifest": (
                 runtime_manifest.public_dict() if runtime_manifest is not None else None
             ),
+            "managed_host_image_reference": self.managed_host_image_reference,
             "capabilities": [capability.public_dict() for capability in self.capabilities],
         }
 
@@ -92,6 +94,7 @@ WORKSPACE_READONLY = EnvironmentProfile(
     access="read-only",
     workspace_access="read-only",
     runtime_manifest_reference=OMNIGENT_HOST_RUNTIME.reference,
+    managed_host_image_reference="omnigent-host@1",
     capabilities=(
         EnvironmentCapability(
             id="session.workspace",
