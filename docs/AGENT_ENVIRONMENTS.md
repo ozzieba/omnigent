@@ -20,6 +20,12 @@ environment policy. This prevents a bundle from selecting the profile while
 requesting broader filesystem write access. The profile itself contains no
 paths, tokens, or other user-specific data.
 
+Agents can inspect the profile selected for their own session by calling
+`sys_session_get_info` without a `session_id`. The result includes the immutable
+profile reference and its capability manifest, including unavailable
+interfaces and authorization owners. This is discovery metadata; it does not
+grant capabilities or mount resources into the environment.
+
 ## Adding a profile revision
 
 Add a new revision rather than changing the meaning of a published reference.

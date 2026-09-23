@@ -2094,6 +2094,9 @@ class SessionResponse(BaseModel):
         snapshots independently of lifecycle status.
     :param environment_profile: Immutable server-published profile revision
         selected when this session was created, e.g. ``workspace-readonly@1``.
+    :param environment_capabilities: Public capability catalog for the
+        selected environment profile. This lets agents inspect the actual
+        interfaces and authorization state available to their session.
     """
 
     id: str
@@ -2141,6 +2144,7 @@ class SessionResponse(BaseModel):
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     environment_profile: str | None = None
+    environment_capabilities: list[dict[str, Any]] = Field(default_factory=list)
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)

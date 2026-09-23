@@ -4540,6 +4540,10 @@ async def _session_get_info_via_rest(
             # agent spec's default; both may be None when unset.
             "model": snap.get("model_override") or snap.get("llm_model"),
             "workspace": snap.get("workspace"),
+            "environment_profile": _optional_string(snap.get("environment_profile")),
+            "environment_capabilities": _json_object_list(
+                snap.get("environment_capabilities")
+            ),
             "git_branch": snap.get("git_branch"),
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick

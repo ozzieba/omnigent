@@ -1072,6 +1072,15 @@ def _build_session_response(
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
+    environment_capabilities: list[dict[str, Any]] = []
+    if conv.environment_profile is not None:
+        from omnigent.server.environment_profiles import get_environment_profile
+
+        environment_profile = get_environment_profile(conv.environment_profile)
+        if environment_profile is not None:
+            environment_capabilities = [
+                capability.public_dict() for capability in environment_profile.capabilities
+            ]
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -1136,6 +1145,7 @@ def _build_session_response(
         pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
         environment_profile=conv.environment_profile,
+        environment_capabilities=environment_capabilities,
         git_branch=conv.git_branch,
         archived=conv.archived,
         # Replay the latest todo list for claude-native sessions.
