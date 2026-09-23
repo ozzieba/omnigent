@@ -65,7 +65,10 @@ jobs:
               --ignore=tests/runtime/policies
             dist: worksteal
           - group: inner-rest
-            runner: ubuntu-latest
+            # Bubblewrap's user namespaces are blocked by the default Docker
+            # seccomp profile; this runner opens them without mounting Docker
+            # into the test job.
+            runner: ubuntu-bwrap
             paths: tests/inner
           - group: tools
             runner: ubuntu-latest
