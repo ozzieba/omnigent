@@ -46,15 +46,15 @@ entire environment. Copy the sample to the dedicated runner service's external
 environment file and point that service at a **new, versioned virtual
 environment**. Do not upgrade the currently running environment in place.
 
-The activation wheel is Docloop 0.2.7, built from source commit `cfff8d9`, now
-included in main at `50fc992f`. Use the exact artifact and verify its hash before
+The activation wheel is Docloop 0.2.7, built from main commit `d959973`.
+Use the exact artifact and verify its hash before
 installing it. Run this in the **new, versioned runner virtual environment**,
 never in the environment used by the active runner:
 
 ```sh
 DOCLOOP_WHEEL=/home/oz/docloop-dogfood/releases/0.2.7/docloop-0.2.7-py3-none-any.whl
 printf '%s  %s\n' \
-  cdd78b6345334db717da35eb5b2a8ac7fc40d71d77a2035d515f8caced882a6f \
+  eb74402a63c591196a10338c6b655fcf6c377f6ab78b433ceaf0c81ffdf0e434 \
   "$DOCLOOP_WHEEL" | sha256sum --check
 python -m pip install \
   "docloop[jupyter,python-state] @ file://$DOCLOOP_WHEEL"

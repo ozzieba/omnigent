@@ -157,7 +157,7 @@ RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]
 # pinned in the build context so the server image discovers its community
 # harness contribution at spec-load time.
 COPY deploy/docker/vendor/docloop-0.2.7-py3-none-any.whl /tmp/docloop-0.2.7-py3-none-any.whl
-RUN echo "cdd78b6345334db717da35eb5b2a8ac7fc40d71d77a2035d515f8caced882a6f  /tmp/docloop-0.2.7-py3-none-any.whl" | sha256sum -c - \
+RUN echo "eb74402a63c591196a10338c6b655fcf6c377f6ab78b433ceaf0c81ffdf0e434  /tmp/docloop-0.2.7-py3-none-any.whl" | sha256sum -c - \
  && uv pip install --no-cache-dir /tmp/docloop-0.2.7-py3-none-any.whl \
  && rm -f /tmp/docloop-0.2.7-py3-none-any.whl \
  && python -c "from importlib.metadata import entry_points; from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES; eps = entry_points(group='omnigent.community.harness'); assert any(ep.name == 'docloop' and ep.value == 'docloop.omnigent:contribution' for ep in eps), [(ep.name, ep.value) for ep in eps]; assert 'docloop' in OMNIGENT_HARNESSES, sorted(OMNIGENT_HARNESSES)"
