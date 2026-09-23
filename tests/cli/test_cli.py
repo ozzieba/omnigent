@@ -2270,6 +2270,9 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     monkeypatch.setattr(_local_server_mod, "pick_local_port", lambda preferred: preferred)
     monkeypatch.setattr(_local_server_mod, "register_local_server", lambda port: None)
     monkeypatch.setattr(_local_server_mod, "clear_local_server_record", lambda: None)
+    # This test covers tunnel-token wiring, not bind preflight. CI jobs share
+    # the runner's host network and another test can own port 9999.
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", lambda host, port: None)
 
     config_home = tmp_path / "config"
     config_home.mkdir()
