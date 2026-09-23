@@ -1178,14 +1178,25 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
     )
     runner_pid = int(proc.stdout.strip().splitlines()[-1])
 
+    import psutil
+
+    def runner_exited() -> bool:
+        # In a CI container the orphan is adopted by PID 1, which may leave
+        # exited children as zombies. A zombie has exited even though the
+        # production _pid_alive() intentionally counts it until reaped.
+        try:
+            return psutil.Process(runner_pid).status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return True
+
     try:
         for _ in range(60):
-            if not _pid_alive(runner_pid):
+            if runner_exited():
                 break
             await asyncio.sleep(0.1)
-        assert not _pid_alive(runner_pid)
+        assert runner_exited()
     finally:
-        if _pid_alive(runner_pid):
+        if not runner_exited():
             with contextlib.suppress(ProcessLookupError):
                 os.kill(runner_pid, signal.SIGKILL)
 
