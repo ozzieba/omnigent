@@ -708,6 +708,25 @@ export interface EnvironmentCapability {
   reason: string;
 }
 
+export interface RuntimeManifestTool {
+  id: string;
+  state: "included-in-image" | "not-included";
+  version: string;
+  source: string;
+  reason: string;
+}
+
+export interface RuntimeManifest {
+  id: string;
+  revision: number;
+  reference: string;
+  name: string;
+  scope: string;
+  /** Image inventory only; does not assert that a session uses the image. */
+  session_guarantee: boolean;
+  tools: RuntimeManifestTool[];
+}
+
 export interface EnvironmentProfile {
   id: string;
   revision: number;
@@ -716,6 +735,7 @@ export interface EnvironmentProfile {
   description: string;
   access: string;
   workspace_access: "read-only" | "read-write";
+  runtime_manifest: RuntimeManifest | null;
   capabilities: EnvironmentCapability[];
 }
 

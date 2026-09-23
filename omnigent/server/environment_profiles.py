@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
+from omnigent.server.runtime_manifests import (
+    OMNIGENT_HOST_RUNTIME,
+    get_runtime_manifest,
+)
+
 CapabilityState = Literal["available", "unavailable", "denied", "requestable"]
 WorkspaceAccess = Literal["read-only", "read-write"]
 
@@ -49,12 +54,14 @@ class EnvironmentProfile:
     access: str
     workspace_access: WorkspaceAccess
     capabilities: tuple[EnvironmentCapability, ...]
+    runtime_manifest_reference: str
 
     @property
     def reference(self) -> str:
         return f"{self.id}@{self.revision}"
 
     def public_dict(self) -> dict[str, object]:
+        runtime_manifest = get_runtime_manifest(self.runtime_manifest_reference)
         return {
             "id": self.id,
             "revision": self.revision,
@@ -63,6 +70,9 @@ class EnvironmentProfile:
             "description": self.description,
             "access": self.access,
             "workspace_access": self.workspace_access,
+            "runtime_manifest": (
+                runtime_manifest.public_dict() if runtime_manifest is not None else None
+            ),
             "capabilities": [capability.public_dict() for capability in self.capabilities],
         }
 
@@ -81,6 +91,7 @@ WORKSPACE_READONLY = EnvironmentProfile(
     ),
     access="read-only",
     workspace_access="read-only",
+    runtime_manifest_reference=OMNIGENT_HOST_RUNTIME.reference,
     capabilities=(
         EnvironmentCapability(
             id="session.workspace",
@@ -325,6 +336,20 @@ def environment_profile_agent_guide(
         "Inspect this session's profile at any time with `sys_session_get_info`.",
         "Only capabilities marked available below are present in this environment.",
     ]
+    runtime_manifest = get_runtime_manifest(profile.runtime_manifest_reference)
+    if runtime_manifest is not None:
+        lines.extend(
+            [
+                "Image tool manifest "
+                f"`{runtime_manifest.reference}` describes declared host-image contents; "
+                "it does not guarantee that this session uses that image or grant access.",
+            ]
+        )
+        for tool in runtime_manifest.tools:
+            lines.append(
+                f"- Image tool `{tool.id}`: {tool.state}; version: "
+                f"{tool.version or 'not installed'}. {tool.reason}"
+            )
     if filesystem_path is not None:
         lines.append(
             "A read-only `AGENTS.md` copy of this environment guide is mounted at "
