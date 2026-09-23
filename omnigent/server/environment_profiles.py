@@ -332,6 +332,28 @@ def environment_profile_agent_guide(
             f"access: {capability.access}; interfaces: {interfaces}; "
             f"authorization owner: {capability.authorization_owner}. {capability.reason}"
         )
+    capability_ids = {capability.id for capability in profile.capabilities}
+    if "omnigent.sessions" in capability_ids:
+        lines.extend(
+            [
+                "",
+                "### Discover Omnigent session context",
+                "Use `sys_session_list` to find sessions visible to you, then "
+                "`sys_session_get_info` for metadata or `sys_session_get_history` "
+                "for transcript context. These tools enforce the server's session "
+                "permissions; do not assume other users' sessions are visible.",
+            ]
+        )
+    if "omnigent.agent-contexts" in capability_ids:
+        lines.extend(
+            [
+                "",
+                "### Discover Omnigent agents",
+                "Use `sys_agent_list` to find built-in, local, and accessible "
+                "session-bound agents. Use `sys_agent_get` or `sys_agent_download` "
+                "only with a session-bound result you are allowed to access.",
+            ]
+        )
     return "\n".join(lines)
 
 
