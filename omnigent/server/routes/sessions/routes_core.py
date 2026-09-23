@@ -227,6 +227,15 @@ def register_core_routes(
 ) -> None:
     """Register the core session routes on router."""
 
+    @router.get("/environment-profiles")
+    async def list_environment_profiles(request: Request) -> dict[str, Any]:
+        """List server-published immutable environment profile revisions."""
+        _require_user(request, auth_provider)
+        from omnigent.server.environment_profiles import list_environment_profiles as _list
+
+        profiles = _list()
+        return {"object": "list", "data": profiles, "has_more": False}
+
     async def _schedule_managed_launch(
         request: Request,
         *,
@@ -1981,9 +1990,7 @@ def register_core_routes(
                                 session_id,
                                 next_state,
                             )
-                            conv = conv.__class__(
-                                **{**conv.__dict__, "session_state": next_state}
-                            )
+                            conv = conv.__class__(**{**conv.__dict__, "session_state": next_state})
         else:
             conv = conv_for_collaboration_mode
             if conv is None:

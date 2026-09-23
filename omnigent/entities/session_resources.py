@@ -97,6 +97,7 @@ def environment_safety_metadata(os_env_spec: Any | None) -> dict[str, object]:
 def default_environment_resource(
     session_id: str,
     os_env_spec: Any | None = None,
+    environment_profile: str | None = None,
 ) -> SessionResourceView:
     """Return the logical primary/default environment resource.
 
@@ -111,6 +112,8 @@ def default_environment_resource(
         "role": "primary",
     }
     metadata.update(environment_safety_metadata(os_env_spec))
+    if environment_profile is not None:
+        metadata["environment_profile"] = environment_profile
     return SessionResourceView(
         id=DEFAULT_ENVIRONMENT_ID,
         type="environment",
@@ -212,6 +215,7 @@ def list_session_resources_from_terminal_registry(
     *,
     has_os_env: bool = True,
     primary_os_env_spec: Any | None = None,
+    environment_profile: str | None = None,
 ) -> PagedList[SessionResourceView]:
     """Build the Phase-1a session resource inventory.
 
@@ -232,11 +236,15 @@ def list_session_resources_from_terminal_registry(
     :param primary_os_env_spec: Optional ``OSEnvSpec`` for the primary
         environment, used to enrich the default environment resource with
         share-safety metadata.  ``None`` preserves the legacy projection.
+    :param environment_profile: Optional immutable profile reference to expose
+        on the primary environment resource.
     :returns: :class:`PagedList` of :class:`SessionResourceView` items.
     """
     resources: list[SessionResourceView] = []
     if has_os_env:
-        resources.append(default_environment_resource(session_id, primary_os_env_spec))
+        resources.append(
+            default_environment_resource(session_id, primary_os_env_spec, environment_profile)
+        )
     if terminal_registry is not None:
         entries = [
             entry

@@ -12,13 +12,15 @@ See ``designs/SESSION_RESOURCES_API_DESIGN.md`` §Runner internal model.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -347,6 +349,9 @@ class SessionResourceRegistry:
         self._runner_workspace = runner_workspace
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
+        self._environment_guide_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
+        self._environment_guide_paths: dict[str, Path] = {}
+        self._session_environment_profiles: dict[str, str] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, bool] = TTLCache(
@@ -626,11 +631,14 @@ class SessionResourceRegistry:
             getattr(agent_spec, "os_env", None) if agent_spec is not None else None
         )
         has_os_env = agent_spec is None or primary_os_env_spec is not None
+        params = getattr(agent_spec, "params", {}) if agent_spec is not None else {}
+        profile = params.get("environment_profile") if isinstance(params, dict) else None
         page = list_session_resources_from_terminal_registry(
             session_id,
             self._terminal_registry,
             has_os_env=has_os_env,
             primary_os_env_spec=primary_os_env_spec,
+            environment_profile=profile if isinstance(profile, str) else None,
         )
         if resource_type is not None:
             return filter_resources_by_type(page, resource_type)
@@ -640,18 +648,17 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         resource_id: str,
+        agent_spec: AgentSpec | None = None,
     ) -> SessionResourceView | None:
         """Find a single resource by id.
 
         :param session_id: Session/conversation identifier.
         :param resource_id: Opaque resource id,
             e.g. ``"default"`` or ``"terminal_bash_s1"``.
+        :param agent_spec: Optional owning agent spec, used to describe its profile.
         :returns: The matching resource or ``None``.
         """
-        page = list_session_resources_from_terminal_registry(
-            session_id,
-            self._terminal_registry,
-        )
+        page = self.list_resources(session_id, agent_spec=agent_spec)
         return get_resource_by_id(page, resource_id)
 
     async def get_terminal_resource(
@@ -760,6 +767,64 @@ class SessionResourceRegistry:
             self._primary_envs[session_id] = os_env
             return os_env
 
+    def ensure_environment_profile_guide(self, session_id: str, reference: str) -> str | None:
+        """Create or return the read-only, session-scoped profile AGENTS.md."""
+        with self._lock:
+            path = self._ensure_environment_profile_guide_locked(session_id, reference)
+            return str(path) if path is not None else None
+
+    def set_session_environment_profile(self, session_id: str, reference: str | None) -> None:
+        """Cache the server-persisted profile reference for this runner session."""
+        with self._lock:
+            if reference is None:
+                self._session_environment_profiles.pop(session_id, None)
+            else:
+                self._session_environment_profiles[session_id] = reference
+
+    def session_environment_profile(self, session_id: str) -> str | None:
+        """Return a session's server-persisted environment profile reference."""
+        with self._lock:
+            return self._session_environment_profiles.get(session_id)
+
+    def _ensure_environment_profile_guide_locked(
+        self,
+        session_id: str,
+        reference: str,
+    ) -> Path | None:
+        existing = self._environment_guide_paths.get(session_id)
+        if existing is not None:
+            return existing
+
+        from omnigent.server.environment_profiles import (
+            environment_profile_agent_guide,
+            environment_profile_catalog,
+        )
+
+        tempdir = tempfile.TemporaryDirectory(prefix="omnigent-environment-")
+        root = Path(tempdir.name)
+        path = root / "AGENTS.md"
+        catalog_path = root / "resources" / "catalog.json"
+        guide = environment_profile_agent_guide(
+            reference,
+            filesystem_path=str(path),
+            catalog_path=str(catalog_path),
+        )
+        catalog = environment_profile_catalog(reference)
+        if guide is None or catalog is None:
+            tempdir.cleanup()
+            return None
+        catalog_path.parent.mkdir(mode=0o700)
+        catalog_path.write_text(
+            json.dumps(catalog, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        catalog_path.chmod(0o444)
+        path.write_text(guide + "\n", encoding="utf-8")
+        path.chmod(0o444)
+        self._environment_guide_dirs[session_id] = tempdir
+        self._environment_guide_paths[session_id] = path
+        return path
+
     def _create_primary_env(
         self,
         session_id: str,
@@ -813,6 +878,44 @@ class SessionResourceRegistry:
                 raise ValueError(
                     "Agent spec has no os_env; cannot create a primary filesystem environment."
                 )
+            profile = self._session_environment_profiles.get(session_id)
+            if profile is None:
+                profile = getattr(agent_spec, "params", {}).get("environment_profile")
+            if profile is not None:
+                from omnigent.server.environment_profiles import (
+                    get_environment_profile,
+                    validate_environment_profile_spec,
+                )
+
+                valid_profile = get_environment_profile(str(profile)) is not None
+                explicit_profile = getattr(agent_spec, "params", {}).get("environment_profile")
+                valid_policy = (
+                    validate_environment_profile_spec(str(profile), spec_os_env)
+                    if explicit_profile == profile
+                    else True
+                )
+                if not (valid_profile and valid_policy):
+                    raise ValueError(
+                        "agent environment profile is unknown or does not match its policy"
+                    )
+                guide_path = self._ensure_environment_profile_guide_locked(
+                    session_id, str(profile)
+                )
+                if guide_path is None:
+                    raise ValueError("environment profile has no generated AGENTS.md guide")
+                if spec_os_env.sandbox is not None and spec_os_env.sandbox.type in (
+                    "linux_bwrap",
+                    "darwin_seatbelt",
+                ):
+                    guide_root = str(guide_path.parent)
+                    read_paths = list(spec_os_env.sandbox.read_paths or [])
+                    if guide_root not in read_paths:
+                        read_paths.append(guide_root)
+                    effective_sandbox = replace(spec_os_env.sandbox, read_paths=read_paths)
+                else:
+                    effective_sandbox = spec_os_env.sandbox
+            else:
+                effective_sandbox = spec_os_env.sandbox
             # Precedence per designs/SESSION_WORKSPACE_SELECTION.md:
             # runner_workspace (env-var-driven) ALWAYS wins when set.
             # Otherwise the spec's absolute cwd wins; otherwise we
@@ -828,7 +931,7 @@ class SessionResourceRegistry:
             effective_spec = OSEnvSpec(
                 type=spec_os_env.type,
                 cwd=cwd,
-                sandbox=spec_os_env.sandbox,
+                sandbox=effective_sandbox,
                 fork=spec_os_env.fork,
                 start_in_scratch=spec_os_env.start_in_scratch,
             )
@@ -1617,6 +1720,9 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             primary = self._primary_envs.pop(session_id, None)
+            environment_guide_dir = self._environment_guide_dirs.pop(session_id, None)
+            self._environment_guide_paths.pop(session_id, None)
+            self._session_environment_profiles.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
                 self._terminal_roles.pop(key, None)
@@ -1642,6 +1748,14 @@ class SessionResourceRegistry:
             except Exception:
                 _logger.exception(
                     "Error cleaning up terminals for session=%s",
+                    session_id,
+                )
+        if environment_guide_dir is not None:
+            try:
+                environment_guide_dir.cleanup()
+            except Exception:
+                _logger.exception(
+                    "Error cleaning environment guide for session=%s",
                     session_id,
                 )
 

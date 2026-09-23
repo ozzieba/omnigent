@@ -1178,6 +1178,30 @@ class InstructionComposition:
     composed: str | None
 
 
+def _append_environment_profile_guide(
+    instructions: str | None,
+    spec: AgentSpec,
+    *,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+) -> str | None:
+    """Append the selected server-owned environment contract to agent context."""
+    reference = resource_registry.session_environment_profile(session_id)
+    if not isinstance(reference, str):
+        reference = spec.params.get("environment_profile")
+    if not isinstance(reference, str):
+        return instructions
+    filesystem_path = resource_registry.ensure_environment_profile_guide(session_id, reference)
+    from omnigent.server.environment_profiles import environment_profile_agent_guide
+
+    guide = environment_profile_agent_guide(reference, filesystem_path=filesystem_path)
+    if guide is None:
+        return instructions
+    if instructions is None or not instructions.strip():
+        return guide
+    return f"{instructions.rstrip()}\n\n{guide}"
+
+
 # Harnesses whose executor reads the wire ``instructions`` field itself and
 # needs the gated ``InstructionComposition.composed`` value there instead of
 # the default fallback-including composed-per-turn string — opencode-native
@@ -3511,6 +3535,10 @@ def create_runner_app(
             _note_session_harness_override(
                 session_id, init_context.envelope.snapshot.harness_override
             )
+            resource_registry.set_session_environment_profile(
+                session_id,
+                init_context.envelope.snapshot.environment_profile,
+            )
 
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
@@ -3558,6 +3586,10 @@ def create_runner_app(
                     )
                 if _start_verdict.data is not None:
                     _apply_sandbox_override_from_verdict(spec, _start_verdict.data)
+
+            profile = spec.params.get("environment_profile")
+            if isinstance(profile, str):
+                resource_registry.ensure_environment_profile_guide(session_id, profile)
 
             await _ensure_session_subagent_router(
                 session_id,
@@ -7059,6 +7091,12 @@ def create_runner_app(
                     _raw_per_request_instructions,
                     [],
                 )
+            instructions = _append_environment_profile_guide(
+                instructions,
+                cached_spec,
+                session_id=conv,
+                resource_registry=resource_registry,
+            )
             # Warn once per (conversation, harness, delivery) if the agent has
             # authored instructions but the harness can't deliver them.
             if _authored_bg and harness_name:
@@ -7621,6 +7659,12 @@ def create_runner_app(
                                 _instr_spec_ds, _per_req_instr, []
                             ),
                         )
+                        _ic_ds.composed = _append_environment_profile_guide(
+                            _ic_ds.composed,
+                            _instr_spec_ds,
+                            session_id=conv_id,
+                            resource_registry=resource_registry,
+                        )
                         # Gated harnesses get nullable — skip the fallback literal.
                         if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                             _instr_val = _ic_ds.composed
@@ -7629,8 +7673,11 @@ def create_runner_app(
                         elif _ic_ds.composed is not None:
                             _instr_body = {
                                 **body,
-                                "instructions": build_instructions(
-                                    _instr_spec_ds, _per_req_instr, []
+                                "instructions": _append_environment_profile_guide(
+                                    build_instructions(_instr_spec_ds, _per_req_instr, []),
+                                    _instr_spec_ds,
+                                    session_id=conv_id,
+                                    resource_registry=resource_registry,
                                 ),
                             }
                         if _authored_ds and harness_name:
@@ -8646,12 +8693,14 @@ def create_runner_app(
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        agent_spec: AgentSpec | None = None,
     ) -> JSONResponse:
         from omnigent.entities.pagination import paginate_in_memory
 
         filtered = resource_registry.list_resources(
             session_id,
             resource_type=resource_type,
+            agent_spec=agent_spec,
         )
         page = paginate_in_memory(
             filtered.data,
@@ -8681,6 +8730,7 @@ def create_runner_app(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ) -> JSONResponse:
+        spec = await _resolve_session_agent_spec(session_id)
         return _build_typed_list_response(
             session_id,
             "environment",
@@ -8688,6 +8738,7 @@ def create_runner_app(
             after=after,
             before=before,
             order=order,
+            agent_spec=spec,
         )
 
     def _environment_reach(root: str, agent_spec: AgentSpec | None) -> dict[str, object]:
@@ -8732,6 +8783,7 @@ def create_runner_app(
         resource = resource_registry.get_resource(
             session_id,
             environment_id,
+            agent_spec,
         )
         if resource is None or resource.type != "environment":
             return JSONResponse(

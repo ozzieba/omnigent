@@ -319,6 +319,8 @@ export interface Session {
    * unbound. The fork-resume picker prefills the source's value.
    */
   workspace?: string | null;
+  /** Immutable server-owned environment profile revision selected at creation. */
+  environmentProfile?: string | null;
   /**
    * Native-terminal CLI args the session was launched with, e.g.
    * ``["--permission-mode", "plan"]``. Reflects the LAUNCH command only:

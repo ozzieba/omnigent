@@ -1072,6 +1072,15 @@ def _build_session_response(
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
+    environment_capabilities: list[dict[str, Any]] = []
+    if conv.environment_profile is not None:
+        from omnigent.server.environment_profiles import get_environment_profile
+
+        environment_profile = get_environment_profile(conv.environment_profile)
+        if environment_profile is not None:
+            environment_capabilities = [
+                capability.public_dict() for capability in environment_profile.capabilities
+            ]
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -1135,6 +1144,8 @@ def _build_session_response(
         # (their message is already persisted into ``items``).
         pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
+        environment_profile=conv.environment_profile,
+        environment_capabilities=environment_capabilities,
         git_branch=conv.git_branch,
         archived=conv.archived,
         # Replay the latest todo list for claude-native sessions.
@@ -8247,10 +8258,12 @@ async def _create_session_from_existing_agent(
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
+    inherited_environment_profile: str | None = None
     if body.parent_session_id is not None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
+            inherited_environment_profile = parent_conv.environment_profile
             # Defense-in-depth: don't inherit a runner the
             # caller doesn't own.
             if (
@@ -8397,6 +8410,7 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
             project_id=project_resolution.project_id,
+            environment_profile=inherited_environment_profile,
         )
     except NameAlreadyExistsError as exc:
         if (
@@ -8684,7 +8698,9 @@ async def _create_session_from_existing_agent(
                 conv.id,
                 {
                     **conv.session_state,
-                    "pending_initial_items": [item.model_dump(mode="json") for item in body.initial_items],
+                    "pending_initial_items": [
+                        item.model_dump(mode="json") for item in body.initial_items
+                    ],
                     "pending_initial_items_warning": "initial_items_seeded_not_dispatched",
                 },
             )
@@ -8802,6 +8818,34 @@ def _create_session_from_bundle(
         bundle_bytes,
         enforce_handler_allowlist=not local_single_user_enabled(),
     )
+    environment_profile = metadata.environment_profile
+    if environment_profile is not None:
+        from omnigent.server.environment_profiles import (
+            get_environment_profile,
+            validate_environment_profile_spec,
+        )
+
+        if get_environment_profile(environment_profile) is None:
+            raise OmnigentError(
+                f"unknown environment profile revision {environment_profile!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if spec.params.get("environment_profile") != environment_profile:
+            raise OmnigentError(
+                "bundle environment_profile must match the selected catalog revision",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not validate_environment_profile_spec(environment_profile, spec.os_env):
+            raise OmnigentError(
+                f"environment profile {environment_profile!r} requires its exact "
+                "server-approved workspace sandbox policy",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    elif spec.params.get("environment_profile") is not None:
+        raise OmnigentError(
+            "bundle environment_profile requires a matching selected catalog revision",
+            code=ErrorCode.INVALID_INPUT,
+        )
     assert spec.name is not None
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:

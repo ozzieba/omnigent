@@ -386,6 +386,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        environment_profile: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -428,6 +429,8 @@ class ConversationStore(ABC):
             the canonicalized realpath returned by ``host.stat``;
             this method does no path expansion. When a git worktree
             was created, this is the worktree directory path.
+        :param environment_profile: Server-owned immutable profile reference
+            inherited from a parent session, if any.
         :param git_branch: Git branch checked out in the session's
             worktree, e.g. ``"feature/login"``. Set only when the
             session was created with a server-created worktree;
@@ -1502,6 +1505,7 @@ class ConversationStore(ABC):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        environment_profile: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1540,6 +1544,8 @@ class ConversationStore(ABC):
         :param runner_id: Optional runner binding to persist at
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field.
+        :param environment_profile: Immutable server-owned catalog
+            reference, e.g. ``"workspace-readonly@1"``.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
