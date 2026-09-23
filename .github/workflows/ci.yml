@@ -235,7 +235,7 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # Forgejo-patched v4.3.1
         with:
           name: pytest-${{ matrix.group }}-${{ github.run_id }}
           path: artifacts/
@@ -284,7 +284,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-postgres.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
         with:
           name: pytest-stores-postgres-${{ github.run_id }}
           path: artifacts/
@@ -334,7 +334,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-mysql.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
         with:
           name: pytest-stores-mysql-${{ github.run_id }}
           path: artifacts/
@@ -426,7 +426,7 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # Forgejo-patched v4.3.1
         with:
           name: pytest-codex-parity-${{ github.run_id }}
           path: artifacts/
@@ -460,7 +460,7 @@ jobs:
         run: pip install "coverage>=7"
 
       - name: Download shard coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: https://code.forgejo.org/forgejo/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427  # Forgejo-patched v4.1.4
         with:
           pattern: pytest-*
           path: covdata
@@ -486,7 +486,7 @@ jobs:
 
       - name: Upload coverage summary
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3  # Forgejo-patched v4.3.1
         with:
           name: coverage-summary-${{ github.run_id }}
           path: coverage-summary/
