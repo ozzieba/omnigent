@@ -13,7 +13,7 @@ import json
 import math
 import secrets
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -2215,7 +2215,54 @@ async def _persist_external_codex_subagent_start(
     )
 
 
+_external_item_locks: dict[tuple[str, str, str, str], tuple[asyncio.Lock, int]] = {}
+
+
+@contextlib.asynccontextmanager
+async def _external_item_lock(key: tuple[str, str, str, str]) -> AsyncIterator[None]:
+    """Serialize one source item locally and evict its lock after the last waiter.
+
+    Pending inputs and session streams are process-affine in the current
+    runtime. The database unique index remains the cross-process append guard,
+    but this lock does not make pending-input drain plus append one transaction
+    across multiple AP workers.
+    """
+    lock, users = _external_item_locks.get(key, (asyncio.Lock(), 0))
+    _external_item_locks[key] = (lock, users + 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        current_lock, current_users = _external_item_locks[key]
+        if current_lock is lock and current_users == 1:
+            _external_item_locks.pop(key, None)
+        elif current_lock is lock:
+            _external_item_locks[key] = (lock, current_users - 1)
+
+
 async def _persist_external_conversation_item(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+) -> str:
+    """Serialize provenance retries before they can consume queued uploads."""
+    item = _parse_external_conversation_item(body)
+    provenance = (item.native_thread_id, item.native_turn_id, item.native_item_id)
+    if not all(provenance):
+        return await _persist_external_conversation_item_once(
+            session_id, conv, body, conversation_store, created_by, background_title_coordinator
+        )
+    key = (session_id, *provenance)
+    async with _external_item_lock(key):
+        return await _persist_external_conversation_item_once(
+            session_id, conv, body, conversation_store, created_by, background_title_coordinator
+        )
+
+
+async def _persist_external_conversation_item_once(
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -2244,6 +2291,20 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _parse_external_conversation_item(body)
+    if all((item.native_thread_id, item.native_turn_id, item.native_item_id)):
+        find_native_item_id = getattr(conversation_store, "find_native_item_id", None)
+        if find_native_item_id is not None:
+            existing_id = await asyncio.to_thread(
+                find_native_item_id,
+                session_id,
+                item.native_thread_id,
+                item.native_turn_id,
+                item.native_item_id,
+            )
+            if existing_id is not None:
+                # A committed replay is acknowledged by the original id. It
+                # must not consume pending input or emit a second broadcast.
+                return existing_id
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.

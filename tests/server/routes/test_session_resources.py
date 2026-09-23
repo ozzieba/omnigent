@@ -4277,6 +4277,81 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
 
 
 @pytest.mark.asyncio
+async def test_external_native_retry_does_not_drain_upload_or_rebroadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A commit-before-ack retry returns the original item and preserves later uploads."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    session_id = "823dbd1aab969b5a813fac59bb977a77"
+    store = _ConversationStore()
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    committed: dict[tuple[str, str, str], str] = {}
+    store.find_native_item_id = lambda _conv, thread, turn, item: committed.get(
+        (thread, turn, item)
+    )  # type: ignore[attr-defined]
+    broadcasts: list[str] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_publish_external_conversation_item",
+        lambda _session, item, **_kwargs: broadcasts.append(item.id),
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "yes"}],
+            },
+            "response_id": "turn-1",
+            "native_thread_id": "thread-1",
+            "native_turn_id": "turn-1",
+            "native_item_id": "item-1",
+        },
+    )
+    try:
+        pending_inputs.record(
+            session_id,
+            [
+                {"type": "input_text", "text": "yes"},
+                {"type": "input_image", "file_id": "upload-original"},
+            ],
+        )
+        first_id = await _persist_external_conversation_item(session_id, conv, body, store)  # type: ignore[arg-type]
+        committed[("thread-1", "turn-1", "item-1")] = first_id
+
+        # This upload belongs to the next message. A redelivered old item must
+        # leave it queued, even if the literal text is identical.
+        pending_inputs.record(
+            session_id,
+            [
+                {"type": "input_text", "text": "yes"},
+                {"type": "input_image", "file_id": "upload-next"},
+            ],
+        )
+        retry_id = await _persist_external_conversation_item(session_id, conv, body, store)  # type: ignore[arg-type]
+        assert retry_id == first_id
+        assert len(store.appended_items) == 1
+        assert broadcasts == [first_id]
+        assert (
+            pending_inputs.snapshot_for(session_id)[0]["content"][-1]["file_id"] == "upload-next"
+        )
+        assert (
+            session_id,
+            "thread-1",
+            "turn-1",
+            "item-1",
+        ) not in orchestration._external_item_locks
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
     """Opaque framework 500 bodies become explicit ensure errors.
 

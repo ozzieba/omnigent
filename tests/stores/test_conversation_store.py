@@ -5954,3 +5954,36 @@ def test_get_conversation_keeps_distinct_query_names(
         "omnigent.conversation_store.select_conversation_metadata_by_id",
         "omnigent.conversation_store.select_conversation_labels",
     ], names
+
+
+def test_native_provenance_is_idempotent_and_does_not_use_text_as_key(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Retries collapse by source identity while identical literal text survives."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    conv = conversation_store.create_conversation()
+
+    def append(item_id: str):
+        return conversation_store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="turn-a",
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": "yes"}]),
+                    native_thread_id="thread-a",
+                    native_turn_id="turn-a",
+                    native_item_id=item_id,
+                )
+            ],
+        )[0]
+
+    first = append("item-1")
+    assert append("item-1").id == first.id
+    assert append("item-2").id != first.id
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        concurrent = list(pool.map(lambda _: append("item-3"), range(8)))
+    assert len({item.id for item in concurrent}) == 1
+    assert len(conversation_store.list_items(conv.id).data) == 3

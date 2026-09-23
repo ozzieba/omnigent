@@ -672,6 +672,9 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         created_at=row.created_at,
         data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
+        native_thread_id=row.native_thread_id,
+        native_turn_id=row.native_turn_id,
+        native_item_id=row.native_item_id,
     )
 
 
@@ -2063,6 +2066,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
+            # Native transcript retries are keyed by source identity, never by
+            # message text. The conversation lock serializes competing appends;
+            # the unique index is the cross-process backstop.
+            if len(items) == 1 and all(
+                (items[0].native_thread_id, items[0].native_turn_id, items[0].native_item_id)
+            ):
+                source = items[0]
+                existing = session.execute(
+                    select(SqlConversationItem).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.native_thread_id == source.native_thread_id,
+                        SqlConversationItem.native_turn_id == source.native_turn_id,
+                        SqlConversationItem.native_item_id == source.native_item_id,
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    decoded = self._decode_item_data_batch([existing.data])[0]
+                    return [_to_item(existing, decoded)]
+
             # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if conv_row is not None:
@@ -2114,6 +2137,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "type": encode_item_type(item.type),
                     "data": data,
                     "created_by": item.created_by,
+                    "native_thread_id": item.native_thread_id,
+                    "native_turn_id": item.native_turn_id,
+                    "native_item_id": item.native_item_id,
                 }
                 # A backend may omit search_text (see _item_search_text): when it
                 # returns None we drop the column so a schema without it still
@@ -2135,6 +2161,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         created_at=now,
                         data=item.data,
                         created_by=item.created_by,
+                        native_thread_id=item.native_thread_id,
+                        native_turn_id=item.native_turn_id,
+                        native_item_id=item.native_item_id,
                     )
                 )
             # One executemany for the batch: positions are pre-allocated above so
@@ -2151,6 +2180,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conv_row.next_position = next_pos
 
         return persisted
+
+    def find_native_item_id(
+        self, conversation_id: str, thread_id: str, turn_id: str, item_id: str
+    ) -> str | None:
+        """Return the persisted id for a native source item, if present."""
+        with self._conv_session("find_native_item_id") as session:
+            return session.execute(
+                select(SqlConversationItem.id).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.native_thread_id == thread_id,
+                    SqlConversationItem.native_turn_id == turn_id,
+                    SqlConversationItem.native_item_id == item_id,
+                )
+            ).scalar_one_or_none()
 
     def list_projects(
         self,

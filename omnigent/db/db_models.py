@@ -1031,6 +1031,9 @@ class SqlConversationItem(ConversationBase):
     data: Mapped[str] = mapped_column(Text)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    native_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    native_turn_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    native_item_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
         # Backs the per-conversation position-ordered scan (the dominant read).
@@ -1053,6 +1056,15 @@ class SqlConversationItem(ConversationBase):
             "conversation_id",
             "response_id",
             "id",
+        ),
+        Index(
+            "uq_conversation_items_native_provenance",
+            "workspace_id",
+            "conversation_id",
+            "native_thread_id",
+            "native_turn_id",
+            "native_item_id",
+            unique=True,
         ),
         # Latest-message previews scan one type per conversation ordered by
         # position DESC (list_latest_message_items_for_conversations). Ordering
