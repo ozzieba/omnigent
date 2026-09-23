@@ -58,7 +58,10 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   lines.push(`  model: ${input.model}`);
   lines.push("  config:");
   lines.push(`    harness: ${input.harness}`);
-  if (input.environmentProfile === "workspace-readonly@1") {
+  if (
+    input.environmentProfile === "workspace-readonly@1" ||
+    input.environmentProfile === "workspace-editable@1"
+  ) {
     lines.push("");
     lines.push("params:");
     lines.push(`  environment_profile: ${yamlQuote(input.environmentProfile)}`);
@@ -68,7 +71,11 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
     lines.push("  cwd: .");
     lines.push("  sandbox:");
     lines.push("    type: auto");
-    lines.push("    write_paths: []");
+    lines.push(
+      input.environmentProfile === "workspace-editable@1"
+        ? '    write_paths: ["."]'
+        : "    write_paths: []",
+    );
     lines.push("    allow_network: true");
   }
   lines.push("");

@@ -154,7 +154,34 @@ WORKSPACE_READONLY = EnvironmentProfile(
     ),
 )
 
-_PROFILES = {WORKSPACE_READONLY.reference: WORKSPACE_READONLY}
+WORKSPACE_EDITABLE = replace(
+    WORKSPACE_READONLY,
+    id="workspace-editable",
+    name="Editable workspace",
+    description=(
+        "Expose the session workspace with read-write access and a generated AGENTS.md "
+        "environment guide plus machine-readable capability catalog. No host mounts or credentials."
+    ),
+    access="read-write workspace only",
+    capabilities=tuple(
+        replace(
+            capability,
+            access="read-write",
+            reason=(
+                "The session workspace is the only writable host path in this profile; "
+                "the OS sandbox continues to isolate all other paths."
+            ),
+        )
+        if capability.id == "session.workspace"
+        else capability
+        for capability in WORKSPACE_READONLY.capabilities
+    ),
+)
+
+_PROFILES = {
+    profile.reference: profile
+    for profile in (WORKSPACE_READONLY, WORKSPACE_EDITABLE)
+}
 
 
 def list_environment_profiles() -> list[dict[str, object]]:
@@ -232,6 +259,29 @@ def validate_workspace_readonly_spec(spec: object) -> bool:
         return False
     default_sandbox = _default_sandbox_for_platform()
     expected_sandbox = replace(default_sandbox, write_paths=[])
+    expected = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=expected_sandbox,
+        fork=False,
+        start_in_scratch=False,
+    )
+    return asdict(spec) == asdict(expected)
+
+
+def validate_environment_profile_spec(reference: str, spec: object) -> bool:
+    """Accept only the exact OS sandbox policy published for a profile."""
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+    if not isinstance(spec, OSEnvSpec):
+        return False
+    if reference == WORKSPACE_READONLY.reference:
+        expected_sandbox = replace(_default_sandbox_for_platform(), write_paths=[])
+    elif reference == WORKSPACE_EDITABLE.reference:
+        expected_sandbox = replace(_default_sandbox_for_platform(), write_paths=["."])
+    else:
+        return False
     expected = OSEnvSpec(
         type="caller_process",
         cwd=".",

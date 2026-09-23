@@ -8820,7 +8820,7 @@ def _create_session_from_bundle(
     if environment_profile is not None:
         from omnigent.server.environment_profiles import (
             get_environment_profile,
-            validate_workspace_readonly_spec,
+            validate_environment_profile_spec,
         )
 
         if get_environment_profile(environment_profile) is None:
@@ -8833,10 +8833,10 @@ def _create_session_from_bundle(
                 "bundle environment_profile must match the selected catalog revision",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if not validate_workspace_readonly_spec(spec.os_env):
+        if not validate_environment_profile_spec(environment_profile, spec.os_env):
             raise OmnigentError(
-                "environment profile workspace-readonly@1 requires the exact "
-                "server-approved read-only workspace os_env policy",
+                f"environment profile {environment_profile!r} requires its exact "
+                "server-approved workspace sandbox policy",
                 code=ErrorCode.INVALID_INPUT,
             )
     elif spec.params.get("environment_profile") is not None:

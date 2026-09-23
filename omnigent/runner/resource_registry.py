@@ -884,15 +884,14 @@ class SessionResourceRegistry:
             if profile is not None:
                 from omnigent.server.environment_profiles import (
                     get_environment_profile,
-                    validate_workspace_readonly_spec,
+                    validate_environment_profile_spec,
                 )
 
                 valid_profile = get_environment_profile(str(profile)) is not None
                 explicit_profile = getattr(agent_spec, "params", {}).get("environment_profile")
-                session_profile = self._session_environment_profiles.get(session_id)
                 valid_policy = (
-                    validate_workspace_readonly_spec(spec_os_env)
-                    if explicit_profile is not None and session_profile is None
+                    validate_environment_profile_spec(str(profile), spec_os_env)
+                    if explicit_profile == profile
                     else True
                 )
                 if not (valid_profile and valid_policy):
