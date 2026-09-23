@@ -2006,6 +2006,16 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
         "OMNIGENT_LOG_TTY_FD": "9",
+        "OMNIGENT_FEATURES": "usage_page,docloop_notebook",
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH": (
+            "DOCLOOP_PROVIDER,DOCLOOP_MODEL,DOCLOOP_REASONING_EFFORT,"
+            "DOCLOOP_PYTHON_STATE,DOCLOOP_NATIVE_NOTEBOOK"
+        ),
+        "DOCLOOP_PROVIDER": "codex-cli",
+        "DOCLOOP_MODEL": "gpt-6-luna",
+        "DOCLOOP_REASONING_EFFORT": "max",
+        "DOCLOOP_PYTHON_STATE": "1",
+        "DOCLOOP_NATIVE_NOTEBOOK": "1",
     }
 
     env = _build_runner_env(
@@ -2065,6 +2075,14 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"
     assert env["OMNIGENT_LOG_TO_STDERR"] == "1"
     assert env["OMNIGENT_LOG_TTY_FD"] == "9"
+    # Each runner resolves its own feature snapshot; explicitly named harness
+    # settings cross the host-to-runner boundary through the operator allowlist.
+    assert env["OMNIGENT_FEATURES"] == "usage_page,docloop_notebook"
+    assert env["DOCLOOP_PROVIDER"] == "codex-cli"
+    assert env["DOCLOOP_MODEL"] == "gpt-6-luna"
+    assert env["DOCLOOP_REASONING_EFFORT"] == "max"
+    assert env["DOCLOOP_PYTHON_STATE"] == "1"
+    assert env["DOCLOOP_NATIVE_NOTEBOOK"] == "1"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env

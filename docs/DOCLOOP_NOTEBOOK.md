@@ -19,16 +19,86 @@ flowchart LR
 
 ## Configuration
 
-This is an opt-in source integration. The central server and runner need the
-`docloop_notebook` entry in `OMNIGENT_FEATURES`. Other enabled entries remain in
-that comma-separated list. The Docloop harness needs a release containing the
-shared notebook binding, with `DOCLOOP_NATIVE_NOTEBOOK=1` in its launch environment.
-It also uses its existing `DOCLOOP_DOCUMENT` and workspace configuration.
+This is an opt-in source integration. The central server and each spawned runner
+need `docloop_notebook` in `OMNIGENT_FEATURES`. The flag is resolved at process
+startup. The optional
+[`compose.docloop-notebook.yaml`](../deploy/docker/compose.docloop-notebook.yaml)
+overlay enables it on the server while preserving the feature list from `.env`:
+
+```sh
+cd deploy/docker
+docker compose --env-file .env -f docker-compose.yaml \
+  -f compose.docloop-notebook.yaml config
+```
+
+Review the rendered `OMNIGENT_FEATURES` before applying the overlay. Applying a
+changed environment recreates the server container, so schedule it after active
+sessions have drained. Use a published Omnigent image that contains the reviewed
+notebook routes; pin its `OMNIGENT_IMAGE_TAG` to that release before the
+maintenance window.
+
+The host also needs to pass the non-secret feature switch to the runner. This
+release allowlists `OMNIGENT_FEATURES`; the named
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` entries in
+[`docloop-runner.env.example`](../deploy/docker/docloop-runner.env.example)
+forward the harness settings to runner processes without forwarding the host's
+entire environment. Copy the sample to the dedicated runner service's external
+environment file and point that service at a **new, versioned virtual
+environment**. Do not upgrade the currently running environment in place.
+
+The activation wheel is Docloop 0.2.7, built from source commit `cfff8d9`, now
+included in main at `50fc992f`. Use the exact artifact and verify its hash before
+installing it. Run this in the **new, versioned runner virtual environment**,
+never in the environment used by the active runner:
+
+```sh
+DOCLOOP_WHEEL=/home/oz/docloop-dogfood/releases/0.2.7/docloop-0.2.7-py3-none-any.whl
+printf '%s  %s\n' \
+  cdd78b6345334db717da35eb5b2a8ac7fc40d71d77a2035d515f8caced882a6f \
+  "$DOCLOOP_WHEEL" | sha256sum --check
+python -m pip install \
+  "docloop[jupyter,python-state] @ file://$DOCLOOP_WHEEL"
+```
+
+The previously deployed Docloop 0.2.6 wheel predates the current integration
+fixes; do not install or pin it. Confirm the package exposes
+`docloop.codex_cli_config`, JupyterLab and ipykernel are installed, and the
+runner's Codex CLI can authenticate with the same per-session `CODEX_HOME` that
+will be used by the harness. Keep credentials out of the example environment
+file.
+
+The Docloop harness uses its existing `DOCLOOP_DOCUMENT` and workspace
+configuration. `DOCLOOP_NATIVE_NOTEBOOK=1` enables its native notebook binding;
+the other sample flags select Codex CLI with Luna at max reasoning effort and
+enable Python state.
 
 All flags default off. A pane request cannot initialize a new agent process or
-select a runner. Start the session normally and send an initial instruction to
+select a runner. Start a new session normally and send an initial instruction to
 initialize its notebook. Existing runner and harness authentication are reused;
 no additional browser token or notebook path is accepted.
+
+### Safe rollout and rollback
+
+1. Create a new, versioned runner virtual environment beside the active one and
+   install the compatible Omnigent SDK and supported Codex CLI there.
+2. Verify and install the pinned Docloop 0.2.7 wheel above with the
+   `[jupyter,python-state]` extras; do not use the older 0.2.6 wheel. Verify the
+   imports, JupyterLab/ipykernel versions and Codex authentication under the
+   runner service identity.
+3. Pin a server image containing the reviewed Omnigent notebook code, render the
+   Compose configuration, and confirm the feature list includes
+   `docloop_notebook` plus any existing features.
+4. Stop dispatching new sessions and wait for active sessions on the old server
+   and runner to finish. Apply the server overlay and switch the dedicated
+   runner service to the new environment during the same maintenance window.
+5. Start a fresh Docloop session and complete the acceptance checks below before
+   routing normal use to the updated service.
+
+Rollback by stopping new dispatch, restoring the previous server image and
+feature environment, switching the runner service back to its retained previous
+virtual environment and environment file, then recreating the server and
+restarting the runner after sessions are drained. Both feature snapshots require
+process startup, so rollback also needs a maintenance window.
 
 ## Save and execution behavior
 
@@ -46,8 +116,9 @@ bounded history of edit receipts. A committed edit whose refreshed snapshot is
 unavailable is reported as applied, without suggesting a new change identifier.
 
 Use Chat for arbitrary instructions to modify the document, execute cells, or
-work with files. With Docloop 0.2.6.dev2 and its Jupyter extra installed, ipynb
-opens in the real JupyterLab editor. Org retains its addressed source editor.
+work with files. With the current Docloop release and its Jupyter extra
+installed, ipynb opens in the real JupyterLab editor. Org retains its addressed
+source editor.
 Run, interrupt, restart, file access and saves travel over the same assigned
 runner. The only WebSocket addition is the session's kernel-channel path.
 Jupyter's server token stays inside the harness; browser credentials are not
@@ -71,11 +142,12 @@ permissions. Cross-project Docloop acceptance uses the real SDK, Engine, Store,
 local evaluator and both host relay adapters. Its provider and live process
 registry entry are fixtures, and its HTTP hops use ASGI transports.
 
-After adopting both reviewed components, open an initialized Docloop session,
-select Notebook, change and save a note, then ask in Chat to use that note and
-execute a saved cell. Confirm the output and created file, reload the page, and
-verify that both survive. Check phone-width switching and a desktop split view.
-Local source tests and UI previews do not establish a live deployment receipt.
+After adopting both reviewed components, open a new initialized Docloop session,
+confirm the Notebook pane appears, change and save a note, then ask in Chat to
+use that note and execute a saved cell. Confirm the output and created file,
+reload the page, and verify that both survive. Check phone-width switching and a
+desktop split view. Local source tests and UI previews do not establish a live
+deployment receipt.
 
 The companion Docloop `tests/test_runner_jupyter.py` runs actual Jupyter and SDK
 HTTP/WebSockets through a private Unix socket, both relays and the actual tunnel

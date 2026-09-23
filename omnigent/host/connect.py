@@ -418,7 +418,7 @@ _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
 # come from the agent spec, not the host owner's shell (spec
 # self-containment). Anything an agent
 # legitimately needs must flow through its spec's env config. Limited to
-# process essentials (PATH/HOME/shell/locale/temp) and TLS trust stores so
+# process essentials, non-secret deployment controls, and TLS trust stores so
 # the runner's outbound HTTPS still works.
 _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
@@ -598,6 +598,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Release features are resolved once by each runner app at startup.
+        # This non-secret deployment switch must reach the spawned runner.
+        "OMNIGENT_FEATURES",
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
