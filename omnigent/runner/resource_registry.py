@@ -351,6 +351,7 @@ class SessionResourceRegistry:
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._environment_guide_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._environment_guide_paths: dict[str, Path] = {}
+        self._session_environment_profiles: dict[str, str] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, bool] = TTLCache(
@@ -772,6 +773,19 @@ class SessionResourceRegistry:
             path = self._ensure_environment_profile_guide_locked(session_id, reference)
             return str(path) if path is not None else None
 
+    def set_session_environment_profile(self, session_id: str, reference: str | None) -> None:
+        """Cache the server-persisted profile reference for this runner session."""
+        with self._lock:
+            if reference is None:
+                self._session_environment_profiles.pop(session_id, None)
+            else:
+                self._session_environment_profiles[session_id] = reference
+
+    def session_environment_profile(self, session_id: str) -> str | None:
+        """Return a session's server-persisted environment profile reference."""
+        with self._lock:
+            return self._session_environment_profiles.get(session_id)
+
     def _ensure_environment_profile_guide_locked(
         self,
         session_id: str,
@@ -864,7 +878,9 @@ class SessionResourceRegistry:
                 raise ValueError(
                     "Agent spec has no os_env; cannot create a primary filesystem environment."
                 )
-            profile = getattr(agent_spec, "params", {}).get("environment_profile")
+            profile = self._session_environment_profiles.get(session_id)
+            if profile is None:
+                profile = getattr(agent_spec, "params", {}).get("environment_profile")
             if profile is not None:
                 from omnigent.server.environment_profiles import (
                     get_environment_profile,
@@ -872,28 +888,33 @@ class SessionResourceRegistry:
                 )
 
                 valid_profile = get_environment_profile(str(profile)) is not None
-                valid_policy = validate_workspace_readonly_spec(spec_os_env)
+                explicit_profile = getattr(agent_spec, "params", {}).get("environment_profile")
+                session_profile = self._session_environment_profiles.get(session_id)
+                valid_policy = (
+                    validate_workspace_readonly_spec(spec_os_env)
+                    if explicit_profile is not None and session_profile is None
+                    else True
+                )
                 if not (valid_profile and valid_policy):
                     raise ValueError(
                         "agent environment profile is unknown or does not match its policy"
-                    )
-                if spec_os_env.sandbox is None or spec_os_env.sandbox.type not in (
-                    "linux_bwrap",
-                    "darwin_seatbelt",
-                ):
-                    raise ValueError(
-                        "workspace-readonly@1 requires Linux bwrap or macOS seatbelt filesystem isolation"
                     )
                 guide_path = self._ensure_environment_profile_guide_locked(
                     session_id, str(profile)
                 )
                 if guide_path is None:
                     raise ValueError("environment profile has no generated AGENTS.md guide")
-                guide_root = str(guide_path.parent)
-                read_paths = list(spec_os_env.sandbox.read_paths or [])
-                if guide_root not in read_paths:
-                    read_paths.append(guide_root)
-                effective_sandbox = replace(spec_os_env.sandbox, read_paths=read_paths)
+                if spec_os_env.sandbox is not None and spec_os_env.sandbox.type in (
+                    "linux_bwrap",
+                    "darwin_seatbelt",
+                ):
+                    guide_root = str(guide_path.parent)
+                    read_paths = list(spec_os_env.sandbox.read_paths or [])
+                    if guide_root not in read_paths:
+                        read_paths.append(guide_root)
+                    effective_sandbox = replace(spec_os_env.sandbox, read_paths=read_paths)
+                else:
+                    effective_sandbox = spec_os_env.sandbox
             else:
                 effective_sandbox = spec_os_env.sandbox
             # Precedence per designs/SESSION_WORKSPACE_SELECTION.md:
@@ -1702,6 +1723,7 @@ class SessionResourceRegistry:
             primary = self._primary_envs.pop(session_id, None)
             environment_guide_dir = self._environment_guide_dirs.pop(session_id, None)
             self._environment_guide_paths.pop(session_id, None)
+            self._session_environment_profiles.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
                 self._terminal_roles.pop(key, None)

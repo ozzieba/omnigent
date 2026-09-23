@@ -890,6 +890,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        environment_profile: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1022,6 +1023,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
                 project_id=project_id,
+                environment_profile=environment_profile,
             )
             with self._session("insert_conversation_metadata") as meta_sess:
                 meta_sess.add(meta)

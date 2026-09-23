@@ -8258,10 +8258,12 @@ async def _create_session_from_existing_agent(
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
+    inherited_environment_profile: str | None = None
     if body.parent_session_id is not None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
+            inherited_environment_profile = parent_conv.environment_profile
             # Defense-in-depth: don't inherit a runner the
             # caller doesn't own.
             if (
@@ -8408,6 +8410,7 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
             project_id=project_resolution.project_id,
+            environment_profile=inherited_environment_profile,
         )
     except NameAlreadyExistsError as exc:
         if (

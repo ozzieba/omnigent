@@ -2400,6 +2400,12 @@ async def _execute_subagent_tool(
             "sub_agent_name": sub_agent_name,
             "labels": {_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
         }
+        # The parent session's selected environment is trusted server-side
+        # session metadata. Carry it to the child so every agent in the spawn
+        # tree can discover the same capabilities and generated guide.
+        parent_profile = _optional_string(snap.get("environment_profile"))
+        if parent_profile is not None:
+            create_body["environment_profile"] = parent_profile
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
         if model is not None:

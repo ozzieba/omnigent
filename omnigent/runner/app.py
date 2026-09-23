@@ -1186,7 +1186,9 @@ def _append_environment_profile_guide(
     resource_registry: SessionResourceRegistry,
 ) -> str | None:
     """Append the selected server-owned environment contract to agent context."""
-    reference = spec.params.get("environment_profile")
+    reference = resource_registry.session_environment_profile(session_id)
+    if not isinstance(reference, str):
+        reference = spec.params.get("environment_profile")
     if not isinstance(reference, str):
         return instructions
     filesystem_path = resource_registry.ensure_environment_profile_guide(session_id, reference)
@@ -3532,6 +3534,10 @@ def create_runner_app(
         if init_context.envelope is not None:
             _note_session_harness_override(
                 session_id, init_context.envelope.snapshot.harness_override
+            )
+            resource_registry.set_session_environment_profile(
+                session_id,
+                init_context.envelope.snapshot.environment_profile,
             )
 
         spec: AgentSpec | None = None
