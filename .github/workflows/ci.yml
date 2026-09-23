@@ -44,7 +44,7 @@ jobs:
     name: Pytest (${{ matrix.group }})
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -67,6 +67,9 @@ jobs:
             paths: tests/tools tests/test_errors.py
           - group: repl-sdk
             paths: tests/frontends tests/repl tests/terminals
+            # Ubuntu 22.04 ships tmux 3.2a, which lacks the control-mode
+            # paste-buffer notification exercised by the terminal tests.
+            runner: ubuntu-24.04
           # Isolates the park-on-future elicitation/permission/policy files so a
           # wedge there stalls one small job, not the whole server shard.
           - group: server-approvals
