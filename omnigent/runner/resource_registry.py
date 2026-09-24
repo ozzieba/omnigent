@@ -796,6 +796,7 @@ class SessionResourceRegistry:
             return existing
 
         from omnigent.server.environment_profiles import (
+            environment_profile_discovery_index,
             environment_profile_agent_guide,
             environment_profile_catalog,
         )
@@ -804,13 +805,16 @@ class SessionResourceRegistry:
         root = Path(tempdir.name)
         path = root / "AGENTS.md"
         catalog_path = root / "resources" / "catalog.json"
+        discovery_index_path = root / "resources" / "services.json"
         guide = environment_profile_agent_guide(
             reference,
             filesystem_path=str(path),
             catalog_path=str(catalog_path),
+            discovery_index_path=str(discovery_index_path),
         )
         catalog = environment_profile_catalog(reference)
-        if guide is None or catalog is None:
+        discovery_index = environment_profile_discovery_index(reference)
+        if guide is None or catalog is None or discovery_index is None:
             tempdir.cleanup()
             return None
         catalog_path.parent.mkdir(mode=0o700)
@@ -819,6 +823,11 @@ class SessionResourceRegistry:
             encoding="utf-8",
         )
         catalog_path.chmod(0o444)
+        discovery_index_path.write_text(
+            json.dumps(discovery_index, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        discovery_index_path.chmod(0o444)
         path.write_text(guide + "\n", encoding="utf-8")
         path.chmod(0o444)
         self._environment_guide_dirs[session_id] = tempdir

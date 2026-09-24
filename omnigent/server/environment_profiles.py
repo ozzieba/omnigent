@@ -298,11 +298,65 @@ def environment_profile_catalog(reference: str) -> dict[str, object] | None:
     }
 
 
+def environment_profile_discovery_index(reference: str) -> dict[str, object] | None:
+    """Return a compact filesystem index for live, permission-checked interfaces.
+
+    The index only describes the server tools already granted by the selected
+    profile. It contains no session data, credentials, paths, or authorization
+    shortcuts; every query still goes through the named tool's normal policy.
+    """
+    profile = get_environment_profile(reference)
+    if profile is None:
+        return None
+
+    capabilities = {capability.id: capability for capability in profile.capabilities}
+    sections: list[dict[str, object]] = []
+    sessions = capabilities.get("omnigent.sessions")
+    if sessions is not None and sessions.state == "available":
+        sections.append(
+            {
+                "id": sessions.id,
+                "name": sessions.name,
+                "access": sessions.access,
+                "authorization_owner": sessions.authorization_owner,
+                "interfaces": list(sessions.interfaces),
+                "workflow": [
+                    "Call sys_session_list to discover sessions visible under the current session.",
+                    "Call sys_session_get_info for one returned session ID.",
+                    "Call sys_session_get_history only when transcript context is needed.",
+                ],
+            }
+        )
+    agents = capabilities.get("omnigent.agent-contexts")
+    if agents is not None and agents.state == "available":
+        sections.append(
+            {
+                "id": agents.id,
+                "name": agents.name,
+                "access": agents.access,
+                "authorization_owner": agents.authorization_owner,
+                "interfaces": list(agents.interfaces),
+                "workflow": [
+                    "Call sys_agent_list to discover built-in, local, and accessible session agents.",
+                    "Use sys_agent_get or sys_agent_download only with an agent ID returned by an authorized listing.",
+                ],
+            }
+        )
+    return {
+        "schema_version": 1,
+        "kind": "omnigent.environment-discovery-index",
+        "profile": profile.reference,
+        "authorization": "Metadata only; each interface enforces its own server-side permissions.",
+        "services": sections,
+    }
+
+
 def environment_profile_agent_guide(
     reference: str,
     *,
     filesystem_path: str | None = None,
     catalog_path: str | None = None,
+    discovery_index_path: str | None = None,
 ) -> str | None:
     """Render trusted profile capability metadata for an agent system prompt.
 
@@ -331,6 +385,13 @@ def environment_profile_agent_guide(
             f"`{catalog_path}`; query it with `jq` when installed in the selected runner, "
             "or read it with `sys_os_read`. "
             "It describes grants but does not grant them."
+        )
+    if discovery_index_path is not None:
+        lines.append(
+            "A read-only service discovery index is mounted at "
+            f"`{discovery_index_path}`. It lists only interfaces available in "
+            "this profile and gives a suggested query order; each tool still "
+            "enforces its own server-side permissions."
         )
     for capability in profile.capabilities:
         interfaces = ", ".join(capability.interfaces)
