@@ -796,10 +796,10 @@ class SessionResourceRegistry:
             return existing
 
         from omnigent.server.environment_profiles import (
-            environment_profile_discovery_index,
             environment_profile_agent_guide,
             environment_profile_catalog,
         )
+        from omnigent.server.environment_discovery import environment_profile_discovery_index
 
         tempdir = tempfile.TemporaryDirectory(prefix="omnigent-environment-")
         root = Path(tempdir.name)
@@ -810,13 +810,18 @@ class SessionResourceRegistry:
             reference,
             filesystem_path=str(path),
             catalog_path=str(catalog_path),
-            discovery_index_path=str(discovery_index_path),
         )
         catalog = environment_profile_catalog(reference)
         discovery_index = environment_profile_discovery_index(reference)
         if guide is None or catalog is None or discovery_index is None:
             tempdir.cleanup()
             return None
+        guide += (
+            "\nA read-only service discovery index is mounted at "
+            f"`{discovery_index_path}`. It lists available interfaces and a "
+            "suggested query order; every tool continues to enforce its own "
+            "server-side permissions.\n"
+        )
         catalog_path.parent.mkdir(mode=0o700)
         catalog_path.write_text(
             json.dumps(catalog, indent=2, sort_keys=True) + "\n",
