@@ -128,6 +128,13 @@ jobs:
       # install it here before pre-commit runs to ensure the check is enforced.
       # The binary is verified against a pinned SHA-256 so a corrupted or spoofed
       # download is caught before the binary is made executable.
+      # The runner container lacks Java; use the same JDK 17 toolchain as Android.
+      - name: Set up JDK 17 for ktlint
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
       - name: Install ktlint
         env:
           KTLINT_VERSION: "1.8.0"
