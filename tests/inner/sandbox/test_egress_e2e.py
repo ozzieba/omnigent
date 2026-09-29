@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -924,10 +925,13 @@ class _CapturingUpstream:
         import threading
 
         captured: list[str | None] = []
+        captured_requests: list[tuple[str, str | None]] = []
 
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                captured.append(self.headers.get("Authorization"))
+                authorization = self.headers.get("Authorization")
+                captured.append(authorization)
+                captured_requests.append((self.path, authorization))
                 self.send_response(200)
                 self.send_header("Content-Length", "2")
                 self.end_headers()
@@ -939,6 +943,7 @@ class _CapturingUpstream:
 
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.captured = captured
+        self.captured_requests = captured_requests
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -948,6 +953,12 @@ class _CapturingUpstream:
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)
+
+    def authorizations_for(self, path: str) -> list[str | None]:
+        """Return only requests made by this test's uniquely tagged probe."""
+        return [
+            authorization for target, authorization in self.captured_requests if target == path
+        ]
 
 
 def _proxied_http_probe(target_url: str, *, auth_expr: str) -> str:
@@ -1056,7 +1067,8 @@ def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
     os_env = create_os_environment(
         OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec)
     )
-    probe = _proxied_http_probe_no_auth(f"http://127.0.0.1:{upstream.port}/probe")
+    request_path = f"/credential-basic-{uuid.uuid4().hex}"
+    probe = _proxied_http_probe_no_auth(f"http://127.0.0.1:{upstream.port}{request_path}")
     try:
         result = run_async(os_env.shell(_python_probe_argv(probe)))
         # Dump every credential-shaped env var the sandbox can see.
@@ -1075,7 +1087,7 @@ def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
     # The proxy synthesized the Authorization header from nothing the
     # client sent — if injection regressed, captured would be [None]
     # (the bare request) instead of the real Basic credential.
-    assert upstream.captured == [expected], (
+    assert upstream.authorizations_for(request_path) == [expected], (
         "Upstream MUST receive the proxy-injected Basic credential on a bare "
         f"request. Captured: {upstream.captured!r}."
     )
@@ -1125,8 +1137,9 @@ def test_credential_proxy_https_bearer_swaps_injected_env_token(
     os_env = create_os_environment(
         OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec)
     )
+    request_path = f"/credential-bearer-{uuid.uuid4().hex}"
     probe = _proxied_http_probe(
-        f"http://127.0.0.1:{upstream.port}/probe",
+        f"http://127.0.0.1:{upstream.port}{request_path}",
         auth_expr="'Bearer ' + os.environ['JIRA_TOKEN']",
     )
     try:
@@ -1140,7 +1153,7 @@ def test_credential_proxy_https_bearer_swaps_injected_env_token(
         f"Probe failed. stdout={result.get('stdout')!r} stderr={result.get('stderr')!r}"
     )
     assert "STATUS 200" in result["stdout"], f"Did not reach upstream: {result['stdout']!r}"
-    assert upstream.captured == [f"Bearer {real_secret}"], (
+    assert upstream.authorizations_for(request_path) == [f"Bearer {real_secret}"], (
         "Upstream MUST receive the real bearer secret after the proxy swap. "
         f"Captured: {upstream.captured!r}. If it shows oa_cred_*, the rewrite "
         "did not fire; if empty, the request never reached upstream."
@@ -1250,7 +1263,8 @@ def test_credential_proxy_databricks_cli_materializes_cfg_and_swaps(
     os_env = create_os_environment(
         OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec)
     )
-    probe = _databricks_cfg_probe(f"{host_url}/probe")
+    request_path = f"/credential-databricks-{uuid.uuid4().hex}"
+    probe = _databricks_cfg_probe(f"{host_url}{request_path}")
     try:
         result = run_async(os_env.shell(_python_probe_argv(probe)))
         cfg_dump = run_async(os_env.shell('cat "$DATABRICKS_CONFIG_FILE"'))
@@ -1265,7 +1279,7 @@ def test_credential_proxy_databricks_cli_materializes_cfg_and_swaps(
         f"Did not reach upstream (the workspace host listed in egress_rules "
         f"must make 127.0.0.1 reachable): {result['stdout']!r}"
     )
-    assert upstream.captured == [f"Bearer {real_token}"], (
+    assert upstream.authorizations_for(request_path) == [f"Bearer {real_token}"], (
         "Upstream MUST receive the real token after the proxy swap. "
         f"Captured: {upstream.captured!r}."
     )

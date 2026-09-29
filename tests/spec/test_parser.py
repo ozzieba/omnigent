@@ -909,27 +909,29 @@ def test_discover_host_skills_skips_unreadable_skill_file(
     host_skills = agent_root / ".claude" / "skills"
     host_skills.mkdir(parents=True)
 
-    # Broken symlink: ``SKILL.md`` exists (in the sense that
-    # ``Path.exists()`` follows symlinks and returns False, but the
-    # discoverer's ``skill_md.exists()`` check returns False too).
-    # Use a directory we make read-then-unreadable instead so the
-    # path exists but read_text() raises OSError.
+    # A broken symlink is skipped by exists() before the read. Inject the
+    # read error for an existing file so this also works under CI's root user,
+    # which can read a chmod(0) file.
     bad_dir = host_skills / "unreadable"
     bad_dir.mkdir()
     bad_md = bad_dir / "SKILL.md"
     bad_md.write_text("---\nname: unreadable\ndescription: x\n---\nbody")
-    bad_md.chmod(0o000)
 
     good_dir = host_skills / "good"
     good_dir.mkdir()
     (good_dir / "SKILL.md").write_text("---\nname: good\ndescription: y\n---\nContent.")
 
-    try:
+    real_read_text = Path.read_text
+
+    def read_text_with_unreadable_skill(path: Path, *args: object, **kwargs: object) -> str:
+        if path == bad_md:
+            raise PermissionError(f"cannot read {bad_md}")
+        return real_read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", read_text_with_unreadable_skill)
         with caplog.at_level("WARNING", logger="omnigent.spec.parser"):
             result = discover_host_skills(agent_root, "all")
-    finally:
-        # Restore so pytest can clean tmp_path on teardown.
-        bad_md.chmod(0o600)
 
     assert [s.name for s in result] == ["good"]
     skip_records = [rec for rec in caplog.records if "Skipping skill" in rec.message]

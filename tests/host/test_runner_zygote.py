@@ -646,6 +646,10 @@ def test_fork_refused_after_source_change_with_stale_build_info(
         sources=_source_file_stamps([source]),
     )
     source.write_text("new = True\n")
+    # The two versions have equal size, and a fast filesystem may report the
+    # same timestamp for both writes. Make the changed stamp deterministic.
+    baseline_mtime_ns = graph_stamp.sources[0].modified_ns
+    os.utime(source, ns=(baseline_mtime_ns + 1_000_000_000, baseline_mtime_ns + 1_000_000_000))
 
     daemon, daemon_peer = socket.socketpair()
     conn, peer = socket.socketpair()

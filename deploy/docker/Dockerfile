@@ -82,7 +82,7 @@ COPY web/electron/package.json ./web/electron/
 RUN npm install -g pnpm@11.15.1
 RUN pnpm install --frozen-lockfile --filter web
 
-COPY web/ ./web/
+COPY --exclude=node_modules web/ ./web/
 RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────
@@ -133,7 +133,16 @@ ENV VIRTUAL_ENV=/opt/venv \
 # pyproject.toml declares the sibling SDKs as editable path deps via
 # [tool.uv.sources]. The runtime stages preserve /build/ so the venv's
 # .pth references stay valid.
-RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e .
+#
+# editable_mode=compat makes setuptools write a plain path .pth (/build on
+# sys.path) instead of its default import-hook finder. Plugin distributions
+# such as Docloop ship modules under omnigent/community/harness/ in
+# site-packages; with the import-hook finder that site-packages directory
+# (which has no omnigent/__init__.py) resolves first as a namespace package
+# and shadows /build/omnigent entirely. With a path entry the regular
+# package in /build wins, and omnigent.community.harness still extends its
+# __path__ into site-packages to pick up the plugin modules.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -C editable_mode=compat -e .
 
 # ── Server builder ──────────────────────────────────────
 # Server-only additions on top of the shared builder: the SPA bundle
@@ -153,13 +162,22 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# Docloop is a separate harness distribution. Keep the released 0.2.7 wheel
+# pinned in the build context so the server image discovers its community
+# harness contribution at spec-load time.
+COPY deploy/docker/vendor/docloop-0.2.7-py3-none-any.whl /tmp/docloop-0.2.7-py3-none-any.whl
+RUN echo "eb74402a63c591196a10338c6b655fcf6c377f6ab78b433ceaf0c81ffdf0e434  /tmp/docloop-0.2.7-py3-none-any.whl" | sha256sum -c - \
+ && uv pip install --no-cache-dir /tmp/docloop-0.2.7-py3-none-any.whl \
+ && rm -f /tmp/docloop-0.2.7-py3-none-any.whl \
+ && python -c "import importlib, omnigent; assert omnigent.__file__ == '/build/omnigent/__init__.py', omnigent.__file__; importlib.import_module('omnigent.community.harness.docloop'); from importlib.metadata import entry_points; from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES; eps = entry_points(group='omnigent.community.harness'); assert any(ep.name == 'docloop' and ep.value == 'docloop.omnigent:contribution' for ep in eps), [(ep.name, ep.value) for ep in eps]; assert 'docloop' in OMNIGENT_HARNESSES, sorted(OMNIGENT_HARNESSES)"
+
 # Optional managed-sandbox provider extras for the SERVER (the launcher imports
 # the provider SDK — e.g. the kubernetes client for `sandbox.provider:
 # kubernetes`). Off by default; the runner host image needs none of these. Build
 # with `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
 ARG OMNIGENT_EXTRAS=
 RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
-        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
+        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -C editable_mode=compat -e ".[${OMNIGENT_EXTRAS}]"; \
     fi
 
 # ── Node alias stage ─────────────────────────────────────

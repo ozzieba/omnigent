@@ -2145,6 +2145,15 @@ async def _wait_for_resolved(omnigent: "FakeOmnigentClient", count: int = 1) -> 
     raise AssertionError(f"Timed out waiting for {count} resolved elicitation(s)")
 
 
+async def _wait_for_streams_stopped(slack: FakeSlackClient, count: int) -> None:
+    """Wait for the resumed turn's Slack output before canceling it at shutdown."""
+    for _ in range(250):
+        if len(slack.streams) >= count and all(stream.stopped for stream in slack.streams[:count]):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"Timed out waiting for {count} completed Slack streams")
+
+
 async def test_tool_approval_approve_resumes_turn(tmp_path: Path) -> None:
     store = await _store(tmp_path)
     slack = FakeSlackClient()
@@ -2165,6 +2174,7 @@ async def test_tool_approval_approve_resumes_turn(tmp_path: Path) -> None:
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
     )
     await _wait_for_resolved(omnigent)
+    await _wait_for_streams_stopped(slack, 2)
     await service.shutdown()
 
     assert delivered is True

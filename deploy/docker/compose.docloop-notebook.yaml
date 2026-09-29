@@ -1,0 +1,6 @@
+# Optional server overlay. Apply during a maintenance window after sessions drain.
+services:
+  omnigent:
+    environment:
+      # Keep features from .env and add the Docloop notebook pane.
+      OMNIGENT_FEATURES: "${OMNIGENT_FEATURES:+${OMNIGENT_FEATURES},}docloop_notebook"

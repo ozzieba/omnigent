@@ -44,32 +44,45 @@ jobs:
     name: Pytest (${{ matrix.group }})
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - group: runtime-harnesses
+            runner: ubuntu-latest
             paths: tests/runtime/harnesses
             dist: worksteal
           - group: runtime-policies
+            runner: ubuntu-latest
             paths: tests/runtime/policies
           - group: runtime-core
+            runner: ubuntu-latest
             paths: >-
               tests/runtime
               --ignore=tests/runtime/harnesses
               --ignore=tests/runtime/policies
             dist: worksteal
           - group: inner-rest
+            # This repo-scoped runner gives Bubblewrap mount/net namespace
+            # capabilities and unconfined seccomp/AppArmor. Its test jobs have
+            # no Docker socket or host bind mounts. The runner-app shard also
+            # uses this runner for its real Bubblewrap filesystem test.
+            runner: ubuntu-bwrap
             paths: tests/inner
           - group: tools
+            runner: ubuntu-latest
             paths: tests/tools tests/test_errors.py
           - group: repl-sdk
             paths: tests/frontends tests/repl tests/terminals
+            # Ubuntu 22.04 ships tmux 3.2a, which lacks the control-mode
+            # paste-buffer notification exercised by the terminal tests.
+            runner: ubuntu-24.04
           # Isolates the park-on-future elicitation/permission/policy files so a
           # wedge there stalls one small job, not the whole server shard.
           - group: server-approvals
+            runner: ubuntu-latest
             paths: >-
               tests/server/integration/test_sessions_permission_request_hook.py
               tests/server/integration/test_sessions_elicitation_resolve_url.py
@@ -78,6 +91,7 @@ jobs:
           # worksteal: the biggest file would otherwise pin one worker past the
           # shard's balanced wall time. server/conftest fixtures are function-scoped.
           - group: server-integration
+            runner: ubuntu-latest
             paths: >-
               tests/server/integration
               --ignore=tests/server/integration/test_sessions_permission_request_hook.py
@@ -87,15 +101,18 @@ jobs:
             dist: worksteal
           # Historical name; stays in merge-ready's REQUIRED list.
           - group: server-rest
+            runner: ubuntu-latest
             paths: tests/server --ignore=tests/server/integration tests/onboarding
             workers: "4"
           - group: spec-llms
+            runner: ubuntu-latest
             paths: tests/spec tests/llms
           # Integration journey tests with mock LLM (no API key).
           # workers=0 (serial): session-scoped live_server + mock_llm_server
           # fixtures spawn subprocesses that must share one mock server;
           # xdist workers would each create their own session fixtures.
           - group: integration-mock
+            runner: ubuntu-latest
             paths: tests/integration
             workers: "0"
           # Carved out of misc: runner + stores were ~68% of misc's cpu and
@@ -105,15 +122,18 @@ jobs:
           # the floor drops from ~500s to ~100s). Both dirs' conftests are
           # function-scoped, so splitting a file across workers is safe.
           - group: runner-app
+            runner: ubuntu-bwrap
             paths: tests/runner
             dist: worksteal
           - group: stores
+            runner: ubuntu-latest
             paths: tests/stores
             dist: worksteal
           # Catch-all so new top-level tests/<dir>/ are covered automatically.
           # worksteal keeps the biggest remaining file (the benchmark smoke
           # test, ~58s) from re-pinning one worker as this catch-all grows.
           - group: misc
+            runner: ubuntu-latest
             paths: >-
               tests
               --ignore=tests/e2e
@@ -140,6 +160,7 @@ jobs:
           # -m "not databricks") and selects them here. Paths carrying marked
           # tests must be listed here or those tests run nowhere.
           - group: databricks
+            runner: ubuntu-latest
             paths: tests/db tests/deploy tests/server/test_smart_routing.py
             extra: databricks
             markexpr: databricks
@@ -152,6 +173,7 @@ jobs:
           # test is omnigent_slack, not omnigent) — harmless, kept for a
           # uniform pytest step.
           - group: slack
+            runner: ubuntu-latest
             paths: integrations/slack/tests
             extra: slack
 
@@ -167,6 +189,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Install ripgrep + bubblewrap + tmux
@@ -231,12 +257,11 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: pytest-${{ matrix.group }}-${{ github.run_id }}
           path: artifacts/
           retention-days: 14
-          include-hidden-files: true  # the per-shard .coverage.<group> dotfile
 
   stores-postgres:
     name: Pytest (stores-postgres)
@@ -264,6 +289,8 @@ jobs:
           python-version-file: ".python-version"
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
         with:
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
       - name: Install dependencies
         run: uv sync --locked --extra all --group test --extra databricks
@@ -278,7 +305,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-postgres.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db
         with:
           name: pytest-stores-postgres-${{ github.run_id }}
           path: artifacts/
@@ -310,6 +337,8 @@ jobs:
           python-version-file: ".python-version"
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
         with:
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
       - name: Install system MySQL client library
         run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
@@ -326,7 +355,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-mysql.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db
         with:
           name: pytest-stores-mysql-${{ github.run_id }}
           path: artifacts/
@@ -350,10 +379,12 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
         with:
           toolchain: stable
 
@@ -416,7 +447,7 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: pytest-codex-parity-${{ github.run_id }}
           path: artifacts/
@@ -450,11 +481,9 @@ jobs:
         run: pip install "coverage>=7"
 
       - name: Download shard coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: https://code.forgejo.org/forgejo/download-artifact@246d7188e736d3686f6d19628d253ede9697bd55  # Forgejo v3-node20
         with:
-          pattern: pytest-*
           path: covdata
-          merge-multiple: true
 
       - name: Combine + report
         shell: bash
@@ -476,7 +505,7 @@ jobs:
 
       - name: Upload coverage summary
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: coverage-summary-${{ github.run_id }}
           path: coverage-summary/

@@ -1892,20 +1892,28 @@ async def test_edit_and_delete_outside_workspace_round_trip(
 async def test_unwritable_target_reports_an_error_not_a_crash(
     client: httpx.AsyncClient,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An ordinary OS permission denial must surface as a filesystem error. The
     in-process route bypasses the helper subprocess, which is what normally
     converts a raised OSError into an error payload."""
     locked = tmp_path / "locked"
     locked.mkdir()
-    locked.chmod(0o500)  # read+execute only: no new entries
-    try:
-        base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
-        url = f"{base}/%2F{str(locked / 'nope.txt').lstrip('/')}"
+    target = locked / "nope.txt"
+    original_write_text = Path.write_text
 
-        resp = await client.put(url, json={"content": "x", "encoding": "utf-8"})
+    def deny_target_write(path: Path, *args: object, **kwargs: object) -> int:
+        if path == target:
+            raise PermissionError("test target is unwritable")
+        return original_write_text(path, *args, **kwargs)
 
-        assert resp.status_code < 500, f"expected a handled error, got {resp.status_code}"
-        assert "error" in resp.json()
-    finally:
-        locked.chmod(0o700)
+    # chmod alone does not deny writes when CI runs as root. Inject the OS
+    # failure at the exact direct-write boundary this route must handle.
+    monkeypatch.setattr(Path, "write_text", deny_target_write)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    url = f"{base}/%2F{str(target).lstrip('/')}"
+
+    resp = await client.put(url, json={"content": "x", "encoding": "utf-8"})
+
+    assert resp.status_code < 500, f"expected a handled error, got {resp.status_code}"
+    assert "error" in resp.json()
