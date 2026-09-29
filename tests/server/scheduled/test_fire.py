@@ -225,11 +225,20 @@ class FakeHostRegistry:
 
 
 class FakePolicyStore:
-    """Records policy create calls."""
+    """Records policy writes and serves scripted persisted readbacks."""
 
-    def __init__(self, *, fail_create: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_create: bool = False,
+        silent_create: bool = False,
+        bad_readback: bool = False,
+    ) -> None:
         self.created: list[dict[str, Any]] = []
         self.fail_create = fail_create
+        self.silent_create = silent_create
+        self.bad_readback = bad_readback
+        self.get_calls: list[tuple[str, str]] = []
 
     def create(
         self,
@@ -243,18 +252,54 @@ class FakePolicyStore:
     ) -> Any:
         if self.fail_create:
             raise RuntimeError("policy create failed")
-        self.created.append(
-            {
-                "policy_id": policy_id,
-                "session_id": session_id,
-                "name": name,
-                "type": type,
-                "handler": handler,
-                "factory_params": factory_params,
-                "enabled": enabled,
-            }
+        policy = {
+            "policy_id": policy_id,
+            "session_id": session_id,
+            "name": name,
+            "type": type,
+            "handler": handler,
+            "factory_params": factory_params,
+            "enabled": enabled,
+            "scope": "session",
+        }
+        if not self.silent_create:
+            self.created.append(policy)
+        return policy
+
+    def get(self, policy_id: str, session_id: str) -> Any:
+        self.get_calls.append((policy_id, session_id))
+        policy = next(
+            (
+                row
+                for row in self.created
+                if row["policy_id"] == policy_id and row["session_id"] == session_id
+            ),
+            None,
         )
-        return None
+        if policy is None:
+            return None
+        return _FakePolicy(
+            id=policy["policy_id"],
+            session_id=policy["session_id"],
+            scope=policy["scope"],
+            name=policy["name"],
+            type=policy["type"],
+            handler=policy["handler"],
+            factory_params=policy["factory_params"],
+            enabled=False if self.bad_readback else policy["enabled"],
+        )
+
+
+@dataclass
+class _FakePolicy:
+    id: str
+    session_id: str
+    scope: str
+    name: str
+    type: str
+    handler: str
+    factory_params: dict[str, Any] | None
+    enabled: bool
 
 
 def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
@@ -1456,6 +1501,8 @@ async def test_max_cost_usd_attaches_cost_budget_policy() -> None:
     assert pol["handler"] == "omnigent.policies.builtins.cost.cost_budget"
     assert pol["factory_params"] == {"max_cost_usd": 5.0}
     assert pol["enabled"] is True
+    assert len(policy_store.get_calls) == 1
+    assert policy_store.get_calls[0][1] == "conv_1"
     assert store.runs[0]["status"] == "running"
 
 
@@ -1482,13 +1529,14 @@ async def test_no_max_cost_usd_skips_policy_attachment() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_policy_store_skips_attachment() -> None:
-    """When policy_store is None, cost budget attachment is silently skipped."""
+async def test_no_policy_store_fails_configured_budget_without_dispatch() -> None:
+    """A configured cap without policy storage records failure and never launches."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+    launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
-        return None
+        launched.append(conv)
 
     on_fire = build_on_fire(
         _deps(store, conversation_store=conv_store, policy_store=None),
@@ -1498,12 +1546,16 @@ async def test_no_policy_store_skips_attachment() -> None:
     await _drain()
 
     assert len(conv_store.created) == 1
-    assert store.runs[0]["status"] == "running"
+    assert launched == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "budget_policy_failed"
+    assert "policy storage is unavailable" in store.runs[0]["error"]
 
 
 @pytest.mark.asyncio
-async def test_policy_create_failure_does_not_fail_fire() -> None:
-    """A policy store failure is non-fatal: the session proceeds without a cap."""
+async def test_policy_create_failure_fails_fire_without_dispatch() -> None:
+    """A policy write failure never launches an uncapped scheduled session."""
     policy_store = FakePolicyStore(fail_create=True)
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
@@ -1520,5 +1572,57 @@ async def test_policy_create_failure_does_not_fail_fire() -> None:
     await _drain()
 
     assert len(conv_store.created) == 1
-    assert len(launched) == 1
-    assert store.runs[0]["status"] == "running"
+    assert launched == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "budget_policy_failed"
+
+
+@pytest.mark.asyncio
+async def test_silent_policy_create_failure_fails_readback_without_dispatch() -> None:
+    """A successful create call with no persisted policy fails closed."""
+    policy_store = FakePolicyStore(silent_create=True)
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert policy_store.get_calls and policy_store.created == []
+    assert launched == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "budget_policy_failed"
+
+
+@pytest.mark.asyncio
+async def test_disabled_policy_readback_fails_closed_without_dispatch() -> None:
+    """A stored but disabled policy is not accepted as a configured cap."""
+    policy_store = FakePolicyStore(bad_readback=True)
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(policy_store.created) == 1 and policy_store.get_calls
+    assert launched == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "budget_policy_failed"

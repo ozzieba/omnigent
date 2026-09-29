@@ -432,7 +432,26 @@ async def _run_fire_for_task(
             )
             return
 
-        await _attach_cost_budget(deps, task, conv.id)
+        try:
+            await _attach_cost_budget(deps, task, conv.id)
+        except _CostBudgetPolicyError as exc:
+            _logger.error(
+                "scheduled fire: task %s cost budget could not be verified; "
+                "not dispatching session %s: %s",
+                task.id,
+                conv.id,
+                exc,
+            )
+            await _record_run(
+                deps,
+                task,
+                conv.id,
+                scheduled_at,
+                status="failed",
+                error=str(exc),
+                error_code="budget_policy_failed",
+            )
+            return
 
         try:
             await _grant_owner(deps, task, conv.id)
@@ -756,18 +775,26 @@ _COST_BUDGET_HANDLER = "omnigent.policies.builtins.cost.cost_budget"
 _COST_BUDGET_POLICY_NAME = "__scheduled_task_cost_budget"
 
 
-async def _attach_cost_budget(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
-    """Attach a cost_budget policy to a session spawned by a scheduled task.
+class _CostBudgetPolicyError(RuntimeError):
+    """A configured scheduled-session budget was not durably confirmed."""
 
-    Non-fatal: a failure logs a warning but does not fail the fire — an
-    uncapped session is better than a dead run.
-    """
-    if task.max_cost_usd is None or deps.policy_store is None:
+
+async def _attach_cost_budget(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
+    """Persist and verify a configured session cost cap before dispatch."""
+    if task.max_cost_usd is None:
         return
+    if deps.policy_store is None:
+        raise _CostBudgetPolicyError(
+            "max_cost_usd is configured but policy storage is unavailable; "
+            "session was not dispatched"
+        )
+
+    policy_id = _new_id()
+    create_error: Exception | None = None
     try:
         await asyncio.to_thread(
             deps.policy_store.create,
-            policy_id=_new_id(),
+            policy_id=policy_id,
             session_id=conversation_id,
             name=_COST_BUDGET_POLICY_NAME,
             type="python",
@@ -776,11 +803,45 @@ async def _attach_cost_budget(deps: FireDeps, task: ScheduledTask, conversation_
             enabled=True,
         )
     except Exception:  # noqa: BLE001
+        create_error = RuntimeError("policy create raised")
         _logger.warning(
-            "scheduled fire: failed to attach cost budget for task %s (session %s)",
+            "scheduled fire: policy create raised for task %s (session %s); checking readback",
             task.id,
             conversation_id,
             exc_info=True,
+        )
+
+    try:
+        policy = await asyncio.to_thread(deps.policy_store.get, policy_id, conversation_id)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "scheduled fire: policy readback failed for task %s (session %s)",
+            task.id,
+            conversation_id,
+            exc_info=True,
+        )
+        policy = None
+        readback_error: Exception | None = exc
+    else:
+        readback_error = None
+
+    if (
+        policy is None
+        or policy.id != policy_id
+        or policy.session_id != conversation_id
+        or policy.scope != "session"
+        or policy.name != _COST_BUDGET_POLICY_NAME
+        or policy.type != "python"
+        or policy.handler != _COST_BUDGET_HANDLER
+        or policy.factory_params != {"max_cost_usd": task.max_cost_usd}
+        or policy.enabled is not True
+    ):
+        if create_error is not None or readback_error is not None:
+            reason = "policy creation or readback failed"
+        else:
+            reason = "policy readback did not match the enabled cost cap"
+        raise _CostBudgetPolicyError(
+            f"{reason}; max_cost_usd is configured and session was not dispatched"
         )
 
 
