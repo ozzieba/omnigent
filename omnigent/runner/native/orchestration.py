@@ -4167,7 +4167,7 @@ def _live_codex_app_server_for_relaunch(
     app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
     if app_server is None:
         return None
-    proc = app_server.proc
+    proc = getattr(app_server, "proc", None)
     if proc is None or proc.returncode is not None:
         return None
     forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
