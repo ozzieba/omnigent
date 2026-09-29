@@ -4657,16 +4657,19 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("terminal_type", "response_id", "expected_started"),
+    ("terminal_type", "response_id", "response_status", "expected_started"),
     [
-        ("response.completed", "resp_model", True),
-        ("response.failed", "resp_failed", False),
-        ("response.completed", "deny_synthetic", False),
+        ("response.completed", "resp_model", "completed", True),
+        ("response.failed", "resp_failed", "failed", False),
+        ("response.completed", "deny_synthetic", "completed", False),
+        ("response.completed", None, "completed", False),
+        ("response.completed", "resp_pending", "in_progress", False),
     ],
 )
 async def test_relay_persists_harness_reported_model(
     terminal_type: str,
-    response_id: str,
+    response_id: str | None,
+    response_status: str,
     expected_started: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4691,7 +4694,8 @@ async def test_relay_persists_harness_reported_model(
                 {
                     "type": terminal_type,
                     "response": {
-                        "id": response_id,
+                        **({"id": response_id} if response_id is not None else {}),
+                        "status": response_status,
                         "model": "repro_agent",
                         "usage": {
                             "input_tokens": 0,

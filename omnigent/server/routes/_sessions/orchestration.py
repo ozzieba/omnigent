@@ -6455,8 +6455,12 @@ async def _relay_runner_stream_once(
                             if isinstance(_completed_response, dict)
                             else None
                         )
-                        if not (
-                            isinstance(_completed_id, str) and _completed_id.startswith("deny_")
+                        if (
+                            isinstance(_completed_response, dict)
+                            and _completed_response.get("status") == "completed"
+                            and isinstance(_completed_id, str)
+                            and bool(_completed_id)
+                            and not _completed_id.startswith("deny_")
                         ):
                             session_live_state.persist_scheduled_run_started(session_id)
                         # Persist the turn's usage (cost + token buckets) so
