@@ -22,6 +22,9 @@ except ImportError:  # pragma: no cover - Windows has no flock.
     fcntl = None  # type: ignore[assignment]
 
 _logger = logging.getLogger(__name__)
+
+# Upper bound on the ``ps`` listing used by the launch-time reap.
+_REAP_PS_TIMEOUT_S = 60.0
 _REGISTRY_FILE = "process-registry.json"
 _OWNER_LOCK_DIR = "process-owners"
 _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
@@ -456,9 +459,17 @@ def reap_codex_native_processes_for_state_dir(
             check=False,
             capture_output=True,
             text=True,
-            timeout=5.0,
+            # A full process listing is O(processes): on a host with a large
+            # process table it can take many seconds, and a timeout here
+            # silently skips the reap that the launch depends on.
+            timeout=_REAP_PS_TIMEOUT_S,
         ).stdout
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _logger.warning(
+            "could not list processes to reap stale codex app-servers for %s: %s",
+            state_dir.name,
+            exc,
+        )
         return 0
     own_pgid = os.getpgid(0)
     victims: dict[int, int] = {}

@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -219,6 +219,7 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
         return
     await _cancel_auto_forwarder_task(session_id)
     leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+    _forget_codex_launch_fingerprint(session_id, leftover_app_server)
     if leftover_app_server is not None:
         with contextlib.suppress(Exception):
             await leftover_app_server.close()
@@ -3955,6 +3956,288 @@ async def _auto_create_kimi_terminal(
     return terminal_view
 
 
+async def _launch_codex_tui_terminal(
+    *,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    app_server: CodexNativeAppServer,
+    codex_ws_url: str,
+    thread_id: str | None,
+    terminal_launch_args: Sequence[str] | None,
+    bypass_sandbox: bool,
+    agent_os_env: OSEnvSpec | None,
+    workspace: str,
+) -> SessionResourceView:
+    """
+    Launch the runner-owned Codex TUI pane attached to a live app-server.
+
+    Shared by the full launch in :func:`_auto_create_codex_terminal` and the
+    TUI-only relaunch in :func:`_relaunch_codex_tui_on_live_app_server`, so
+    a pane that died on its own can be re-attached to the SAME app-server
+    (which still owns the thread's writer lock and may be mid-turn) instead
+    of tearing that app-server down.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param resource_registry: Session resource registry that owns the pane.
+    :param publish_event: Per-session SSE emitter for ``resource.created``.
+    :param app_server: The live app-server the TUI attaches to.
+    :param codex_ws_url: The app-server's loopback ws URL, e.g.
+        ``"ws://127.0.0.1:9876"``.
+    :param thread_id: Codex thread to resume, or ``None`` for a fresh TUI
+        thread.
+    :param terminal_launch_args: Persisted raw Codex CLI args.
+    :param bypass_sandbox: Whether the session runs in full-bypass mode.
+    :param agent_os_env: The agent's os_env (sandbox), or ``None``.
+    :param workspace: Session workspace directory.
+    :returns: The launched terminal resource view.
+    """
+    from omnigent.codex_native_app_server import (
+        _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
+        build_codex_remote_args,
+        codex_terminal_env,
+    )
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    codex_remote_args = build_codex_remote_args(
+        codex_args=tuple(terminal_launch_args or ()),
+        thread_id=thread_id,
+        remote_url=codex_ws_url,
+        bypass_sandbox=bypass_sandbox,
+        # The --remote TUI loads its own config and does not inherit the
+        # app-server's -c flags; pass the same provider/model overrides so it
+        # resolves the Omnigent provider instead of falling back to the OpenAI
+        # built-in (which would force the first-run login screen and block
+        # thread creation).
+        config_overrides=tuple(app_server.config_overrides),
+        # Omnigent provisions the private CODEX_HOME and vets hook sources
+        # itself; skip the interactive trust prompt that headless sub-agents
+        # can never answer.
+        #
+        # A failed version probe must not restore the interactive gate:
+        # Omnigent's supported Codex floor is newer than the release that added
+        # this flag. Otherwise a transient ``codex --version`` failure strands
+        # the queued web message behind the terminal-only review screen.
+        bypass_hook_trust=(
+            app_server.codex_cli_version is None
+            or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+        ),
+    )
+    # Apply the per-harness startup command/args override from config
+    # (``harness.codex-native.{command,args}``) so a downstream integration
+    # can wrap this launch — e.g. Databricks' ``isaac`` sets ``command:
+    # isaac`` + ``args: ["codex", "--"]`` to run ``isaac codex -- <remote
+    # args>``. Identity by default; the runner is the single args merge
+    # point (the CLI persists raw pass-through, see cli_native).
+    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
+    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+        resolve_harness_args,
+        resolve_harness_config,
+    )
+
+    _codex_harness_cfg = load_effective_config()
+    # Config-only command resolve: the managed host provisions
+    # ``app_server.codex_path`` (the vetted binary), so a stray
+    # ``OMNIGENT_CODEX_PATH`` in the runner env must not silently replace it.
+    # A config ``command`` (isaac's wrapper) still applies; env path
+    # overrides are deliberately not consulted on this managed-host path.
+    _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
+    _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
+    codex_command = (
+        _codex_cmd_override.strip()
+        if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
+        else app_server.codex_path
+    )
+    codex_launch_args = resolve_harness_args(
+        "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
+    )
+    terminal_view = await resource_registry.launch_auxiliary_terminal(
+        session_id=session_id,
+        terminal_name="codex",
+        session_key="main",
+        resource_role=CODEX_NATIVE_TERMINAL_ROLE,
+        parent_os_env=agent_os_env,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+            ),
+            command=codex_command,
+            args=codex_launch_args,
+            env=codex_terminal_env(app_server),
+            # Match the local ``omnigent codex`` terminal scrollback.
+            scrollback=100_000,
+            # Enable tmux passthrough so the Codex TUI's escape sequences
+            # reach the web xterm.
+            tmux_allow_passthrough=True,
+            # Start the TUI at creation rather than on first attach,
+            # mirroring claude-native. Deferring to attach (the local CLI
+            # default) means the full-screen TUI cold-starts the instant
+            # the web UI attaches over the runner tunnel; that initial
+            # render burst starves the tunnel ping/pong and the host
+            # recycles the unresponsive runner (the "runner
+            # death on terminal attach" class). Starting now lets the TUI settle
+            # in the detached tmux pane (no tunnel traffic) and create its
+            # thread before anyone attaches.
+            tmux_start_on_attach=False,
+        ),
+    )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    return terminal_view
+
+
+# Launch fingerprint of each session's live runner-owned app-server, keyed by
+# session id and paired with the app-server it describes. A TUI-only relaunch
+# reuses that app-server only while the session's persisted launch settings
+# still match it, so an agent/model/permission change still gets a fresh
+# app-server.
+_AUTO_CODEX_LAUNCH_FINGERPRINTS: dict[str, tuple[CodexNativeAppServer, tuple[object, ...]]] = {}
+
+
+def _forget_codex_launch_fingerprint(
+    session_id: str, app_server: CodexNativeAppServer | None
+) -> None:
+    """
+    Drop the recorded launch fingerprint for *app_server* once it is torn down.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param app_server: The app-server just removed from
+        ``_AUTO_CODEX_APP_SERVERS``; a fingerprint recorded for a different
+        (newer) app-server is left alone.
+    """
+    recorded = _AUTO_CODEX_LAUNCH_FINGERPRINTS.get(session_id)
+    if recorded is not None and (app_server is None or recorded[0] is app_server):
+        del _AUTO_CODEX_LAUNCH_FINGERPRINTS[session_id]
+
+
+def _codex_launch_fingerprint(launch_config: _CodexNativeLaunchConfig) -> tuple[object, ...]:
+    """
+    Return the launch settings a live app-server was started with.
+
+    Excludes the thread id (checked against the bridge state instead) and the
+    one-shot ``turn_routing`` / fork fields, which legitimately change after
+    the first launch without requiring a new app-server.
+
+    :param launch_config: Persisted codex-native launch config.
+    :returns: Hashable fingerprint tuple.
+    """
+    return (
+        str(launch_config.workspace),
+        tuple(launch_config.terminal_launch_args or ()),
+        launch_config.model_override,
+        launch_config.bypass_sandbox,
+        launch_config.auto_harness,
+        launch_config.routing_enabled,
+    )
+
+
+def _live_codex_app_server_for_relaunch(
+    session_id: str,
+    launch_config: _CodexNativeLaunchConfig,
+    bridge_dir: Path,
+) -> tuple[CodexNativeAppServer, str, str] | None:
+    """
+    Return the session's live app-server when only its TUI pane needs relaunching.
+
+    The Codex TUI is an auxiliary ``--remote`` client: when its pane dies the
+    app-server deliberately keeps running (it may be mid-turn) and keeps
+    holding the thread's cross-process writer lock
+    (``$CODEX_HOME/thread-writer-locks/<thread>.lock``). Booting a second
+    app-server for the same thread then fails ``thread/resume`` with
+    "already has an active writer" — and tearing the live one down to make
+    room SIGTERMs it into a graceful drain that holds the lock until its
+    in-flight turn ends. So when the live app-server, its forwarder and its
+    bridge state are all intact and still match the persisted launch
+    settings, the ensure path re-attaches a fresh TUI to it instead.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param launch_config: Freshly read persisted launch config.
+    :param bridge_dir: The session's codex-native bridge dir.
+    :returns: ``(app_server, ws_url, thread_id)`` when reusable, else ``None``.
+    """
+    from omnigent.codex_native_bridge import read_bridge_state
+
+    app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    if app_server is None:
+        return None
+    proc = app_server.proc
+    if proc is None or proc.returncode is not None:
+        return None
+    forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
+    if forwarder is None or forwarder.done():
+        return None
+    recorded = _AUTO_CODEX_LAUNCH_FINGERPRINTS.get(session_id)
+    if recorded is None or recorded[0] is not app_server:
+        return None
+    if recorded[1] != _codex_launch_fingerprint(launch_config):
+        return None
+    ws_url = app_server.listen_url
+    if not ws_url:
+        return None
+    state = read_bridge_state(bridge_dir)
+    if state is None or not state.thread_id or state.socket_path != ws_url:
+        return None
+    if (
+        launch_config.external_session_id is not None
+        and launch_config.external_session_id != state.thread_id
+    ):
+        return None
+    return app_server, ws_url, state.thread_id
+
+
+async def _relaunch_codex_tui_on_live_app_server(
+    *,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    launch_config: _CodexNativeLaunchConfig,
+    bridge_dir: Path,
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> SessionResourceView | None:
+    """
+    Re-attach a new Codex TUI pane to the session's still-live app-server.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param resource_registry: Session resource registry that owns the pane.
+    :param publish_event: Per-session SSE emitter.
+    :param launch_config: Freshly read persisted launch config.
+    :param bridge_dir: The session's codex-native bridge dir.
+    :param agent_spec: Optional resolved agent spec (for its os_env).
+    :returns: The new terminal view, or ``None`` when no reusable live
+        app-server exists (the caller then performs a full launch).
+    """
+    live = _live_codex_app_server_for_relaunch(session_id, launch_config, bridge_dir)
+    if live is None:
+        return None
+    app_server, ws_url, thread_id = live
+    _logger.info(
+        "Codex app-server for session %s is still live; relaunching only its TUI "
+        "(thread=%s) instead of replacing the app-server",
+        session_id,
+        thread_id,
+        extra={"session_id": session_id},
+    )
+    return await _launch_codex_tui_terminal(
+        session_id=session_id,
+        resource_registry=resource_registry,
+        publish_event=publish_event,
+        app_server=app_server,
+        codex_ws_url=ws_url,
+        thread_id=thread_id,
+        terminal_launch_args=launch_config.terminal_launch_args,
+        bypass_sandbox=launch_config.bypass_sandbox,
+        agent_os_env=_agent_os_env_from_spec(agent_spec),
+        workspace=str(launch_config.workspace),
+    )
+
+
 async def _auto_create_codex_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -4009,12 +4292,9 @@ async def _auto_create_codex_terminal(
     from pathlib import Path
 
     from omnigent.codex_native_app_server import (
-        _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         CodexAppServerClient,
         build_codex_native_server,
-        build_codex_remote_args,
         codex_session_meta_model_provider,
-        codex_terminal_env,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
     )
@@ -4025,7 +4305,6 @@ async def _auto_create_codex_terminal(
         socket_path_for_bridge_dir,
     )
     from omnigent.inner.codex_executor import codex_extended_catalog_env
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     launch_config = await _codex_native_launch_config(
         session_id=session_id,
@@ -4036,6 +4315,20 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
+    # A dead TUI pane over a live app-server needs only a new TUI. Replacing
+    # the app-server would SIGTERM it into a graceful drain (it may be
+    # mid-turn) that keeps the thread's writer lock, so the replacement's
+    # ``thread/resume`` fails with "already has an active writer".
+    relaunched = await _relaunch_codex_tui_on_live_app_server(
+        session_id=session_id,
+        resource_registry=resource_registry,
+        publish_event=publish_event,
+        launch_config=launch_config,
+        bridge_dir=bridge_dir,
+        agent_spec=agent_spec,
+    )
+    if relaunched is not None:
+        return relaunched
     # Route across all offerings: a configured provider (omnigent setup),
     # a Databricks ucode profile from provider config, or Codex's own
     # login — parity with the in-process codex harness and the CLI path.
@@ -4474,96 +4767,17 @@ async def _auto_create_codex_terminal(
     # below: a raise here must still close them and drop the
     # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
     try:
-        codex_remote_args = build_codex_remote_args(
-            codex_args=tuple(launch_config.terminal_launch_args or ()),
-            thread_id=launch_config.external_session_id,
-            remote_url=codex_ws_url,
-            bypass_sandbox=launch_config.bypass_sandbox,
-            # The --remote TUI loads its own config and does not inherit the
-            # app-server's -c flags; pass the same provider/model overrides so it
-            # resolves the Omnigent provider instead of falling back to the OpenAI
-            # built-in (which would force the first-run login screen and block
-            # thread creation).
-            config_overrides=tuple(app_server.config_overrides),
-            # Omnigent provisions the private CODEX_HOME and vets hook sources
-            # itself; skip the interactive trust prompt that headless sub-agents
-            # can never answer.
-            #
-            # A failed version probe must not restore the interactive gate:
-            # Omnigent's supported Codex floor is newer than the release that added
-            # this flag. Otherwise a transient ``codex --version`` failure strands
-            # the queued web message behind the terminal-only review screen.
-            bypass_hook_trust=(
-                app_server.codex_cli_version is None
-                or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
-            ),
-        )
-        # Apply the per-harness startup command/args override from config
-        # (``harness.codex-native.{command,args}``) so a downstream integration
-        # can wrap this launch — e.g. Databricks' ``isaac`` sets ``command:
-        # isaac`` + ``args: ["codex", "--"]`` to run ``isaac codex -- <remote
-        # args>``. Identity by default; the runner is the single args merge
-        # point (the CLI persists raw pass-through, see cli_native).
-        from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-        from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
-            resolve_harness_args,
-            resolve_harness_config,
-        )
-
-        _codex_harness_cfg = load_effective_config()
-        # Config-only command resolve: the managed host provisions
-        # ``app_server.codex_path`` (the vetted binary), so a stray
-        # ``OMNIGENT_CODEX_PATH`` in the runner env must not silently replace it.
-        # A config ``command`` (isaac's wrapper) still applies; env path
-        # overrides are deliberately not consulted on this managed-host path.
-        _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
-        _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
-        codex_command = (
-            _codex_cmd_override.strip()
-            if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
-            else app_server.codex_path
-        )
-        codex_launch_args = resolve_harness_args(
-            "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
-        )
-        terminal_view = await resource_registry.launch_auxiliary_terminal(
+        terminal_view = await _launch_codex_tui_terminal(
             session_id=session_id,
-            terminal_name="codex",
-            session_key="main",
-            resource_role=CODEX_NATIVE_TERMINAL_ROLE,
-            parent_os_env=agent_os_env,
-            spec=TerminalEnvSpec(
-                os_env=OSEnvSpec(
-                    type="caller_process",
-                    cwd=workspace,
-                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
-                ),
-                command=codex_command,
-                args=codex_launch_args,
-                env=codex_terminal_env(app_server),
-                # Match the local ``omnigent codex`` terminal scrollback.
-                scrollback=100_000,
-                # Enable tmux passthrough so the Codex TUI's escape sequences
-                # reach the web xterm.
-                tmux_allow_passthrough=True,
-                # Start the TUI at creation rather than on first attach,
-                # mirroring claude-native. Deferring to attach (the local CLI
-                # default) means the full-screen TUI cold-starts the instant
-                # the web UI attaches over the runner tunnel; that initial
-                # render burst starves the tunnel ping/pong and the host
-                # recycles the unresponsive runner (the "runner
-                # death on terminal attach" class). Starting now lets the TUI settle
-                # in the detached tmux pane (no tunnel traffic) and create its
-                # thread before anyone attaches.
-                tmux_start_on_attach=False,
-            ),
-        )
-        publish_event(
-            session_id,
-            {
-                "type": "session.resource.created",
-                "resource": session_resource_view_to_dict(terminal_view),
-            },
+            resource_registry=resource_registry,
+            publish_event=publish_event,
+            app_server=app_server,
+            codex_ws_url=codex_ws_url,
+            thread_id=launch_config.external_session_id,
+            terminal_launch_args=launch_config.terminal_launch_args,
+            bypass_sandbox=launch_config.bypass_sandbox,
+            agent_os_env=agent_os_env,
+            workspace=workspace,
         )
     except Exception:
         await event_client.close()
@@ -4600,6 +4814,10 @@ async def _auto_create_codex_terminal(
         name=f"codex-forwarder-{session_id}",
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
+    _AUTO_CODEX_LAUNCH_FINGERPRINTS[session_id] = (
+        app_server,
+        _codex_launch_fingerprint(launch_config),
+    )
 
     # A prompt a previous launch blocked for routing but never got to replay
     # exists nowhere else: the block consumed it and the marker stops the hook
@@ -4829,6 +5047,7 @@ async def _codex_discover_thread_and_forward(
         # subprocess is ours to stop, else it orphans one process per session.
         # Pop first so the dict never holds a closed reference.
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _forget_codex_launch_fingerprint(session_id, leftover_app_server)
         with contextlib.suppress(Exception):
             await event_client.close()
         if leftover_app_server is not None:
@@ -4886,6 +5105,7 @@ async def _codex_forward_known_thread(
         )
     finally:
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _forget_codex_launch_fingerprint(session_id, leftover_app_server)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
                 await leftover_app_server.close()
