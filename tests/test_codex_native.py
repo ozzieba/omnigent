@@ -1356,13 +1356,15 @@ def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> Non
                 "ws://127.0.0.1:9876",
             ],
         ),
-        # Resume path: the bypass flag is a global flag and MUST precede the
-        # ``resume`` subcommand, and a pre-existing bypass flag is de-duped.
+        # Resume path: Codex 0.156 rejects ANY permission override on a
+        # ``resume --remote`` attach ("Permission overrides are not supported
+        # when resuming a remote task") — the bypass flag included — and exits
+        # the TUI. The app-server already carries the bypass stance, so the
+        # attaching TUI drops the flag entirely.
         (
             ("--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only"),
             "thread_x",
             [
-                "--dangerously-bypass-approvals-and-sandbox",
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -1513,15 +1515,17 @@ def test_build_codex_remote_args_fresh_launch_keeps_permission_overrides() -> No
 
 
 @pytest.mark.parametrize("thread_id", [None, "thread_x"])
-def test_build_codex_remote_args_bypass_sandbox_unchanged_by_resume_strip(
+def test_build_codex_remote_args_bypass_sandbox_flag_only_on_fresh_attach(
     thread_id: str | None,
 ) -> None:
     """
-    ``bypass_sandbox=True`` keeps its single bypass flag on both paths.
+    ``bypass_sandbox=True`` emits the bypass flag on a fresh attach only.
 
-    The resume strip must not remove ``--dangerously-bypass-approvals-and-
-    sandbox`` or the provider overrides; the bypass path's own stripping of
-    ``--sandbox`` / ``--ask-for-approval`` is unchanged.
+    Codex 0.156 rejects the bypass flag on ``resume --remote`` exactly like
+    the granular approval/sandbox flags ("Permission overrides are not
+    supported when resuming a remote task") and the TUI exits at once, so the
+    resume attach must drop it; the app-server already runs the thread in the
+    bypass stance. Provider overrides survive on both paths.
     """
     args = codex_native_app_server.build_codex_remote_args(
         codex_args=("--sandbox", "danger-full-access", "--ask-for-approval", "never"),
@@ -1531,16 +1535,58 @@ def test_build_codex_remote_args_bypass_sandbox_unchanged_by_resume_strip(
         bypass_sandbox=True,
     )
 
-    tail = ["--remote", "ws://127.0.0.1:9876"]
-    if thread_id is not None:
-        tail = ["resume", *tail, thread_id]
-    assert args == [
+    provider = [
         "-c",
         'model="catalog-databricks-openai-default"',
         "-c",
         'model_provider="omnigent_databricks"',
-        "--dangerously-bypass-approvals-and-sandbox",
-        *tail,
+    ]
+    if thread_id is None:
+        assert args == [
+            *provider,
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--remote",
+            "ws://127.0.0.1:9876",
+        ]
+    else:
+        assert args == [*provider, "resume", "--remote", "ws://127.0.0.1:9876", thread_id]
+
+
+def test_build_codex_remote_args_resume_drops_app_server_permission_overrides() -> None:
+    """
+    The app-server's own permission ``-c`` overrides never reach a resume attach.
+
+    A bypass-sandbox app-server is launched with ``-c approval_policy="never"``
+    and ``-c sandbox_mode="danger-full-access"``, and the runner forwards the
+    app-server's ``config_overrides`` to the ``--remote`` TUI. On a resume
+    those are permission overrides Codex refuses, which killed every resumed
+    codex-native pane right after launch (the dead pane then made the next
+    injected turn replace a live, mid-turn app-server and fail with
+    "already has an active writer").
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=(
+            'model_provider="openai"',
+            'approval_policy="never"',
+            'sandbox_mode="danger-full-access"',
+            'model="gpt-5.5"',
+        ),
+        bypass_sandbox=True,
+        bypass_hook_trust=True,
+    )
+    assert args == [
+        "-c",
+        'model_provider="openai"',
+        "-c",
+        'model="gpt-5.5"',
+        "--dangerously-bypass-hook-trust",
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_x",
     ]
 
 

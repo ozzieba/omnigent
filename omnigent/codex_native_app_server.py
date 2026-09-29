@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import socket
 import sys
 import tempfile
@@ -84,6 +85,13 @@ _CONNECT_RETRY_DELAY_SECONDS = 0.05
 # short-lived metadata app-servers before execing the real server. Leave room
 # for that reviewed startup path under load without weakening turn deadlines.
 _CONNECT_TIMEOUT_SECONDS = 45.0
+# Seconds a SIGTERMed app-server process group may keep draining after its
+# launcher exited before close() escalates to SIGKILL.
+_PROCESS_GROUP_REAP_GRACE_SECONDS = 3.0
+# How long a resume preload waits for a previous writer of the same thread
+# (e.g. an app-server draining its last turn after SIGTERM, which Codex bounds
+# at about a minute) to release the thread's writer lock.
+_PRELOAD_ACTIVE_WRITER_WAIT_SECONDS = 90.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
@@ -1181,6 +1189,7 @@ class CodexNativeAppServer:
     trust_project: bool = False
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
+    process_group_id: int | None = None
 
     async def start(self) -> None:
         """
@@ -1340,10 +1349,11 @@ class CodexNativeAppServer:
                 self.process_owner_lock.close()
                 self.process_owner_lock = None
             raise
+        self.process_group_id = _process_group_id(self.proc)
         if self.process_owner_lock is not None:
             register_codex_native_process(
                 pid=self.proc.pid,
-                pgid=_process_group_id(self.proc),
+                pgid=self.process_group_id,
                 session_tag=self.process_registry_tag,
                 owner_lock_path=self.process_owner_lock.path,
             )
@@ -1527,6 +1537,17 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
+        # The direct child can be a launcher shim (e.g. a fleet wrapper that
+        # runs ``codex app-server`` as its own child) that exits at once on
+        # SIGTERM, while the real app-server — same process group — treats
+        # SIGTERM as a graceful drain and keeps running until its in-flight
+        # turn ends, still holding the thread's writer lock. Waiting on the
+        # direct child alone then reports "closed" for a live writer, so the
+        # next launch's ``thread/resume`` fails with "already has an active
+        # writer". Make sure the whole group is gone.
+        if self.process_group_id is not None:
+            await _reap_process_group(self.process_group_id)
+            self.process_group_id = None
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -3162,6 +3183,7 @@ async def preload_codex_thread_for_resume(
     thread_id: str,
     *,
     terminal_launch_args: Sequence[str] | None = None,
+    active_writer_wait_s: float = _PRELOAD_ACTIVE_WRITER_WAIT_SECONDS,
 ) -> None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -3177,6 +3199,8 @@ async def preload_codex_thread_for_resume(
     :param thread_id: Codex thread id to load, e.g.
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
     :param terminal_launch_args: Persisted permission overrides for the resumed thread.
+    :param active_writer_wait_s: Seconds to keep retrying while another
+        process still holds the thread's writer lock, e.g. ``90.0``.
     :returns: None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -3186,16 +3210,52 @@ async def preload_codex_thread_for_resume(
     )
     await client.connect()
     try:
-        await client.request(
-            "thread/resume",
-            {
-                "threadId": thread_id,
-                "excludeTurns": True,
-                **_codex_resume_permission_params(terminal_launch_args),
-            },
-        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + active_writer_wait_s
+        delay = 0.5
+        while True:
+            try:
+                await client.request(
+                    "thread/resume",
+                    {
+                        "threadId": thread_id,
+                        "excludeTurns": True,
+                        **_codex_resume_permission_params(terminal_launch_args),
+                    },
+                )
+                return
+            except CodexAppServerResponseError as exc:
+                # Another codex process in this CODEX_HOME still holds the
+                # thread's cross-process writer lock — typically a previous
+                # app-server that is draining its in-flight turn after SIGTERM.
+                # The lock frees when that writer exits, so wait for it instead
+                # of failing the session.
+                if not is_codex_active_writer_error(exc) or loop.time() >= deadline:
+                    raise
+                _logger.warning(
+                    "Codex thread %s still has an active writer; retrying thread/resume in %.1fs",
+                    thread_id,
+                    delay,
+                )
+                await asyncio.sleep(min(delay, max(0.0, deadline - loop.time())))
+                delay = min(delay * 2, 5.0)
     finally:
         await client.close()
+
+
+def is_codex_active_writer_error(exc: BaseException) -> bool:
+    """
+    Return whether *exc* is Codex's "thread already has an active writer" refusal.
+
+    Codex guards each thread with an exclusive cross-process file lock under
+    ``$CODEX_HOME/thread-writer-locks``; a second process that tries to load
+    the thread for writing gets JSON-RPC ``-32600`` with this message.
+
+    :param exc: Exception raised by an app-server request.
+    :returns: ``True`` for the active-writer conflict.
+    """
+    message = exc.message if isinstance(exc, CodexAppServerResponseError) else None
+    return "already has an active writer" in (message or str(exc))
 
 
 def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
@@ -3382,8 +3442,11 @@ def build_codex_remote_args(
     # overrides are not supported when resuming a remote task") and exits
     # immediately, killing the terminal pane. The app-server already owns the
     # thread's permission profile, so drop them from the attaching TUI.
-    passthrough = _strip_remote_resume_permission_overrides(passthrough)
-    return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+    # That includes the app-server's own ``-c approval_policy`` /
+    # ``-c sandbox_mode`` overrides (emitted for a bypass-sandbox session)
+    # and the bypass flag itself, which are all permission overrides too.
+    attach_args = _strip_remote_resume_permission_overrides([*override_args, *passthrough])
+    return [*attach_args, "resume", "--remote", remote_url, thread_id]
 
 
 # ``-c`` / ``--config`` keys that ``codex resume --remote`` treats as
@@ -3405,6 +3468,7 @@ def _strip_remote_resume_permission_overrides(args: list[str]) -> list[str]:
 
     Dropped:
 
+    - ``--dangerously-bypass-approvals-and-sandbox``.
     - ``--sandbox`` / ``-s`` / ``--ask-for-approval`` / ``-a`` in both the
       ``--flag value`` and ``--flag=value`` spellings. As in
       :func:`_strip_approval_sandbox_flags`, the next token is consumed as
@@ -3413,8 +3477,8 @@ def _strip_remote_resume_permission_overrides(args: list[str]) -> list[str]:
       ``--config=key=value``) whose key is in
       :data:`_REMOTE_RESUME_PERMISSION_CONFIG_KEYS`.
 
-    Everything else (model/provider ``-c`` overrides, hook-trust and
-    bypass flags, ...) passes through untouched.
+    Everything else (model/provider ``-c`` overrides, the hook-trust
+    bypass flag, ...) passes through untouched.
 
     :param args: Codex argv passthrough, e.g.
         ``["-c", 'default_permissions=":workspace"', "--sandbox", "read-only"]``.
@@ -3425,6 +3489,9 @@ def _strip_remote_resume_permission_overrides(args: list[str]) -> list[str]:
     n = len(args)
     while i < n:
         arg = args[i]
+        if arg == _CODEX_BYPASS_SANDBOX_FLAG:
+            i += 1
+            continue
         if arg in _CODEX_APPROVAL_SANDBOX_FLAGS:
             if i + 1 < n and not args[i + 1].startswith("-"):
                 i += 2
@@ -3439,7 +3506,10 @@ def _strip_remote_resume_permission_overrides(args: list[str]) -> list[str]:
                 i += 2
                 continue
         elif arg.startswith("--config="):
-            if _config_override_key(arg[len("--config=") :]) in _REMOTE_RESUME_PERMISSION_CONFIG_KEYS:
+            if (
+                _config_override_key(arg[len("--config=") :])
+                in _REMOTE_RESUME_PERMISSION_CONFIG_KEYS
+            ):
                 i += 1
                 continue
         cleaned.append(arg)
@@ -3478,6 +3548,68 @@ def _process_group_id(process: asyncio.subprocess.Process) -> int:
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             return os.getpgid(process.pid)
     return process.pid
+
+
+def _process_group_alive(pgid: int) -> bool:
+    """
+    Return whether any process in group *pgid* is still running.
+
+    :param pgid: Process group id, e.g. ``12345``.
+    :returns: ``True`` while at least one member exists.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+async def _reap_process_group(
+    pgid: int,
+    *,
+    grace_s: float = _PROCESS_GROUP_REAP_GRACE_SECONDS,
+    kill_wait_s: float = 5.0,
+) -> bool:
+    """
+    Wait for an app-server process group to exit, escalating to ``SIGKILL``.
+
+    No-op on non-POSIX hosts and for the caller's own process group (which a
+    child spawned without ``start_new_session`` would share).
+
+    :param pgid: Process group id recorded at spawn, e.g. ``12345``.
+    :param grace_s: Seconds to let a draining member exit on its own after
+        the ``SIGTERM`` it already received, e.g. ``3.0``.
+    :param kill_wait_s: Seconds to wait for the group to disappear after
+        ``SIGKILL``, e.g. ``5.0``.
+    :returns: ``True`` when the group had to be force-killed.
+    """
+    if os.name != "posix" or pgid <= 0:
+        return False
+    with contextlib.suppress(OSError):
+        if pgid == os.getpgid(0):
+            return False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + grace_s
+    while _process_group_alive(pgid):
+        if loop.time() >= deadline:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        return False
+    _logger.warning(
+        "codex app-server process group %d outlived its launcher; sending SIGKILL",
+        pgid,
+    )
+    with contextlib.suppress(OSError):
+        os.killpg(pgid, signal.SIGKILL)
+    deadline = loop.time() + kill_wait_s
+    while _process_group_alive(pgid) and loop.time() < deadline:
+        await asyncio.sleep(0.05)
+    return True
 
 
 def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
