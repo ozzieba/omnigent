@@ -231,13 +231,21 @@ class FakePolicyStore:
         self,
         *,
         fail_create: bool = False,
+        persist_then_raise: bool = False,
         silent_create: bool = False,
+        readback_error: bool = False,
         bad_readback: bool = False,
+        wrong_cap: bool = False,
+        wrong_scope: bool = False,
     ) -> None:
         self.created: list[dict[str, Any]] = []
         self.fail_create = fail_create
+        self.persist_then_raise = persist_then_raise
         self.silent_create = silent_create
+        self.readback_error = readback_error
         self.bad_readback = bad_readback
+        self.wrong_cap = wrong_cap
+        self.wrong_scope = wrong_scope
         self.get_calls: list[tuple[str, str]] = []
 
     def create(
@@ -264,10 +272,14 @@ class FakePolicyStore:
         }
         if not self.silent_create:
             self.created.append(policy)
+        if self.persist_then_raise:
+            raise RuntimeError("commit succeeded but acknowledgement failed")
         return policy
 
     def get(self, policy_id: str, session_id: str) -> Any:
         self.get_calls.append((policy_id, session_id))
+        if self.readback_error:
+            raise RuntimeError("policy readback failed")
         policy = next(
             (
                 row
@@ -281,11 +293,13 @@ class FakePolicyStore:
         return _FakePolicy(
             id=policy["policy_id"],
             session_id=policy["session_id"],
-            scope=policy["scope"],
+            scope="server" if self.wrong_scope else policy["scope"],
             name=policy["name"],
             type=policy["type"],
             handler=policy["handler"],
-            factory_params=policy["factory_params"],
+            factory_params=(
+                {"max_cost_usd": 999.0} if self.wrong_cap else policy["factory_params"]
+            ),
             enabled=False if self.bad_readback else policy["enabled"],
         )
 
@@ -1626,3 +1640,89 @@ async def test_disabled_policy_readback_fails_closed_without_dispatch() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "budget_policy_failed"
+
+
+@pytest.mark.asyncio
+async def test_policy_create_ack_error_accepts_exact_persisted_readback() -> None:
+    """A committed policy remains safe when create raises after committing."""
+    policy_store = FakePolicyStore(persist_then_raise=True)
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(policy_store.created) == 1
+    assert len(policy_store.get_calls) == 1
+    assert len(launched) == 1
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_policy_readback_error_fails_closed_without_dispatch() -> None:
+    """An unavailable policy readback leaves the run terminal and undispatched."""
+    policy_store = FakePolicyStore(readback_error=True)
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert launched == []
+    assert len(policy_store.get_calls) == 1
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "budget_policy_failed"
+    assert "readback failed" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("store_options", "expected_reason"),
+    [
+        ({"wrong_cap": True}, "readback did not match"),
+        ({"wrong_scope": True}, "readback did not match"),
+    ],
+)
+async def test_mismatched_policy_readback_fails_closed_without_dispatch(
+    store_options: dict[str, bool], expected_reason: str
+) -> None:
+    """A persisted policy with the wrong cap or scope cannot authorize dispatch."""
+    policy_store = FakePolicyStore(**store_options)
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(max_cost_usd=5.0)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, policy_store=policy_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert launched == []
+    assert len(policy_store.get_calls) == 1
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "budget_policy_failed"
+    assert expected_reason in store.runs[0]["error"]
