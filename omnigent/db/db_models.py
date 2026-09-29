@@ -1623,6 +1623,9 @@ class SqlScheduledTaskRun(OmnigentBase):
     status: Mapped[int] = mapped_column(SmallInteger)
     scheduled_at: Mapped[int] = mapped_column(Integer)
     fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Set only after accepted model output is observed. Bootstrap status edges
+    # alone do not prove the scheduled turn ran.
+    started_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Opaque free-text error blob, never SQL-queried — stored compressed.
     error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)

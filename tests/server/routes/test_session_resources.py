@@ -4221,6 +4221,54 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
 
 
 @pytest.mark.asyncio
+async def test_native_assistant_transcript_marks_scheduled_work_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native bridge records assistant output but never counts user input."""
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    started: list[str] = []
+    monkeypatch.setattr(session_live_state, "persist_scheduled_run_started", started.append)
+    store = _ConversationStore()
+    session_id = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+
+    user_input = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "please do the work"}],
+            },
+        },
+    )
+    await _persist_external_conversation_item(session_id, conv, user_input, store)  # type: ignore[arg-type]
+    assert started == []
+
+    assistant_output = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "assistant",
+                "agent": "native-agent",
+                "content": [{"type": "output_text", "text": "done"}],
+            },
+        },
+    )
+    await _persist_external_conversation_item(
+        session_id,
+        conv,
+        assistant_output,
+        store,  # type: ignore[arg-type]
+    )
+    assert started == [session_id]
+
+
+@pytest.mark.asyncio
 async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() -> None:
     """A failed Kiro prompt must not make the next prompt clear the wrong pending input."""
     from omnigent.runtime import pending_inputs
@@ -4608,9 +4656,18 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_type", ["response.completed", "response.failed"])
+@pytest.mark.parametrize(
+    ("terminal_type", "response_id", "expected_started"),
+    [
+        ("response.completed", "resp_model", True),
+        ("response.failed", "resp_failed", False),
+        ("response.completed", "deny_synthetic", False),
+    ],
+)
 async def test_relay_persists_harness_reported_model(
     terminal_type: str,
+    response_id: str,
+    expected_started: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """SDK terminal usage records the concrete model on the session snapshot."""
@@ -4618,6 +4675,11 @@ async def test_relay_persists_harness_reported_model(
 
     session_id = "79b22ebd2309e48fdeb450c65611d51b"
     published: list[dict[str, Any]] = []
+    started: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.session_live_state.persist_scheduled_run_started",
+        started.append,
+    )
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda _session_id, event: published.append(event),
@@ -4629,7 +4691,7 @@ async def test_relay_persists_harness_reported_model(
                 {
                     "type": terminal_type,
                     "response": {
-                        "id": "resp_model",
+                        "id": response_id,
                         "model": "repro_agent",
                         "usage": {
                             "input_tokens": 0,
@@ -4655,6 +4717,7 @@ async def test_relay_persists_harness_reported_model(
             "model": "claude-opus-4-8",
         }
     ]
+    assert started == ([session_id] if expected_started else [])
 
 
 @pytest.mark.asyncio

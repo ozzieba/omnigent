@@ -1188,6 +1188,29 @@ def test_get_running_run_by_conversation_returns_running_run(
     assert found.status == "running"
 
 
+def test_mark_run_started_by_conversation_is_idempotent(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Only the first accepted-output timestamp is retained."""
+    run_id = _seed_running_run(store, "started")
+    first = store.mark_run_started_by_conversation(_uid("conv_started"), 301)
+    second = store.mark_run_started_by_conversation(_uid("conv_started"), 999)
+    assert first is not None and first.id == run_id and first.started_at == 301
+    assert second is not None and second.started_at == 301
+
+
+def test_mark_run_started_by_conversation_is_workspace_scoped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A marker from another workspace cannot touch this run."""
+    with workspace_scope(11):
+        run_id = _seed_running_run(store, "started_ws")
+    assert store.mark_run_started_by_conversation(_uid("conv_started_ws"), 301) is None
+    with workspace_scope(11):
+        found = store.mark_run_started_by_conversation(_uid("conv_started_ws"), 302)
+    assert found is not None and found.id == run_id and found.started_at == 302
+
+
 def test_get_running_run_by_conversation_none_when_terminal(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:

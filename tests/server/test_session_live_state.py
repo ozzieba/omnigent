@@ -252,8 +252,8 @@ def test_unencodable_status_is_dropped_before_enqueue(
 class _FakeScheduledTaskStore:
     """Scheduled-task-store stand-in recording the hook's lookup + update."""
 
-    def __init__(self, running_by_conv: dict[str, str] | None = None) -> None:
-        # conversation_id -> run_id for conversations that have a running run.
+    def __init__(self, running_by_conv: dict[str, tuple[str, int | None]] | None = None) -> None:
+        # conversation_id -> (run_id, actual accepted-work timestamp).
         self._running_by_conv = running_by_conv or {}
         self.lookup_calls: list[str] = []
         self.update_calls: list[tuple[str, str, str | None, str | None]] = []
@@ -264,11 +264,11 @@ class _FakeScheduledTaskStore:
 
         self.lookup_calls.append(conversation_id)
         self.lookup_workspaces.append(current_workspace_id())
-        run_id = self._running_by_conv.get(conversation_id)
-        if run_id is None:
+        value = self._running_by_conv.get(conversation_id)
+        if value is None:
             return None
-        # Minimal object carrying only the ``id`` the hook reads.
-        return type("_Run", (), {"id": run_id})()
+        run_id, started_at = value
+        return type("_Run", (), {"id": run_id, "started_at": started_at})()
 
     def update_run(
         self,
@@ -284,8 +284,8 @@ class _FakeScheduledTaskStore:
 
 
 def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
-    """A terminal ``idle`` edge flips the conversation's running run to succeeded."""
-    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    """Idle succeeds only after a real accepted-work marker was persisted."""
+    sched = _FakeScheduledTaskStore({"conv_1": ("run_1", 100)})
     session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
     try:
         session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
@@ -299,9 +299,34 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
     assert error is None and error_code is None
 
 
+def test_scheduled_run_bootstrap_idle_does_not_succeed_unstarted_run() -> None:
+    """Prompt seeding can leave a session idle before a model accepts work."""
+    sched = _FakeScheduledTaskStore({"conv_1": ("run_1", None)})
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        _wait_until(lambda: bool(sched.lookup_calls))
+    finally:
+        session_live_state.configure(None)
+    assert sched.update_calls == []
+
+
+def test_scheduled_run_generic_running_edge_then_idle_stays_unstarted() -> None:
+    """Generic startup status is not evidence an upstream model request ran."""
+    sched = _FakeScheduledTaskStore({"conv_1": ("run_1", None)})
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    try:
+        # A generic status="running" is not wired to this accepted-work hook.
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        _wait_until(lambda: bool(sched.lookup_calls))
+    finally:
+        session_live_state.configure(None)
+    assert sched.update_calls == []
+
+
 def test_scheduled_run_completion_failed_carries_error_code() -> None:
     """A terminal ``failed`` edge flips the run to failed with the error detail."""
-    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    sched = _FakeScheduledTaskStore({"conv_1": ("run_1", None)})
     session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
     try:
         session_live_state.persist_scheduled_run_completion(
@@ -311,6 +336,25 @@ def test_scheduled_run_completion_failed_carries_error_code() -> None:
     finally:
         session_live_state.configure(None)
     assert sched.update_calls == [("run_1", "failed", "dropped", "runner_disconnected")]
+
+
+def test_scheduled_run_cancellation_fails_even_without_accepted_output() -> None:
+    """An explicit user interruption is terminal even before model output."""
+    sched = _FakeScheduledTaskStore({"conv_1": ("run_1", None)})
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_scheduled_run_completion(
+            "conv_1",
+            "failed",
+            error_code="cancelled",
+            error="scheduled turn was interrupted",
+        )
+        _wait_until(lambda: bool(sched.update_calls))
+    finally:
+        session_live_state.configure(None)
+    assert sched.update_calls == [
+        ("run_1", "failed", "scheduled turn was interrupted", "cancelled")
+    ]
 
 
 def test_scheduled_run_completion_noop_for_non_scheduled_conversation() -> None:
@@ -355,7 +399,7 @@ def test_scheduled_run_completion_runs_in_callers_workspace_scope() -> None:
     """
     from omnigent.db.db_models import workspace_scope
 
-    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    sched = _FakeScheduledTaskStore({"conv_1": ("run_1", 100)})
     session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
     try:
         with workspace_scope(4242):

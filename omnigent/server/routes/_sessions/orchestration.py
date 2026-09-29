@@ -2299,6 +2299,12 @@ async def _persist_external_conversation_item(
     if pending_background_title is not None:
         pending_background_title.schedule()
     persisted = persisted_items[0]
+    if item.type in {"function_call", "reasoning"} or (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "assistant"
+    ):
+        session_live_state.persist_scheduled_run_started(session_id)
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -6438,6 +6444,21 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                             )
                     if evt_type == "response.completed":
+                        # A completed model response proves the scheduled turn
+                        # started; a runner's startup/running status does not.
+                        # The INPUT-phase policy short-circuit also publishes a
+                        # synthetic completed response (`deny_<random>`), which
+                        # never reached the model and must not count as work.
+                        _completed_response = event.get("response")
+                        _completed_id = (
+                            _completed_response.get("id")
+                            if isinstance(_completed_response, dict)
+                            else None
+                        )
+                        if not (
+                            isinstance(_completed_id, str) and _completed_id.startswith("deny_")
+                        ):
+                            session_live_state.persist_scheduled_run_started(session_id)
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the

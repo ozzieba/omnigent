@@ -194,6 +194,7 @@ class ScheduledTaskStore(ABC):
         *,
         conversation_id: str | None = None,
         fired_at: int | None = None,
+        started_at: int | None = None,
         finished_at: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
@@ -208,6 +209,8 @@ class ScheduledTaskStore(ABC):
         :param scheduled_at: Unix epoch seconds the firing was scheduled for.
         :param conversation_id: Optional conversation created by this firing.
         :param fired_at: Optional Unix epoch seconds dispatch began.
+        :param started_at: Optional Unix epoch seconds accepted model output
+            was observed.
         :param finished_at: Optional Unix epoch seconds of terminal state.
         :param error: Optional failure detail.
         :param error_code: Optional short failure classification for future
@@ -293,6 +296,17 @@ class ScheduledTaskStore(ABC):
         :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
             ``None`` if the conversation has no run, or its run is already
             terminal.
+        """
+        ...
+
+    @abstractmethod
+    def mark_run_started_by_conversation(
+        self, conversation_id: str, started_at: int
+    ) -> ScheduledTaskRun | None:
+        """Persist the first accepted-output marker for a running run.
+
+        Idempotent and workspace-scoped. ``started_at`` remains unchanged once
+        the first edge is stored.
         """
         ...
 

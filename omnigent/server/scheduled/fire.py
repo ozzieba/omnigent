@@ -453,6 +453,9 @@ async def _run_fire_for_task(
             )
             return
 
+        # Persist the run before dispatch: runner lifecycle events can arrive as
+        # soon as the dispatch callback returns (or while it is still running).
+        run_id = await _record_run(deps, task, conv.id, scheduled_at, status="running")
         try:
             await dispatch(conv, effective)
         except Exception:
@@ -463,18 +466,15 @@ async def _run_fire_for_task(
                 task.id,
                 conv.id,
             )
-            await _record_run(
+            await _finish_run(
                 deps,
-                task,
-                conv.id,
-                scheduled_at,
+                run_id,
                 status="failed",
                 error="runner launch/dispatch failed",
                 error_code="launch_failed",
             )
             return
 
-        await _record_run(deps, task, conv.id, scheduled_at, status="running")
         _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
     except Exception:
         _logger.exception("scheduled fire: task %s failed", task.id)
@@ -808,9 +808,9 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
-) -> None:
+) -> str:
     """Stamp last_run_* on the task and write a scheduled_task_runs row."""
-    await asyncio.to_thread(
+    return await asyncio.to_thread(
         _record_run_sync,
         deps,
         task,
@@ -831,20 +831,41 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
-) -> None:
+) -> str:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = int(time.time())
     update_fields: dict[str, Any] = {"last_run_at": now}
     if conversation_id is not None:
         update_fields["last_run_conversation_id"] = conversation_id
     deps.scheduled_task_store.update(task.id, **update_fields)
+    run_id = _new_id()
     deps.scheduled_task_store.create_run(
-        _new_id(),
+        run_id,
         task.id,
         status,
         scheduled_at,
         conversation_id=conversation_id,
         fired_at=now,
+        error=error,
+        error_code=error_code,
+    )
+    return run_id
+
+
+async def _finish_run(
+    deps: FireDeps,
+    run_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    """Finish a run row already created before runner dispatch."""
+    await asyncio.to_thread(
+        deps.scheduled_task_store.update_run,
+        run_id,
+        status=status,
+        finished_at=int(time.time()),
         error=error,
         error_code=error_code,
     )

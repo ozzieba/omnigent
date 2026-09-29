@@ -80,6 +80,7 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
         scheduled_at=row.scheduled_at,
         conversation_id=row.conversation_id,
         fired_at=row.fired_at,
+        started_at=row.started_at,
         finished_at=row.finished_at,
         error=row.error,
         error_code=row.error_code,
@@ -357,6 +358,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         *,
         conversation_id: str | None = None,
         fired_at: int | None = None,
+        started_at: int | None = None,
         finished_at: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
@@ -369,6 +371,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             scheduled_at=scheduled_at,
             conversation_id=conversation_id,
             fired_at=fired_at,
+            started_at=started_at,
             finished_at=finished_at,
             error=error,
             error_code=error_code,
@@ -475,6 +478,26 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             row = session.execute(stmt).scalars().first()
             return _run_to_entity(row) if row is not None else None
+
+    def mark_run_started_by_conversation(
+        self, conversation_id: str, started_at: int
+    ) -> ScheduledTaskRun | None:
+        """Set the start marker once for a still-running conversation run."""
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session("mark_task_run_started") as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .where(SqlScheduledTaskRun.status == running_code)
+            )
+            row = session.execute(stmt).scalars().first()
+            if row is None:
+                return None
+            if row.started_at is None:
+                row.started_at = started_at
+                session.flush()
+            return _run_to_entity(row)
 
     def list_running_runs_for_tasks(
         self,

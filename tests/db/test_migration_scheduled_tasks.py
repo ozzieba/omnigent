@@ -86,6 +86,7 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         "status",
         "scheduled_at",
         "fired_at",
+        "started_at",
         "finished_at",
         "error",
         "error_code",

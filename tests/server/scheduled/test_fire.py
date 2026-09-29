@@ -127,6 +127,12 @@ class FakeScheduledTaskStore:
         )
         return None
 
+    def update_run(self, run_id: str, **kwargs: Any) -> None:
+        for run in self.runs:
+            if run["run_id"] == run_id:
+                run.update(kwargs)
+                return
+
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
     """Returns scripted rows for consecutive get() calls."""
@@ -831,6 +837,10 @@ async def test_launch_failure_is_swallowed() -> None:
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
 
     async def _boom(conv: Any, task: Any) -> None:
+        # A lifecycle edge may race dispatch return, so the row must pre-exist.
+        assert len(store.runs) == 1
+        assert store.runs[0]["status"] == "running"
+        assert store.runs[0]["conversation_id"] == conv.id
         raise RuntimeError("launch exploded")
 
     on_fire = build_on_fire(_deps(store), launch_dispatch=_boom)
@@ -839,6 +849,7 @@ async def test_launch_failure_is_swallowed() -> None:
     await _drain()
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "launch_failed"
+    assert len(store.runs) == 1
 
 
 @pytest.mark.asyncio
