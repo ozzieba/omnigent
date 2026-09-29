@@ -2440,6 +2440,14 @@ async def _heal_subagent_runner_binding_via_parent(
         ancestor = await asyncio.to_thread(conversation_store.get_conversation, ancestor_id)
         if ancestor is None or ancestor.runner_id is None:
             continue
+        child_host_id = getattr(child_conv, "host_id", None)
+        if child_host_id is not None and getattr(ancestor, "host_id", None) != child_host_id:
+            # A child bound to its own host runs on a runner that host
+            # launches (the host-bound grace/relaunch path handles a runner
+            # that is still booting or gone). Moving it onto an ancestor's
+            # runner on another host would run it in the wrong process and
+            # workspace, without that host's harness environment.
+            continue
         ancestor_runner_id = ancestor.runner_id
         # Wait briefly for the ancestor's tunnel — covers the reconnect gap
         # right after a relaunch.  When no registry is wired (in-process /
