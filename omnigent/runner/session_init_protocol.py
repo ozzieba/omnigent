@@ -26,6 +26,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     model_override: str | None = None
     harness_override: str | None = None
     cost_control_mode_override: str | None = None
+    environment_profile: str | None = None
     terminal_launch_args: list[str] | None = None
     external_session_id: str | None = None
     parent_session_id: str | None = None
@@ -76,6 +77,7 @@ def build_runner_session_init_payload(
             model_override=conversation.model_override,
             harness_override=conversation.harness_override,
             cost_control_mode_override=conversation.cost_control_mode_override,
+            environment_profile=conversation.environment_profile,
             terminal_launch_args=conversation.terminal_launch_args,
             external_session_id=conversation.external_session_id,
             parent_session_id=conversation.parent_conversation_id,
