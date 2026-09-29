@@ -1012,6 +1012,45 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
         )
 
 
+def replace_active_turn_id_if_matches(
+    bridge_dir: Path, stale_turn_id: str | None, current_turn_id: str
+) -> bool:
+    """
+    Resynchronize a stale active turn id to Codex's current one.
+
+    Codex goal mode starts turns by itself; when the forwarder misses such a
+    ``turn/started`` the bridge keeps the old id and ``turn/steer`` /
+    ``turn/interrupt`` are rejected with "expected active turn id A but
+    found B". Callers adopt B from that authoritative error. Compare-and-set
+    so a concurrent, newer write (e.g. the forwarder recording turn C) wins.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param stale_turn_id: Turn id the caller used, e.g. ``"turn_old"``.
+    :param current_turn_id: Codex's actual active turn id, e.g. ``"turn_new"``.
+    :returns: ``True`` when the bridge now records *current_turn_id*.
+    """
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return False
+        if state.active_turn_id == current_turn_id:
+            return True
+        if state.active_turn_id not in {stale_turn_id, None}:
+            return False
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id=state.session_id,
+                socket_path=state.socket_path,
+                thread_id=state.thread_id,
+                codex_home=state.codex_home,
+                active_turn_id=current_turn_id,
+                cwd=state.cwd,
+            ),
+        )
+        return True
+
+
 def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | None) -> bool:
     """
     Clear the active Codex turn id if a terminal event matches it.

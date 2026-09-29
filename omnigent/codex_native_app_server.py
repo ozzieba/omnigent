@@ -37,7 +37,9 @@ from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CodexLaunchRole,
+    clear_active_turn_id_if_matches,
     codex_launch_env,
+    replace_active_turn_id_if_matches,
     write_policy_hook_config,
 )
 from omnigent.codex_native_process_registry import (
@@ -508,6 +510,95 @@ class CodexAppServerResponseError(RuntimeError):
             self.code = code if isinstance(code, int) else None
             self.message = message if isinstance(message, str) else None
         super().__init__(str(error))
+
+
+# ``turn/steer`` / ``turn/interrupt`` rejection when the caller's turn id is
+# stale. Steer quotes the ids in backticks, interrupt does not.
+_ACTIVE_TURN_MISMATCH_RE = re.compile(
+    r"expected active turn id `?(?P<expected>[^`\s]+)`? but found `?(?P<actual>[^`\s]+)`?"
+)
+_NO_ACTIVE_TURN_MESSAGES = frozenset({"no active turn to steer", "no active turn to interrupt"})
+# Bound on stale-id resyncs per operation (each retry targets the id Codex
+# just reported, so more than one only happens if turns rotate mid-call).
+CODEX_ACTIVE_TURN_RESYNC_ATTEMPTS = 4
+
+
+def codex_active_turn_mismatch(error: BaseException) -> str | None:
+    """
+    Return Codex's actual active turn id from a stale-turn rejection.
+
+    :param error: Exception from a ``turn/steer`` or ``turn/interrupt``
+        request, e.g. ``CodexAppServerResponseError({"code": -32600,
+        "message": "expected active turn id `A` but found `B`"})``.
+    :returns: The actual active turn id (``"B"``), or ``None`` when the
+        error is not a turn-id mismatch.
+    """
+    message = getattr(error, "message", None)
+    if not isinstance(message, str):
+        message = str(error)
+    match = _ACTIVE_TURN_MISMATCH_RE.search(message)
+    return match.group("actual") if match else None
+
+
+def is_codex_no_active_turn_error(error: BaseException) -> bool:
+    """
+    Return whether Codex rejected a steer/interrupt because no turn is running.
+
+    :param error: Exception from ``turn/steer`` or ``turn/interrupt``.
+    :returns: ``True`` for "no active turn to steer/interrupt".
+    """
+    message = getattr(error, "message", None)
+    return isinstance(message, str) and message.strip().casefold() in _NO_ACTIVE_TURN_MESSAGES
+
+
+async def interrupt_codex_active_turn(
+    client: CodexAppServerClient,
+    *,
+    bridge_dir: Path | None,
+    thread_id: str,
+    turn_id: str,
+) -> str | None:
+    """
+    Interrupt the thread's CURRENT active turn, resyncing a stale turn id.
+
+    Goal-mode Codex starts turns by itself, so the recorded *turn_id* can be
+    stale. A mismatch rejection names the actual active turn; that turn is
+    interrupted instead (Stop means stop what is running) and adopted into
+    bridge state. "No active turn" means there is nothing left to stop.
+
+    :param client: Connected Codex app-server client.
+    :param bridge_dir: Bridge directory to resync, or ``None`` to skip.
+    :param thread_id: Codex thread id.
+    :param turn_id: Recorded active turn id.
+    :returns: The turn id that was interrupted, or ``None`` when no turn
+        was running.
+    :raises CodexAppServerResponseError: For any other rejection, or if
+        the active turn keeps changing.
+    """
+    for _ in range(CODEX_ACTIVE_TURN_RESYNC_ATTEMPTS):
+        try:
+            await client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+            return turn_id
+        except CodexAppServerResponseError as error:
+            actual = codex_active_turn_mismatch(error)
+            if actual is not None and actual != turn_id:
+                _logger.info(
+                    "Codex interrupt targeted stale turn %s; interrupting active turn %s",
+                    turn_id,
+                    actual,
+                )
+                if bridge_dir is not None:
+                    replace_active_turn_id_if_matches(bridge_dir, turn_id, actual)
+                turn_id = actual
+                continue
+            if is_codex_no_active_turn_error(error):
+                if bridge_dir is not None:
+                    clear_active_turn_id_if_matches(bridge_dir, turn_id)
+                return None
+            raise
+    raise CodexAppServerResponseError(
+        {"code": -32600, "message": "Codex active turn kept changing during interrupt"}
+    )
 
 
 class CodexAppServerConnectionClosed(ConnectionError):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import dataclasses
 import json
 import logging
 import os
@@ -13,9 +14,12 @@ from pathlib import Path
 from typing import cast
 
 from omnigent.codex_native_app_server import (
+    CODEX_ACTIVE_TURN_RESYNC_ATTEMPTS,
     CodexAppServerClient,
     CodexAppServerResponseError,
     client_for_transport,
+    codex_active_turn_mismatch,
+    interrupt_codex_active_turn,
 )
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
@@ -27,6 +31,7 @@ from omnigent.codex_native_bridge import (
     read_bridge_startup_error,
     read_bridge_state,
     read_mcp_startup,
+    replace_active_turn_id_if_matches,
     update_active_turn_id,
     write_codex_config_model,
 )
@@ -144,56 +149,79 @@ async def _inject_codex_turn(
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
 ) -> None:
-    """Steer an active turn or start one, recovering one proven stale steer."""
-    if state.active_turn_id is None:
-        await _start_codex_turn(
-            client,
-            bridge_dir=bridge_dir,
-            state=state,
-            input_items=input_items,
-            settings_overrides=settings_overrides,
-        )
-        return
+    """
+    Steer the thread's current active turn, or start one when idle.
 
-    expected_turn_id = state.active_turn_id
-    try:
-        await _steer_codex_turn(
-            client,
-            bridge_dir=bridge_dir,
-            state=state,
-            input_items=input_items,
-        )
-        return
-    except CodexAppServerResponseError as error:
-        if not _is_no_active_turn_to_steer(error):
-            raise
+    The recorded active turn id can be stale: Codex goal mode starts
+    auto-continuation turns by itself. Two authoritative rejections are
+    recovered instead of failing the session:
 
-    # Codex authoritatively says A ended. Clear A only if it is still the
-    # bridge's value; a concurrent turn/started(B) must survive this recovery.
-    clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
-    recovered_state = read_bridge_state(bridge_dir)
-    if recovered_state is None or recovered_state.session_id != state.session_id:
-        raise RuntimeError("Codex native bridge changed while recovering a stale turn")
-    if recovered_state.active_turn_id is not None:
-        _logger.info(
-            "Codex native stale steer raced with a newer turn; steering turn_id=%s",
-            recovered_state.active_turn_id,
-        )
-        await _steer_codex_turn(
-            client,
-            bridge_dir=bridge_dir,
-            state=recovered_state,
-            input_items=input_items,
-        )
-        return
-    _logger.info("Codex native reconciled completed stale turn: turn_id=%s", expected_turn_id)
-    await _start_codex_turn(
-        client,
-        bridge_dir=bridge_dir,
-        state=recovered_state,
-        input_items=input_items,
-        settings_overrides=settings_overrides,
-    )
+    - "expected active turn id A but found B": adopt B (compare-and-set in
+      bridge state) and steer B.
+    - "no active turn to steer": clear A, then steer whatever newer turn a
+      concurrent ``turn/started`` recorded, or start a fresh turn.
+
+    :param client: Connected Codex app-server client.
+    :param bridge_dir: Native Codex bridge directory.
+    :param state: Bridge state read under the injection lock.
+    :param input_items: Codex ``UserInput`` items to deliver.
+    :param settings_overrides: Settings applied before a ``turn/start``.
+    :returns: None.
+    :raises RuntimeError: If the bridge changed sessions mid-recovery or the
+        active turn kept changing.
+    :raises CodexAppServerResponseError: For any other Codex rejection.
+    """
+    current = state
+    for _ in range(CODEX_ACTIVE_TURN_RESYNC_ATTEMPTS):
+        if current.active_turn_id is None:
+            await _start_codex_turn(
+                client,
+                bridge_dir=bridge_dir,
+                state=current,
+                input_items=input_items,
+                settings_overrides=settings_overrides,
+            )
+            return
+        expected_turn_id = current.active_turn_id
+        try:
+            await _steer_codex_turn(
+                client,
+                bridge_dir=bridge_dir,
+                state=current,
+                input_items=input_items,
+            )
+            return
+        except CodexAppServerResponseError as error:
+            actual_turn_id = codex_active_turn_mismatch(error)
+            if actual_turn_id is not None and actual_turn_id != expected_turn_id:
+                _logger.info(
+                    "Codex native steer targeted stale turn %s; steering active turn %s",
+                    expected_turn_id,
+                    actual_turn_id,
+                )
+                replace_active_turn_id_if_matches(bridge_dir, expected_turn_id, actual_turn_id)
+                current = dataclasses.replace(current, active_turn_id=actual_turn_id)
+                continue
+            if not _is_no_active_turn_to_steer(error):
+                raise
+
+        # Codex authoritatively says A ended. Clear A only if it is still the
+        # bridge's value; a concurrent turn/started(B) must survive this recovery.
+        clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
+        recovered_state = read_bridge_state(bridge_dir)
+        if recovered_state is None or recovered_state.session_id != state.session_id:
+            raise RuntimeError("Codex native bridge changed while recovering a stale turn")
+        if recovered_state.active_turn_id is not None:
+            _logger.info(
+                "Codex native stale steer raced with a newer turn; steering turn_id=%s",
+                recovered_state.active_turn_id,
+            )
+        else:
+            _logger.info(
+                "Codex native reconciled completed stale turn: turn_id=%s", expected_turn_id
+            )
+        current = recovered_state
+    raise RuntimeError("Codex native active turn kept changing while injecting a message")
 
 
 class CodexNativeExecutor(Executor):
@@ -317,12 +345,13 @@ class CodexNativeExecutor(Executor):
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
-                await client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
+                # Interrupts Codex's CURRENT turn even when the recorded id
+                # is stale (goal mode auto-starts turns).
+                await interrupt_codex_active_turn(
+                    client,
+                    bridge_dir=self._bridge_dir,
+                    thread_id=state.thread_id,
+                    turn_id=state.active_turn_id,
                 )
         finally:
             await client.close()
