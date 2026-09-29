@@ -63,6 +63,29 @@ _logger = logging.getLogger(__name__)
 
 _AGENT_NAME = "codex-native-ui"
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
+# Reconnect policy for a dropped app-server connection. The forwarder must
+# outlive a dropped websocket (the TUI keeps working on the same app-server):
+# it reconnects, re-subscribes, and backfills the missed items. Connect
+# failures are bounded — a refused connect means the app-server itself is
+# gone, and returning lets the runner tear the session's terminal down.
+_RECONNECT_INITIAL_DELAY_SECONDS = 0.5
+_RECONNECT_MAX_DELAY_SECONDS = 30.0
+_RECONNECT_MAX_CONNECT_FAILURES = 6
+# A connection that stayed up this long resets the reconnect backoff.
+_RECONNECT_HEALTHY_SECONDS = 60.0
+# Paged history reads (``thread/turns/list``). Never hydrate a thread's full
+# history with ``thread/resume``/``thread/read`` on the observer connection: a
+# long-running (e.g. goal-mode) thread's full history exceeds the client's
+# websocket ``max_size`` and the app-server response kills the connection.
+_CODEX_THREAD_TURNS_LIST_METHOD = "thread/turns/list"
+_USER_MESSAGE_LOOKUP_TURN_LIMIT = 2
+_BACKFILL_PAGE_TURNS = 5
+_BACKFILL_MAX_PAGES = 8
+# Durable record of item keys this bridge has mirrored, so a restarted
+# forwarder can backfill items produced while it was down without
+# re-posting what Omnigent already has (the server does not dedup).
+_SYNCED_ITEMS_LOG_NAME = "forwarder-synced-items.log"
+_SYNCED_ITEMS_LOG_KEEP = 4096
 # How long to wait for a freshly launched Codex TUI to create its
 # app-server thread (emit ``thread/started``) before giving up. Generous
 # because a host-spawned TUI cold-starts over the runner.
@@ -359,9 +382,13 @@ class _CodexForwarderState:
     :param subscribed_child_threads: Codex child thread ids whose backlog
         has been replayed for this connection (guards against re-replay
         if the same collab item is observed multiple times).
-    :param synced_item_keys: Stable item keys already posted to Omnigent this
-        connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
-        guards replay-vs-live overlap within one forwarder lifetime.
+    :param synced_item_keys: Stable item keys already posted to Omnigent,
+        e.g. ``{"thread_c:turn_c:item-1"}``. Guards replay-vs-live and
+        backfill-vs-live overlap. Seeded from :attr:`synced_items_log` at
+        forwarder start so a restarted forwarder does not re-post.
+    :param synced_items_log: Optional append-only file recording each
+        claimed stable item key, e.g. ``bridge_dir /
+        "forwarder-synced-items.log"``. ``None`` keeps dedup in memory only.
     :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
         ``error`` notification was already surfaced. Used to suppress a later
         terminal boundary for the same turn.
@@ -414,6 +441,7 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     synced_item_keys: set[str] = field(default_factory=set)
+    synced_items_log: Path | None = None
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
@@ -636,6 +664,46 @@ class _CodexForwarderState:
         :returns: None.
         """
         self.posted_user_turns.add(turn_id)
+
+    def note_user_message_absent(self, turn_id: str) -> None:
+        """
+        Record that a turn has no user message to recover.
+
+        Goal-mode (auto-continuation) turns are started by Codex itself and
+        carry no ``userMessage``. Remembering that stops every later
+        assistant item of the turn from re-querying the thread history.
+
+        :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+        :returns: None.
+        """
+        self.posted_user_turns.add(turn_id)
+
+    def persist_item_key(self, item_key: str) -> None:
+        """
+        Append one claimed stable item key to :attr:`synced_items_log`.
+
+        Best-effort: a write failure only weakens restart dedup.
+
+        :param item_key: Stable dedup key, e.g. ``"thread_c:turn_c:item-1"``.
+        :returns: None.
+        """
+        if self.synced_items_log is None:
+            return
+        try:
+            with self.synced_items_log.open("a", encoding="utf-8") as handle:
+                handle.write(item_key + "\n")
+        except OSError:
+            _logger.debug("Could not persist Codex synced item key", exc_info=True)
+
+    def has_synced_items_for_thread(self, thread_id: str) -> bool:
+        """
+        Return whether any item of *thread_id* was already mirrored.
+
+        :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+        :returns: ``True`` when a stable key for the thread is known.
+        """
+        prefix = f"{thread_id}:"
+        return any(key.startswith(prefix) for key in self.synced_item_keys)
 
     def has_posted_user_message(self, turn_id: str) -> bool:
         """
@@ -1851,8 +1919,11 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
-    :returns: None. Runs until cancelled or the app-server connection
-        closes.
+    :returns: None. Runs until cancelled or the app-server becomes
+        unreachable. A dropped connection (e.g. the app-server closed it)
+        is reconnected, re-subscribed, and backfilled, so every turn on
+        the thread — including goal-mode turns Omnigent did not start — keeps
+        reaching the web transcript.
     """
     # Bind bridge dir so failed durable-event posts can be dead-lettered (#1120).
     _dead_letter_dir.set(bridge_dir)
@@ -1888,83 +1959,127 @@ async def supervise_forwarder(
             usage_coalescer=_SessionUsageCoalescer(ap_client, session_id),
             elicitation_tracker=_CodexElicitationTaskTracker(),
         )
+        synced_items_log = bridge_dir / _SYNCED_ITEMS_LOG_NAME
         forwarder_state = _CodexForwarderState(
             parent_session_id=session_id,
             codex_client=client,
+            synced_items_log=synced_items_log,
         )
+        # Seed dedup from what earlier forwarders of this bridge mirrored, so
+        # the post-subscribe backfill can fill a restart gap without re-posting.
+        forwarder_state.synced_item_keys.update(_load_synced_item_keys(synced_items_log))
+
+        def start_subscribe(ready_signal: asyncio.Event) -> asyncio.Task[None]:
+            """
+            Subscribe the current app-server connection to the current thread.
+
+            :param ready_signal: Released when the thread shows activity.
+            :returns: The background subscribe task.
+            """
+            return asyncio.create_task(
+                _subscribe_until_ready(
+                    client,
+                    ap_client,
+                    session_id=target.session_id,
+                    bridge_dir=bridge_dir,
+                    thread_id=target.thread_id,
+                    usage_coalescer=target.usage_coalescer,
+                    elicitation_tracker=target.elicitation_tracker,
+                    forwarder_state=forwarder_state,
+                    ready_signal=ready_signal,
+                ),
+                name="codex-native-forwarder-subscribe",
+            )
+
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
         # for a fresh, still-empty thread. Recreated per thread on rotation.
         thread_active = asyncio.Event()
-        subscribe_task = asyncio.create_task(
-            _subscribe_until_ready(
-                client,
-                ap_client,
-                session_id=target.session_id,
-                bridge_dir=bridge_dir,
-                thread_id=target.thread_id,
-                usage_coalescer=target.usage_coalescer,
-                elicitation_tracker=target.elicitation_tracker,
-                forwarder_state=forwarder_state,
-                ready_signal=thread_active,
-            ),
-            name="codex-native-forwarder-subscribe",
-        )
+        subscribe_task = start_subscribe(thread_active)
+        await _await_backfilling_subscription(subscribe_task, forwarder_state, target.thread_id)
         await _sleep(0)
+        loop = asyncio.get_running_loop()
+        drops = 0
         try:
-            async for event in client.iter_events():
-                try:
-                    rotated = await _maybe_rotate_session_on_thread_started(
-                        ap_client=ap_client,
-                        target=target,
-                        bridge_dir=bridge_dir,
-                        app_server_url=app_server_url,
-                        event=event,
-                    )
-                    if rotated:
-                        forwarder_state.note_parent_rotation(target.session_id)
-                        subscribe_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await subscribe_task
-                        # Fresh thread after a /clear rotation — start its
-                        # own active signal so the new subscription parks
-                        # until the rotated thread's first turn.
-                        thread_active = asyncio.Event()
-                        subscribe_task = asyncio.create_task(
-                            _subscribe_until_ready(
-                                client,
-                                ap_client,
-                                session_id=target.session_id,
-                                bridge_dir=bridge_dir,
-                                thread_id=target.thread_id,
-                                usage_coalescer=target.usage_coalescer,
-                                elicitation_tracker=target.elicitation_tracker,
-                                forwarder_state=forwarder_state,
-                                ready_signal=thread_active,
-                            ),
-                            name="codex-native-forwarder-subscribe",
+            while True:
+                connected_at = loop.time()
+                async for event in client.iter_events():
+                    try:
+                        rotated = await _maybe_rotate_session_on_thread_started(
+                            ap_client=ap_client,
+                            target=target,
+                            bridge_dir=bridge_dir,
+                            app_server_url=app_server_url,
+                            event=event,
                         )
-                        continue
-                    # Release the subscribe task as soon as the thread shows
-                    # activity (rollout now exists), so it resumes instead of
-                    # waiting forever on an idle fresh thread.
-                    if not thread_active.is_set() and _event_indicates_thread_active(event):
-                        thread_active.set()
-                    await _handle_event(
-                        ap_client,
-                        session_id=target.session_id,
-                        bridge_dir=bridge_dir,
-                        event=event,
-                        delta_coalescer=target.delta_coalescer,
-                        usage_coalescer=target.usage_coalescer,
-                        elicitation_tracker=target.elicitation_tracker,
-                        expected_thread_id=target.thread_id,
-                        codex_client=client,
-                        forwarder_state=forwarder_state,
-                    )
-                except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
-                    _logger.warning("Codex forwarder event handling failed", exc_info=True)
+                        if rotated:
+                            forwarder_state.note_parent_rotation(target.session_id)
+                            subscribe_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await subscribe_task
+                            # Fresh thread after a /clear rotation — start its
+                            # own active signal so the new subscription parks
+                            # until the rotated thread's first turn.
+                            thread_active = asyncio.Event()
+                            subscribe_task = start_subscribe(thread_active)
+                            continue
+                        # Release the subscribe task as soon as the thread shows
+                        # activity (rollout now exists), so it resumes instead of
+                        # waiting forever on an idle fresh thread.
+                        if not thread_active.is_set() and _event_indicates_thread_active(event):
+                            thread_active.set()
+                        await _handle_event(
+                            ap_client,
+                            session_id=target.session_id,
+                            bridge_dir=bridge_dir,
+                            event=event,
+                            delta_coalescer=target.delta_coalescer,
+                            usage_coalescer=target.usage_coalescer,
+                            elicitation_tracker=target.elicitation_tracker,
+                            expected_thread_id=target.thread_id,
+                            codex_client=client,
+                            forwarder_state=forwarder_state,
+                        )
+                    except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
+                        _logger.warning("Codex forwarder event handling failed", exc_info=True)
+                # The event stream ended. A real client ends it only when the
+                # websocket closed; reconnect instead of silently stopping the
+                # mirror while the TUI keeps working on the same app-server.
+                close_error = getattr(client, "connection_error", None)
+                if close_error is None:
+                    return
+                _logger.warning(
+                    "Codex forwarder lost its app-server connection; reconnecting: "
+                    "session=%s thread=%s error=%s",
+                    target.session_id,
+                    target.thread_id,
+                    close_error,
+                )
+                subscribe_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await subscribe_task
+                await target.delta_coalescer.flush()
+                if loop.time() - connected_at >= _RECONNECT_HEALTHY_SECONDS:
+                    drops = 0
+                drops += 1
+                new_client = await _reconnect_app_server(app_server_url, drops=drops)
+                if new_client is None:
+                    return
+                with contextlib.suppress(Exception):
+                    await client.close()
+                client = new_client
+                forwarder_state.codex_client = client
+                # The thread was already subscribed once, so its rollout
+                # normally exists; keep the activity signal's state.
+                was_active = thread_active.is_set()
+                thread_active = asyncio.Event()
+                if was_active:
+                    thread_active.set()
+                subscribe_task = start_subscribe(thread_active)
+                await _await_backfilling_subscription(
+                    subscribe_task, forwarder_state, target.thread_id
+                )
         finally:
             if mcp_settle_timer is not None:
                 mcp_settle_timer.cancel()
@@ -1977,6 +2092,85 @@ async def supervise_forwarder(
             with contextlib.suppress(asyncio.CancelledError):
                 await subscribe_task
             await client.close()
+
+
+async def _await_backfilling_subscription(
+    subscribe_task: asyncio.Task[None],
+    forwarder_state: _CodexForwarderState,
+    thread_id: str,
+) -> None:
+    """
+    Finish a subscription that will backfill before live events are mirrored.
+
+    Omnigent orders mirrored items by POST arrival, so a gap backfill must land
+    before the newer live items already queued on the connection. Only
+    subscriptions that backfill (the thread already has mirrored items,
+    hence an existing rollout) are awaited; a fresh thread's subscription
+    may park until live activity and must stay in the background.
+
+    :param subscribe_task: Running :func:`_subscribe_until_ready` task.
+    :param forwarder_state: Forwarder state holding the dedup keys.
+    :param thread_id: Codex thread id being subscribed.
+    :returns: None.
+    """
+    if not forwarder_state.has_synced_items_for_thread(thread_id):
+        return
+    try:
+        await asyncio.shield(subscribe_task)
+    except asyncio.CancelledError:
+        if subscribe_task.cancelled():
+            return
+        raise
+    except Exception:  # noqa: BLE001 - subscription failures are logged by the task owner.
+        _logger.warning("Codex forwarder subscription failed", exc_info=True)
+
+
+async def _reconnect_app_server(app_server_url: str, *, drops: int) -> CodexAppServerClient | None:
+    """
+    Open a fresh app-server connection after the forwarder's one dropped.
+
+    Backs off with the number of recent drops so a connection that keeps
+    dying cannot spin, and gives up after ``_RECONNECT_MAX_CONNECT_FAILURES``
+    consecutive failed connects: a refused connect means the app-server is
+    gone, and the caller then returns so the runner can tear down.
+
+    :param app_server_url: Codex app-server transport, e.g.
+        ``"ws://127.0.0.1:9876"``.
+    :param drops: Connection drops since the last healthy connection
+        (``1`` for the first).
+    :returns: A connected client, or ``None`` when the app-server is unreachable.
+    """
+    delay = min(
+        _RECONNECT_INITIAL_DELAY_SECONDS * (2 ** max(drops - 1, 0)),
+        _RECONNECT_MAX_DELAY_SECONDS,
+    )
+    for attempt in range(1, _RECONNECT_MAX_CONNECT_FAILURES + 1):
+        await _sleep(delay)
+        candidate = client_for_transport(app_server_url, client_name="omnigent-codex-forwarder")
+        try:
+            await candidate.connect()
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await candidate.close()
+            raise
+        except Exception as exc:  # noqa: BLE001 - any connect failure is retried.
+            _logger.warning(
+                "Codex forwarder reconnect attempt %d/%d failed: %s",
+                attempt,
+                _RECONNECT_MAX_CONNECT_FAILURES,
+                exc,
+            )
+            with contextlib.suppress(Exception):
+                await candidate.close()
+            delay = min(delay * 2, _RECONNECT_MAX_DELAY_SECONDS)
+            continue
+        _logger.info("Codex forwarder reconnected to the app-server: attempt=%d", attempt)
+        return candidate
+    _logger.warning(
+        "Codex forwarder giving up: app-server unreachable after %d attempts",
+        _RECONNECT_MAX_CONNECT_FAILURES,
+    )
+    return None
 
 
 async def _maybe_rotate_session_on_thread_started(
@@ -2282,7 +2476,265 @@ async def _subscribe_until_ready(
             elicitation_tracker=elicitation_tracker,
             forwarder_state=forwarder_state,
         )
+        if forwarder_state is not None:
+            await _backfill_missed_turns(
+                client,
+                ap_client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                thread_id=thread_id,
+                usage_coalescer=usage_coalescer,
+                elicitation_tracker=elicitation_tracker,
+                forwarder_state=forwarder_state,
+            )
         return
+
+
+async def _backfill_missed_turns(
+    client: CodexAppServerClient,
+    ap_client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    usage_coalescer: _SessionUsageCoalescer,
+    elicitation_tracker: _CodexElicitationTaskTracker,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror items the forwarder missed while it was not subscribed.
+
+    Runs after every (re)subscription. A dropped app-server connection or a
+    restarted runner leaves a gap: Codex keeps running turns — including
+    goal-mode auto-continuation turns nobody in Omnigent started — and the
+    live notifications for them never reached this forwarder. This pages
+    the thread's history newest-first with ``thread/turns/list`` until it
+    reaches a turn containing an item already mirrored (the anchor), then
+    replays everything from that turn onward through the normal
+    ``item/completed`` path, whose dedup gate drops what Omnigent already has.
+
+    Only runs when the forwarder has mirrored something from this thread
+    before (in memory, or via the persisted synced-items log); a first
+    subscription keeps the historical "live items only" behavior instead of
+    dumping (or duplicating) the whole thread.
+
+    :param client: Connected Codex app-server client.
+    :param ap_client: Omnigent HTTP client.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param usage_coalescer: Token-usage coalescer.
+    :param elicitation_tracker: Background Codex elicitation tracker.
+    :param forwarder_state: Forwarder state holding the dedup keys.
+    :returns: None.
+    """
+    if not forwarder_state.has_synced_items_for_thread(thread_id):
+        return
+    newest_first: list[_JsonObject] = []
+    anchor_found = False
+    cursor: str | None = None
+    try:
+        for _ in range(_BACKFILL_MAX_PAGES):
+            response = await client.request(
+                _CODEX_THREAD_TURNS_LIST_METHOD,
+                _turns_list_params(thread_id, limit=_BACKFILL_PAGE_TURNS, cursor=cursor),
+            )
+            page = _turns_from_response(response)
+            for turn in page:
+                newest_first.append(turn)
+                if _turn_has_synced_item(turn, thread_id, forwarder_state):
+                    anchor_found = True
+                    break
+            if anchor_found or not page:
+                break
+            result = response.get("result")
+            next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
+            if not isinstance(next_cursor, str) or not next_cursor:
+                break
+            cursor = next_cursor
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - backfill is best-effort; live mirroring continues.
+        _logger.warning(
+            "Codex forwarder could not page thread history for backfill: thread=%s",
+            thread_id,
+            exc_info=True,
+        )
+        return
+    if not anchor_found:
+        _logger.warning(
+            "Codex forwarder backfill found no previously mirrored item in the "
+            "newest %d turns; mirroring those turns: thread=%s",
+            len(newest_first),
+            thread_id,
+        )
+    chronological = list(reversed(newest_first))
+    before = len(forwarder_state.synced_item_keys)
+    for turn in chronological:
+        turn_id = _turn_id_from_payload(turn)
+        items = turn.get("items")
+        if not turn_id or not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or _history_item_in_progress(item):
+                continue
+            await _handle_event(
+                ap_client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                event={
+                    "method": "item/completed",
+                    "params": {"threadId": thread_id, "turnId": turn_id, "item": item},
+                },
+                usage_coalescer=usage_coalescer,
+                elicitation_tracker=elicitation_tracker,
+                expected_thread_id=thread_id,
+                codex_client=client,
+                forwarder_state=forwarder_state,
+            )
+    await _post_backfill_turn_status(
+        ap_client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        thread_id=thread_id,
+        turns=chronological,
+    )
+    _logger.info(
+        "Codex forwarder backfill complete: thread=%s turns=%d new_items=%d anchor=%s",
+        thread_id,
+        len(chronological),
+        len(forwarder_state.synced_item_keys) - before,
+        anchor_found,
+    )
+
+
+def _turn_has_synced_item(
+    turn: _JsonObject, thread_id: str, forwarder_state: _CodexForwarderState
+) -> bool:
+    """
+    Return whether any item of *turn* was already mirrored to Omnigent.
+
+    :param turn: Codex history turn with ``items``.
+    :param thread_id: Codex thread id owning the turn.
+    :param forwarder_state: Forwarder state holding the dedup keys.
+    :returns: ``True`` when a stable key of the turn is known.
+    """
+    turn_id = _turn_id_from_payload(turn)
+    items = turn.get("items")
+    if not turn_id or not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        if (
+            isinstance(item_id, str)
+            and item_id
+            and f"{thread_id}:{turn_id}:{item_id}" in forwarder_state.synced_item_keys
+        ):
+            return True
+    return False
+
+
+def _history_item_in_progress(item: _JsonObject) -> bool:
+    """
+    Return whether a history item is still running.
+
+    The newest turn's snapshot can include started-but-unfinished items
+    (e.g. a running ``commandExecution``). Mirroring one now would claim its
+    dedup key and swallow the real ``item/completed`` that arrives later.
+
+    :param item: Codex history item.
+    :returns: ``True`` for an in-progress item.
+    """
+    status = item.get("status")
+    if isinstance(status, dict):
+        status = status.get("type")
+    return isinstance(status, str) and status.replace("_", "").lower() in {
+        "inprogress",
+        "pending",
+        "running",
+    }
+
+
+async def _post_backfill_turn_status(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    turns: list[_JsonObject],
+) -> None:
+    """
+    Publish the status edge a backfill gap may have swallowed.
+
+    A missed ``turn/completed`` leaves the web session "running" forever,
+    and a missed ``turn/started`` (e.g. a goal auto-continuation turn that
+    began during the gap) leaves it idle while Codex works. The newest
+    turn's status decides which edge to publish.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent conversation id.
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex thread id.
+    :param turns: Backfilled turns, oldest first.
+    :returns: None.
+    """
+    if not turns:
+        return
+    latest = turns[-1]
+    latest_id = _turn_id_from_payload(latest)
+    state = read_bridge_state(bridge_dir)
+    if latest_id is None or state is None or state.thread_id != thread_id:
+        return
+    status = _omnigent_status_from_resume_turn(latest)
+    if status is None:
+        if state.active_turn_id != latest_id:
+            await _handle_turn_started(
+                client, session_id, bridge_dir, {"threadId": thread_id, "turn": latest}
+            )
+        return
+    backfilled_ids = {_turn_id_from_payload(turn) for turn in turns}
+    if state.active_turn_id is None or state.active_turn_id not in backfilled_ids:
+        # Omnigent never saw a turn of the gap running; nothing to close.
+        return
+    update_active_turn_id(bridge_dir, None)
+    error = _terminal_error_from_turn({"turn": latest})
+    await _post_turn_status_edge(
+        client,
+        session_id,
+        _CodexTurnStatusEdge(
+            status=status,
+            turn_id=latest_id,
+            source="thread/turns/list:backfill",
+            error=error,
+        ),
+    )
+
+
+def _load_synced_item_keys(log_path: Path) -> list[str]:
+    """
+    Load the most recent persisted synced item keys, compacting the log.
+
+    :param log_path: Synced-items log, e.g. ``bridge_dir /
+        "forwarder-synced-items.log"``.
+    :returns: Up to ``_SYNCED_ITEMS_LOG_KEEP`` newest keys (empty when the
+        log is missing or unreadable).
+    """
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    keys = [line.strip() for line in lines if line.strip()]
+    if len(keys) > 2 * _SYNCED_ITEMS_LOG_KEEP:
+        keys = keys[-_SYNCED_ITEMS_LOG_KEEP:]
+        tmp_path = log_path.with_suffix(".tmp")
+        try:
+            tmp_path.write_text("".join(f"{key}\n" for key in keys), encoding="utf-8")
+            tmp_path.replace(log_path)
+        except OSError:
+            _logger.debug("Could not compact Codex synced-items log", exc_info=True)
+    return keys[-_SYNCED_ITEMS_LOG_KEEP:]
 
 
 def _event_indicates_thread_active(event: CodexMessage) -> bool:
@@ -4469,6 +4921,9 @@ def _claim_completed_item(
     item_key, is_anon = _completed_item_key(params, item, forwarder_state)
     if not forwarder_state.claim_item_key(item_key):
         return False
+    if not is_anon:
+        # Anonymous keys are positional per connection; never persist them.
+        forwarder_state.persist_item_key(item_key)
     if is_anon:
         thread_id = _thread_id_from_params(params) or "thread"
         turn_id = params.get("turnId")
@@ -5367,9 +5822,14 @@ async def _ensure_user_message_posted(
     the subscription can miss the early ``userMessage`` event; this
     recovers it via a targeted ``thread/resume`` and posts it through the
     normal claim/post path so it takes an earlier Omnigent position than the
-    reply. The recovered item carries Codex's resume id (e.g. ``item-1``),
-    matching the id the resume backfill would later use — so the dedup
-    gate drops the backfill's duplicate.
+    reply. The recovered item carries Codex's history id, matching the id a
+    later backfill would use — so the dedup gate drops the duplicate.
+
+    The lookup is a small ``thread/turns/list`` page, never a full-history
+    ``thread/resume``: on a long-running thread the full history exceeds the
+    websocket ``max_size`` and the oversized response kills the observer
+    connection. A turn that exists but has no user message (Codex goal-mode
+    auto-continuation turns) is remembered so it is looked up only once.
 
     No-op when ``forwarder_state`` is absent (tests bypassing
     ``supervise_forwarder``), when no Codex client is wired, or when the
@@ -5393,19 +5853,26 @@ async def _ensure_user_message_posted(
     if codex_client is None or thread_id is None:
         return
     try:
-        response = await codex_client.request("thread/resume", {"threadId": thread_id})
+        response = await codex_client.request(
+            _CODEX_THREAD_TURNS_LIST_METHOD,
+            _turns_list_params(thread_id, limit=_USER_MESSAGE_LOOKUP_TURN_LIMIT),
+        )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 - degrade to current behavior on resume failure.
+    except Exception:  # noqa: BLE001 - degrade to current behavior on lookup failure.
         _logger.warning(
-            "Codex forwarder could not resume to recover user message: thread=%s turn=%s",
+            "Codex forwarder could not read turns to recover user message: thread=%s turn=%s",
             thread_id,
             turn_id,
             exc_info=True,
         )
+        forwarder_state.note_user_message_absent(turn_id)
         return
-    user_item = _find_turn_user_message(response, turn_id)
+    turn = _find_turn(response, turn_id)
+    user_item = _turn_user_message(turn) if turn is not None else None
     if user_item is None:
+        if turn is not None:
+            forwarder_state.note_user_message_absent(turn_id)
         return
     recovered_params: _JsonObject = {
         "threadId": thread_id,
@@ -5418,34 +5885,74 @@ async def _ensure_user_message_posted(
     forwarder_state.note_user_message_posted(turn_id)
 
 
-def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject | None:
+def _turns_list_params(thread_id: str, *, limit: int, cursor: str | None = None) -> _JsonObject:
     """
-    Locate a turn's ``userMessage`` item in a ``thread/resume`` response.
+    Build ``thread/turns/list`` params for a newest-first page with items.
 
-    :param response: Codex ``thread/resume`` response envelope.
-    :param turn_id: Codex turn id whose user message to find, e.g.
-        ``"turn_123"``.
-    :returns: The ``userMessage`` item dict, or ``None`` when the turn or
-        its user message is absent.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param limit: Max turns in the page, e.g. ``5``.
+    :param cursor: Opaque ``nextCursor`` from the previous page.
+    :returns: JSON-RPC params.
+    """
+    params: _JsonObject = {
+        "threadId": thread_id,
+        "limit": limit,
+        "sortDirection": "desc",
+        "itemsView": "full",
+    }
+    if cursor is not None:
+        params["cursor"] = cursor
+    return params
+
+
+def _turns_from_response(response: CodexMessage) -> list[_JsonObject]:
+    """
+    Extract turns from a ``thread/turns/list`` (or ``thread/resume``) response.
+
+    :param response: JSON-RPC response envelope. ``thread/turns/list``
+        carries ``result.data``; ``thread/resume`` carries
+        ``result.thread.turns``.
+    :returns: Turn objects in response order (possibly empty).
     """
     result = response.get("result")
     if not isinstance(result, dict):
-        return None
-    thread = result.get("thread")
-    if not isinstance(thread, dict):
-        return None
-    turns = thread.get("turns")
+        return []
+    turns = result.get("data")
     if not isinstance(turns, list):
+        thread = result.get("thread")
+        turns = thread.get("turns") if isinstance(thread, dict) else None
+    if not isinstance(turns, list):
+        return []
+    return [turn for turn in turns if isinstance(turn, dict)]
+
+
+def _find_turn(response: CodexMessage, turn_id: str) -> _JsonObject | None:
+    """
+    Locate one turn in a turns-bearing Codex response.
+
+    :param response: ``thread/turns/list`` or ``thread/resume`` response.
+    :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+    :returns: The turn object, or ``None`` when absent.
+    """
+    for turn in _turns_from_response(response):
+        if _turn_id_from_payload(turn) == turn_id:
+            return turn
+    return None
+
+
+def _turn_user_message(turn: _JsonObject) -> _JsonObject | None:
+    """
+    Return a turn's ``userMessage`` item.
+
+    :param turn: Codex turn object with ``items``.
+    :returns: The ``userMessage`` item dict, or ``None`` when absent.
+    """
+    items = turn.get("items")
+    if not isinstance(items, list):
         return None
-    for turn in turns:
-        if not isinstance(turn, dict) or _turn_id_from_payload(turn) != turn_id:
-            continue
-        items = turn.get("items")
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if isinstance(item, dict) and item.get("type") == "userMessage":
-                return item
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "userMessage":
+            return item
     return None
 
 

@@ -510,6 +510,17 @@ class CodexAppServerResponseError(RuntimeError):
         super().__init__(str(error))
 
 
+class CodexAppServerConnectionClosed(ConnectionError):
+    """The Codex app-server websocket closed while a caller depended on it.
+
+    Raised from :meth:`CodexAppServerClient.request` for every request that
+    was in flight (or issued) after the connection died, so callers fail
+    fast instead of awaiting a response that can never arrive. Common
+    triggers: the app-server exited, or it sent a frame larger than the
+    client's ``max_size`` (websockets closes such a connection with 1009).
+    """
+
+
 class CodexAppServerClient:
     """JSON-RPC client for a Codex app-server.
 
@@ -539,8 +550,25 @@ class CodexAppServerClient:
         self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
-        self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
+        # ``None`` is the end-of-stream sentinel queued when the connection dies.
+        self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
+        self._connection_error: CodexAppServerConnectionClosed | None = None
+
+    @property
+    def connection_error(self) -> CodexAppServerConnectionClosed | None:
+        """
+        Return why the app-server connection closed, or ``None`` while open.
+
+        Set once the reader observes the websocket end (remote close,
+        transport error, or an oversized frame). Consumers such as the
+        forwarder use it to tell "the connection dropped" apart from an
+        event stream that simply finished, and reconnect.
+
+        :returns: The closure error, e.g. ``CodexAppServerConnectionClosed(
+            "... 1009 (message too big) ...")``, or ``None``.
+        """
+        return self._connection_error
 
     async def connect(self) -> None:
         """
@@ -587,14 +615,17 @@ class CodexAppServerClient:
         """
         if self._reader_task is not None:
             self._reader_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            # A reader that already died must not make ``close()`` raise:
+            # callers run it from ``finally`` blocks during teardown.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._reader_task
         for future in self._pending_requests.values():
             if not future.done():
                 future.cancel()
         self._pending_requests.clear()
         if self._ws is not None:
-            await self._ws.close()
+            with contextlib.suppress(Exception):
+                await self._ws.close()
         self._ws = None
         self._reader_task = None
 
@@ -609,20 +640,28 @@ class CodexAppServerClient:
         """
         if self._ws is None:
             raise RuntimeError("Codex app-server client is not connected")
+        if self._connection_error is not None:
+            raise self._connection_error
         request_id = self._next_id
         self._next_id += 1
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexMessage] = loop.create_future()
         self._pending_requests[request_id] = future
-        await self._ws.send(
-            json.dumps(
-                {
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                }
+        try:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    }
+                )
             )
-        )
+        except websockets.ConnectionClosed as exc:
+            self._pending_requests.pop(request_id, None)
+            raise CodexAppServerConnectionClosed(
+                f"Codex app-server connection closed: {exc}"
+            ) from exc
         response = await future
         error = response.get("error")
         if error:
@@ -670,10 +709,19 @@ class CodexAppServerClient:
         """
         Yield app-server notifications until the connection closes.
 
+        Ends (returns) once the reader observes the websocket close, so a
+        dropped connection is visible to the consumer instead of parking it
+        forever; :attr:`connection_error` then says why.
+
         :returns: Async iterator of notification envelopes.
         """
         while True:
-            yield await self._events.get()
+            event = await self._events.get()
+            if event is None:
+                # Re-queue the sentinel so any other iterator also ends.
+                self._events.put_nowait(None)
+                return
+            yield event
 
     async def _reader_loop(self) -> None:
         """
@@ -682,7 +730,49 @@ class CodexAppServerClient:
         :returns: None.
         """
         assert self._ws is not None
-        async for raw in self._ws:
+        cause: BaseException | None = None
+        try:
+            await self._read_messages(self._ws)
+        except Exception as exc:  # noqa: BLE001 - any reader death ends the connection.
+            cause = exc
+            _logger.warning("Codex app-server connection closed: %s", exc)
+        finally:
+            self._mark_connection_closed(cause)
+
+    def _mark_connection_closed(self, cause: BaseException | None) -> None:
+        """
+        Fail in-flight requests and end the event stream after the reader stops.
+
+        Without this, a request awaiting a response on a dead socket (e.g.
+        one whose response frame exceeded ``max_size``) would wait forever,
+        and :meth:`iter_events` would never return.
+
+        :param cause: Exception that ended the reader, or ``None`` for a
+            clean close / cancellation.
+        :returns: None.
+        """
+        if self._connection_error is not None:
+            return
+        reason = str(cause) if cause is not None else "connection closed"
+        error = CodexAppServerConnectionClosed(f"Codex app-server connection closed: {reason}")
+        if cause is not None:
+            error.__cause__ = cause
+        self._connection_error = error
+        pending = list(self._pending_requests.values())
+        self._pending_requests.clear()
+        for future in pending:
+            if not future.done():
+                future.set_exception(error)
+        self._events.put_nowait(None)
+
+    async def _read_messages(self, ws: ClientConnection) -> None:
+        """
+        Route websocket messages to pending requests or the event queue.
+
+        :param ws: Connected app-server websocket.
+        :returns: None when the websocket closes cleanly.
+        """
+        async for raw in ws:
             if not isinstance(raw, str):
                 continue
             decoded: object = json.loads(raw)

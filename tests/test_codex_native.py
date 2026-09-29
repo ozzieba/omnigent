@@ -3379,7 +3379,14 @@ def test_forwarder_recovers_user_before_recovered_agent_message_delta(tmp_path: 
     assert posted[0]["data"]["item_data"]["content"][0]["text"] == "hello"
     assert posted[1]["data"] == _expected_status_data("running", "turn_early")
     assert posted[2]["data"] == _expected_delta_data("Hello", "turn_early", "item_agent")
-    assert [method for method, _ in fake_client.requests] == ["thread/resume"]
+    # Recovery pages recent turns; it never hydrates the full thread history
+    # (which can exceed the websocket max_size and kill the connection).
+    assert fake_client.requests == [
+        (
+            "thread/turns/list",
+            {"threadId": "thread_123", "limit": 2, "sortDirection": "desc", "itemsView": "full"},
+        )
+    ]
     assert forwarder_state.has_posted_user_message("turn_early")
 
 
@@ -5779,7 +5786,14 @@ def test_forwarder_posts_user_message_on_assistant_item_started(tmp_path: Path) 
     assert items[0]["data"]["item_data"]["content"][0]["text"] == "hello codex"
     # The recovery issued exactly one resume to fetch the user message, and
     # the turn is now marked so the item/completed backstop won't re-post.
-    assert [method for method, _ in fake_client.requests] == ["thread/resume"]
+    # Recovery pages recent turns; it never hydrates the full thread history
+    # (which can exceed the websocket max_size and kill the connection).
+    assert fake_client.requests == [
+        (
+            "thread/turns/list",
+            {"threadId": "thread_123", "limit": 2, "sortDirection": "desc", "itemsView": "full"},
+        )
+    ]
     assert forwarder_state.has_posted_user_message("turn_123")
 
 
@@ -5953,7 +5967,14 @@ def test_forwarder_recovers_missed_user_message_before_assistant(tmp_path: Path)
     assert items[0]["data"]["item_data"]["content"][0]["text"] == "hello codex"
     assert items[1]["data"]["item_data"]["content"][0]["text"] == "hello from codex"
     # The recovery issued exactly one resume to fetch the user message.
-    assert [method for method, _ in fake_client.requests] == ["thread/resume"]
+    # Recovery pages recent turns; it never hydrates the full thread history
+    # (which can exceed the websocket max_size and kill the connection).
+    assert fake_client.requests == [
+        (
+            "thread/turns/list",
+            {"threadId": "thread_123", "limit": 2, "sortDirection": "desc", "itemsView": "full"},
+        )
+    ]
 
 
 def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> None:
