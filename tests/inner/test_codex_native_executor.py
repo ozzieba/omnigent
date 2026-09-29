@@ -1377,3 +1377,201 @@ def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
 
     assert interrupted is False
     assert _FakeCodexNativeClient.requests == []
+
+
+def _install_turn_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    codex_active_turn: list[str | None],
+) -> type[_FakeCodexNativeClient]:
+    """
+    Install a fake app-server whose active turn is ``codex_active_turn[0]``.
+
+    Steer/interrupt requests naming a different turn are rejected exactly
+    like Codex does ("expected active turn id A but found B"), which is
+    what happens after goal mode auto-starts a turn Omnigent did not see.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Bridge directory.
+    :param codex_active_turn: One-element holder for Codex's active turn
+        id (``None`` = idle); tests may mutate it to model rotation.
+    :returns: The installed fake client class (for its ``requests``).
+    """
+    del tmp_path
+
+    class _GoalModeClient(_FakeCodexNativeClient):
+        """Codex app-server double with an authoritative active turn."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Enforce Codex's expected-turn checks for steer and interrupt."""
+            type(self).requests.append((method, params))
+            active = codex_active_turn[0]
+            if method == "turn/steer":
+                if active is None:
+                    raise CodexAppServerResponseError(
+                        {"code": -32600, "message": "no active turn to steer"}
+                    )
+                if params["expectedTurnId"] != active:
+                    raise CodexAppServerResponseError(
+                        {
+                            "code": -32600,
+                            "message": (
+                                f"expected active turn id `{params['expectedTurnId']}` "
+                                f"but found `{active}`"
+                            ),
+                        }
+                    )
+                return {"result": {"turnId": active}}
+            if method == "turn/interrupt" and params["turnId"]:
+                if active is None:
+                    raise CodexAppServerResponseError(
+                        {"code": -32600, "message": "no active turn to interrupt"}
+                    )
+                if params["turnId"] != active:
+                    raise CodexAppServerResponseError(
+                        {
+                            "code": -32600,
+                            "message": (
+                                f"expected active turn id {params['turnId']} but found {active}"
+                            ),
+                        }
+                    )
+                return {"result": {}}
+            if method == "turn/start":
+                codex_active_turn[0] = "turn_started"
+                return {"result": {"turn": {"id": "turn_started"}}}
+            return {"result": {}}
+
+    _GoalModeClient.requests = []
+    _GoalModeClient.created = []
+    monkeypatch.setattr("omnigent.codex_native_app_server.CodexAppServerClient", _GoalModeClient)
+    return _GoalModeClient
+
+
+def test_steer_resyncs_to_goal_auto_turn_instead_of_failing_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Regression: goal mode auto-started ``turn_goal`` while the bridge still
+    recorded ``turn_old``. Codex rejects the stale steer with "expected
+    active turn id `turn_old` but found `turn_goal`"; the executor must
+    adopt ``turn_goal`` and steer it — not fail the Omnigent session.
+    """
+    client = _install_turn_client(monkeypatch, tmp_path, codex_active_turn=["turn_goal"])
+    _seed_bridge(tmp_path, active_turn_id="turn_old")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "status?")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert [(m, p.get("expectedTurnId")) for m, p in client.requests] == [
+        ("turn/steer", "turn_old"),
+        ("turn/steer", "turn_goal"),
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_goal"
+
+
+def test_mid_turn_enqueue_resyncs_to_goal_auto_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The live-queue steering path recovers from a stale turn id too."""
+    client = _install_turn_client(monkeypatch, tmp_path, codex_active_turn=["turn_goal"])
+    _seed_bridge(tmp_path, active_turn_id="turn_old")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    accepted = asyncio.run(executor.enqueue_session_message("key", "also check logs"))
+
+    assert accepted is True
+    assert [p.get("expectedTurnId") for _m, p in client.requests] == ["turn_old", "turn_goal"]
+
+
+def test_interrupt_targets_current_goal_turn_when_recorded_id_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop interrupts what Codex is running now: a stale recorded id is
+    resynced from the mismatch rejection and the current turn interrupted.
+    """
+    client = _install_turn_client(monkeypatch, tmp_path, codex_active_turn=["turn_goal"])
+    _seed_bridge(tmp_path, active_turn_id="turn_old")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    interrupted = asyncio.run(executor.interrupt_session("key"))
+
+    assert interrupted is True
+    assert client.requests == [
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_old"}),
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_goal"}),
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_goal"
+
+
+def test_interrupt_of_already_finished_turn_clears_stale_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """'No active turn to interrupt' is success: nothing is running."""
+    _install_turn_client(monkeypatch, tmp_path, codex_active_turn=[None])
+    _seed_bridge(tmp_path, active_turn_id="turn_old")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    assert asyncio.run(executor.interrupt_session("key")) is True
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id is None
+
+
+def test_steer_gives_up_when_codex_turn_keeps_rotating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Resync is bounded: a turn id that changes on every call cannot loop forever."""
+    counter = iter(range(100))
+
+    class _RotatingClient(_FakeCodexNativeClient):
+        """Every steer finds a brand-new active turn."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            type(self).requests.append((method, params))
+            raise CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": (
+                        f"expected active turn id `{params['expectedTurnId']}` "
+                        f"but found `turn_{next(counter)}`"
+                    ),
+                }
+            )
+
+    _RotatingClient.requests = []
+    _RotatingClient.created = []
+    monkeypatch.setattr("omnigent.codex_native_app_server.CodexAppServerClient", _RotatingClient)
+    _seed_bridge(tmp_path, active_turn_id="turn_old")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "hi")
+
+    assert [type(event) for event in events] == [ExecutorError]
+    assert 1 < len(_RotatingClient.requests) <= 8
+
+
+def test_resync_does_not_clobber_newer_forwarder_turn(tmp_path: Path) -> None:
+    """
+    The stale-id resync is compare-and-set: if the forwarder already
+    recorded a newer turn, the older mismatch report must not overwrite it.
+    """
+    from omnigent.codex_native_bridge import replace_active_turn_id_if_matches
+
+    _seed_bridge(tmp_path, active_turn_id="turn_newest")
+
+    assert replace_active_turn_id_if_matches(tmp_path, "turn_old", "turn_goal") is False
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_newest"
+    assert replace_active_turn_id_if_matches(tmp_path, "turn_newest", "turn_goal") is True
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_goal"

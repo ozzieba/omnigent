@@ -529,7 +529,10 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _codex_interrupt(self, conv_id: str) -> Response:
-        from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.codex_native_app_server import (
+            client_for_transport,
+            interrupt_codex_active_turn,
+        )
         from omnigent.codex_native_bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
@@ -594,12 +597,13 @@ class NativeInterruptRunner:
                         exc_info=True,
                     )
             if state.active_turn_id is not None:
-                await codex_client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
+                # Interrupts Codex's CURRENT turn even when the recorded id
+                # is stale (goal mode auto-starts turns), resyncing the bridge.
+                await interrupt_codex_active_turn(
+                    codex_client,
+                    bridge_dir=bridge_dir,
+                    thread_id=state.thread_id,
+                    turn_id=state.active_turn_id,
                 )
         except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures.
             self._logger.warning(
