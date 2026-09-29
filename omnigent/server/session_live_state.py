@@ -196,8 +196,9 @@ def persist_scheduled_run_completion(
     """Transition a scheduled-task run to terminal when its turn ends.
 
     The event-driven completion mechanism: called from ``_publish_status``
-    wherever a session reaches a durable terminal edge (``idle`` = the turn
-    completed, ``failed`` = it errored/disconnected). Most conversations are
+    wherever a session reaches a durable terminal edge (``idle`` is only
+    success when accepted model output was previously recorded; ``failed``
+    remains terminal even during startup). Most conversations are
     not scheduled-task fires, so the reverse lookup returns ``None`` and this
     is a cheap no-op; only a fired conversation with a still-``running`` run
     gets transitioned.
@@ -220,8 +221,9 @@ def persist_scheduled_run_completion(
     dropped-write or restart-in-flight case.
 
     :param conversation_id: The fired conversation whose turn just ended.
-    :param run_status: Terminal run status to set — ``"succeeded"`` (turn
-        completed) or ``"failed"`` (turn errored/cancelled/disconnected).
+    :param run_status: Terminal run status to set — ``"succeeded"`` after
+        accepted output followed by idle, or ``"failed"`` when the turn
+        errored/cancelled/disconnected.
     :param error_code: Short failure classification when ``run_status`` is
         ``"failed"`` (e.g. the conversation's ``last_task_error_code``).
     :param error: Optional human-readable failure detail for ``"failed"``.
@@ -236,6 +238,11 @@ def persist_scheduled_run_completion(
             # Not a scheduled fire, or its run is already terminal — nothing to
             # do. This is the common case (interactive sessions).
             return
+        if run_status == "succeeded" and getattr(run, "started_at", None) is None:
+            # Initial runner/session idle is not a completed scheduled turn.
+            # Success requires a model response/output marker recorded by the
+            # SDK relay or native transcript bridge.
+            return
         store.update_run(
             run.id,
             status=run_status,
@@ -245,6 +252,24 @@ def persist_scheduled_run_completion(
         )
 
     submit("scheduled_run_completion", _transition)
+
+
+def persist_scheduled_run_started(conversation_id: str) -> None:
+    """Record evidence that a scheduled turn produced model output.
+
+    Call only for a successful response event or a persisted assistant/tool
+    item. Runner startup, prompt delivery and generic ``running`` statuses do
+    not prove that the model accepted the turn.
+    """
+    store = _scheduled_task_store
+    if store is None:
+        return
+    submit(
+        "scheduled_run_started",
+        store.mark_run_started_by_conversation,
+        conversation_id,
+        int(time.time()),
+    )
 
 
 def persist_pending_count(conversation_id: str, count: int) -> None:
