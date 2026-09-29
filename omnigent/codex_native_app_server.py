@@ -3378,7 +3378,83 @@ def build_codex_remote_args(
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
+    # Codex rejects permission overrides on a remote resume ("Permission
+    # overrides are not supported when resuming a remote task") and exits
+    # immediately, killing the terminal pane. The app-server already owns the
+    # thread's permission profile, so drop them from the attaching TUI.
+    passthrough = _strip_remote_resume_permission_overrides(passthrough)
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+
+
+# ``-c`` / ``--config`` keys that ``codex resume --remote`` treats as
+# permission overrides and rejects.
+_REMOTE_RESUME_PERMISSION_CONFIG_KEYS = frozenset(
+    {"default_permissions", "approval_policy", "approvals_reviewer", "sandbox_mode"}
+)
+_CODEX_CONFIG_FLAGS = frozenset({"-c", "--config"})
+
+
+def _strip_remote_resume_permission_overrides(args: list[str]) -> list[str]:
+    """
+    Remove permission overrides that ``codex resume --remote`` rejects.
+
+    Codex 0.156+ aborts a remote resume with "Permission overrides are not
+    supported when resuming a remote task" when the TUI argv carries any
+    approval/sandbox/permission override. The remote app-server already
+    holds the thread's permission profile, so the attaching TUI needs none.
+
+    Dropped:
+
+    - ``--sandbox`` / ``-s`` / ``--ask-for-approval`` / ``-a`` in both the
+      ``--flag value`` and ``--flag=value`` spellings. As in
+      :func:`_strip_approval_sandbox_flags`, the next token is consumed as
+      the value only when it does not start with ``-``.
+    - ``-c`` / ``--config`` overrides (``-c key=value`` or
+      ``--config=key=value``) whose key is in
+      :data:`_REMOTE_RESUME_PERMISSION_CONFIG_KEYS`.
+
+    Everything else (model/provider ``-c`` overrides, hook-trust and
+    bypass flags, ...) passes through untouched.
+
+    :param args: Codex argv passthrough, e.g.
+        ``["-c", 'default_permissions=":workspace"', "--sandbox", "read-only"]``.
+    :returns: *args* without the permission overrides, e.g. ``[]``.
+    """
+    cleaned: list[str] = []
+    i = 0
+    n = len(args)
+    while i < n:
+        arg = args[i]
+        if arg in _CODEX_APPROVAL_SANDBOX_FLAGS:
+            if i + 1 < n and not args[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in _CODEX_APPROVAL_SANDBOX_FLAGS):
+            i += 1
+            continue
+        if arg in _CODEX_CONFIG_FLAGS and i + 1 < n:
+            if _config_override_key(args[i + 1]) in _REMOTE_RESUME_PERMISSION_CONFIG_KEYS:
+                i += 2
+                continue
+        elif arg.startswith("--config="):
+            if _config_override_key(arg[len("--config=") :]) in _REMOTE_RESUME_PERMISSION_CONFIG_KEYS:
+                i += 1
+                continue
+        cleaned.append(arg)
+        i += 1
+    return cleaned
+
+
+def _config_override_key(override: str) -> str:
+    """
+    Return the key of a Codex ``-c`` override value.
+
+    :param override: Override value, e.g. ``'approval_policy="never"'``.
+    :returns: Stripped key, e.g. ``"approval_policy"``.
+    """
+    return override.partition("=")[0].strip()
 
 
 def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:

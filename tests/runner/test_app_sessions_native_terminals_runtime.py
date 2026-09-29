@@ -593,14 +593,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
     assert launched.args[0] == "--dangerously-bypass-hook-trust"
-    assert launched.args[1:4] == [
-        "--config",
-        "approval_policy=on-request",
-        "resume",
-    ]
-    assert launched.args[4] == "--remote"
-    assert launched.args[5].startswith("ws://127.0.0.1:")
-    assert launched.args[6] == thread_id
+    # The persisted permission override stays on the app-server resume
+    # (preload_calls below) but is stripped from the attaching TUI argv:
+    # ``codex resume --remote`` rejects permission overrides and exits.
+    assert launched.args[1] == "resume"
+    assert launched.args[2] == "--remote"
+    assert launched.args[3].startswith("ws://127.0.0.1:")
+    assert launched.args[4] == thread_id
+    assert "approval_policy=on-request" not in launched.args
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
