@@ -8,6 +8,7 @@ import json
 import secrets
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -1904,17 +1905,20 @@ def register_core_routes(
                 # resolve the spec and cache it before the first turn.
                 # This is the design doc's "Server POST /v1/sessions
                 # (to runner)" step from §7 Flow: session creation.
-                conv = conversation_store.get_conversation(
+                rebound_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation,
                     session_id,
                 )
-                if _runner_client is not None and conv is not None:
+                if rebound_conv is None:
+                    raise _session_not_found()
+                if _runner_client is not None:
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
                             json={
                                 "session_id": session_id,
-                                "agent_id": conv.agent_id,
-                                "sub_agent_name": conv.sub_agent_name,
+                                "agent_id": rebound_conv.agent_id,
+                                "sub_agent_name": rebound_conv.sub_agent_name,
                             },
                             timeout=10.0,
                         )
@@ -1950,17 +1954,20 @@ def register_core_routes(
                 # create path stores those events as history plus a durable
                 # delivery ledger; replay them now that the runner is ready.
                 if _runner_client is not None:
-                    pending = list((conv.session_state or {}).get("pending_initial_items", []))
+                    pending = list(
+                        (rebound_conv.session_state or {}).get("pending_initial_items", [])
+                    )
                     if pending:
+                        rebound_agent_id = rebound_conv.agent_id
                         agent = (
-                            await asyncio.to_thread(agent_store.get, conv.agent_id)
-                            if conv.agent_id is not None
+                            await asyncio.to_thread(agent_store.get, rebound_agent_id)
+                            if rebound_agent_id is not None
                             else None
                         )
                         for index, raw_item in enumerate(pending):
                             await _dispatch_session_event_to_runner(
                                 session_id,
-                                conv,
+                                rebound_conv,
                                 SessionEventInput.model_validate(raw_item),
                                 conversation_store,
                                 _runner_client,
@@ -1970,7 +1977,7 @@ def register_core_routes(
                                 runner_router=runner_router,
                             )
                             remaining = pending[index + 1 :]
-                            next_state = dict(conv.session_state or {})
+                            next_state = dict(rebound_conv.session_state or {})
                             if remaining:
                                 next_state["pending_initial_items"] = remaining
                             else:
@@ -1981,9 +1988,7 @@ def register_core_routes(
                                 session_id,
                                 next_state,
                             )
-                            conv = conv.__class__(
-                                **{**conv.__dict__, "session_state": next_state}
-                            )
+                            rebound_conv = replace(rebound_conv, session_state=next_state)
         else:
             conv = conv_for_collaboration_mode
             if conv is None:
