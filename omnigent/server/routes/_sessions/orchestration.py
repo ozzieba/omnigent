@@ -8251,6 +8251,13 @@ async def _create_session_from_existing_agent(
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
+            # A child the caller binds to an explicit host/workspace runs on
+            # a runner that host launches there. Pinning it to the parent's
+            # runner instead would execute it in the parent's process and
+            # workspace (without the target host's harness environment)
+            # while its row reports a different binding.
+            if body.host_id is not None:
+                inherited_runner_id = None
             # Defense-in-depth: don't inherit a runner the
             # caller doesn't own.
             if (

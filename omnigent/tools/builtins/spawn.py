@@ -1006,6 +1006,25 @@ class SysSessionCreateTool(Tool):
                                 "default."
                             ),
                         },
+                        "host_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional host to run the child on, e.g. a "
+                                "dedicated harness host. Only valid with "
+                                "'agent_id' and requires 'workspace'. The "
+                                "child then gets its own runner on that host "
+                                "instead of sharing yours; omit to co-locate "
+                                "it with you."
+                            ),
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Absolute working directory for the child on "
+                                "'host_id', e.g. '/home/me/repo'. Only used "
+                                "with 'host_id'."
+                            ),
+                        },
                     },
                     # Only the always-optional fields are listed in
                     # ``required`` (none): the agent_id-vs-config_path

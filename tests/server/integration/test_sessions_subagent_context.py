@@ -159,6 +159,52 @@ async def test_child_inherits_parent_runner_affinity(
     assert snap.json()["parent_session_id"] == parent["id"]
 
 
+async def test_child_bound_to_explicit_host_does_not_inherit_parent_runner(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child created with its own ``host_id``/``workspace`` gets its own runner.
+
+    Inheriting the parent's runner would execute the child in the parent's
+    process and workspace — e.g. a Docloop child of a Codex session would run
+    inside the Codex runner, without the Docloop host's harness environment —
+    while the row reported the requested host. The explicit binding must win:
+    no inherited ``runner_id`` (the bound host launches one on first message)
+    and the requested ``host_id``/``workspace`` persisted on the child.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _accept_workspace(**kwargs: Any) -> str:
+        return str(kwargs["workspace"])
+
+    monkeypatch.setattr(orchestration, "_validate_session_workspace", _accept_workspace)
+
+    parent = await _create_parent_session(client, agent_name="ctx-parent-bound-child")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    assert conv_store.set_runner_id(parent["id"], "runner_parent_codex_1f3a") is True
+
+    agent = await create_test_agent(client, name="ctx-child-bound-to-host")
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "host_id": "ab071af4656c4ad7ae37d0244437f8bf",
+            "workspace": "/srv/checkouts/learning-platform",
+            "title": "docloop:bound",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    child = await client.get(f"/v1/sessions/{resp.json()['id']}")
+    assert child.status_code == 200, child.text
+    body = child.json()
+    assert body["parent_session_id"] == parent["id"]
+    assert body["runner_id"] is None
+    assert body["host_id"] == "ab071af4656c4ad7ae37d0244437f8bf"
+    assert body["workspace"] == "/srv/checkouts/learning-platform"
+
+
 # ── Transcript isolation (no implicit history bleed) ─────
 
 
