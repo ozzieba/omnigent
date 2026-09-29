@@ -52,6 +52,66 @@ _TIMEOUT_S = 8.0
 
 _cache: dict[str, Any] = {"fetched_at": 0.0, "models": []}
 
+def _fetch_llmq_catalog(token: str) -> list[dict[str, Any]]:
+    """The merged cross-upstream catalog: prices + pareto + eval scores."""
+    url = f"{_GATEWAY_URL}/v1/catalog?sort=pareto"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    return [e for e in data if isinstance(e, dict) and isinstance(e.get("model"), str)]
+
+
+_catalog_cache: dict[str, Any] = {"entries": {}, "fetched_at": 0.0}
+
+
+def _catalog_by_key() -> dict[tuple[str, str], dict[str, Any]]:
+    """(upstream, model) -> catalog entry; cached with the module TTL."""
+    now = time.time()
+    if _catalog_cache["entries"] and now - _catalog_cache["fetched_at"] < TTL_SECONDS:
+        return _catalog_cache["entries"]
+    token = _gateway_token()
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    if token:
+        try:
+            for entry in _fetch_llmq_catalog(token):
+                entries[(str(entry.get("upstream")), str(entry.get("model")))] = entry
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            _logger.warning("llmq catalog fetch failed: %s", exc)
+    _catalog_cache["entries"] = entries
+    _catalog_cache["fetched_at"] = now
+    return entries
+
+
+def _catalog_entry(upstream: str, bare: str) -> dict[str, Any] | None:
+    by_key = _catalog_by_key()
+    entry = by_key.get((upstream, bare))
+    if entry is None:
+        for (up, model), entry in by_key.items():
+            if model == bare or model.endswith("/" + bare):
+                return entry
+    return entry
+
+
+def _decorate(display: str, entry: dict[str, Any] | None) -> str:
+    """Embed price/eval/pareto into the picker label (no web rebuild needed)."""
+    if not entry:
+        return display
+    in_usd = float(entry.get("input_usd_per_million") or 0)
+    out_usd = float(entry.get("output_usd_per_million") or 0)
+    price = "free" if in_usd == 0 and out_usd == 0 else f"${in_usd + out_usd:.2f}/M"
+    bits = [price]
+    if entry.get("eval_score") is not None:
+        bits.append(f"{round(float(entry['eval_score']) * 100)}%")
+    if entry.get("avg_latency_s") is not None:
+        bits.append(f"{float(entry['avg_latency_s']):.1f}s")
+    if entry.get("pareto"):
+        bits.append("\u2605")
+    return display + "  [" + " \u00b7 ".join(bits) + "]"
+
+
 
 def _gateway_token() -> str | None:
     try:
@@ -131,12 +191,17 @@ def llmq_opencode_models(force: bool = False) -> list[dict[str, Any]]:
         live = _fetch_llmq_models()
         prices = _price_map()
         rows: list[dict[str, Any]] = []
+        catalog_by_key = _catalog_by_key()
         for m in live:
             bare = str(m["id"])
+            entry = catalog_by_key.get((_UPSTREAM, bare))
             row: dict[str, Any] = {
                 "id": f"{_UPSTREAM}/{bare}",
                 "bare_id": bare,
                 "pricing": prices.get(bare),
+                "eval_score": (entry or {}).get("eval_score"),
+                "pareto": bool((entry or {}).get("pareto")),
+                "avg_latency_s": (entry or {}).get("avg_latency_s"),
             }
             rows.append(row)
         _cache["fetched_at"] = now
@@ -192,11 +257,53 @@ def merge_llmq_pricing(cli_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "id": display,
                 "model": llmq_row["bare_id"],
                 "providerID": _UPSTREAM,
-                "displayName": display,
+                "displayName": _decorate(
+                    display, _catalog_entry(_UPSTREAM, llmq_row["bare_id"])
+                ),
                 "name": llmq_row["bare_id"],
                 "isDefault": False,
                 "pricing": llmq_row.get("pricing"),
+                "eval_score": llmq_row.get("eval_score"),
+                "pareto": llmq_row.get("pareto"),
+                "avg_latency_s": llmq_row.get("avg_latency_s"),
                 "source": "llmq",
             }
         )
+
+    # Cross-upstream pareto rows from the llmq catalog: curated to the
+    # frontier so the picker stays navigable (the go lane rows above carry
+    # their own catalog enrichment).
+    try:
+        catalog_entries = _catalog_by_key()
+        go_bare = {r["bare_id"] for r in llmq_rows}
+        appended_ids = {str(r.get("id") or "") for r in rows}
+        for (upstream, model), entry in catalog_entries.items():
+            if upstream == _UPSTREAM or model in go_bare:
+                continue
+            if not entry.get("pareto"):
+                continue
+            full = f"{upstream}/{model}"
+            if full in appended_ids:
+                continue
+            in_usd = float(entry.get("input_usd_per_million") or 0)
+            out_usd = float(entry.get("output_usd_per_million") or 0)
+            price = {"input_per_million_usd": in_usd,
+                     "cached_input_per_million_usd": float(entry.get("cached_input_per_million_usd") or 0),
+                     "output_per_million_usd": out_usd}
+            decorated = _decorate(full, entry)
+            rows.append({
+                "id": full,
+                "model": model,
+                "providerID": upstream,
+                "displayName": decorated,
+                "name": model,
+                "isDefault": False,
+                "pricing": price,
+                "eval_score": entry.get("eval_score"),
+                "pareto": True,
+                "source": "llmq-catalog",
+            })
+            appended_ids.add(full)
+    except Exception:  # noqa: BLE001 - the picker must render without llmq
+        pass
     return rows

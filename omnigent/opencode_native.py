@@ -68,6 +68,13 @@ _logger = logging.getLogger(__name__)
 # ``wrapper_agent_name`` and the web native registry).
 _AGENT_NAME = "opencode-native-ui"
 
+# Personal-cloud MCP stdio bridge installed by the agent fleet. Declared on the
+# generated spec so the server translates it into the session's opencode ``mcp``
+# block (the per-session XDG config otherwise hides the user's global entry).
+_PERSONAL_CLOUD_STDIO_BRIDGE = (
+    "/home/oz/.local/libexec/oz-agent-fleet/personal-cloud-stdio-bridge"
+)
+
 
 def _materialize_opencode_agent_spec(
     tmpdir: Path,
@@ -108,6 +115,18 @@ def _materialize_opencode_agent_spec(
         # is a non-empty ``terminals:`` block on this spec). Its command
         # follows the user's ``$SHELL`` (zsh/fish/bash).
         "terminals": native_shell_terminal_spec(),
+        # The per-session XDG_CONFIG_HOME override hides the user's global
+        # ~/.config/opencode/opencode.json, so the personal-cloud MCP declared
+        # there never reaches the session. Declare it on the agent spec: the
+        # runner translates ``mcp_servers`` into opencode's ``mcp`` block
+        # (see _opencode_native_mcp_servers_from_spec). Only declared servers
+        # reach the synthesized config; the global mcp block is not inherited.
+        "tools": {
+            "personal-cloud": {
+                "type": "mcp",
+                "command": _PERSONAL_CLOUD_STDIO_BRIDGE,
+            },
+        },
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path
