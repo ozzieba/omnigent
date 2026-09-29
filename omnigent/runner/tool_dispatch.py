@@ -2883,6 +2883,8 @@ def _build_session_create_body(
     message: object,
     model: object = None,
     reasoning_effort: object = None,
+    host_id: object = None,
+    workspace: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2910,6 +2912,12 @@ def _build_session_create_body(
         written as ``model_override`` on the session.
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
+    :param host_id: Optional host to bind the child to, e.g. a dedicated
+        harness host. The server then launches the child's own runner on
+        that host instead of co-locating it on the caller's runner, and
+        validates ``workspace`` against the agent's ``os_env`` there.
+    :param workspace: Absolute workspace path on ``host_id``; sent only
+        together with ``host_id``.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2922,6 +2930,10 @@ def _build_session_create_body(
         body["model_override"] = model
     if isinstance(reasoning_effort, str) and reasoning_effort:
         body["reasoning_effort"] = reasoning_effort
+    if isinstance(host_id, str) and host_id:
+        body["host_id"] = host_id
+        if isinstance(workspace, str) and workspace:
+            body["workspace"] = workspace
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -3073,6 +3085,16 @@ async def _execute_session_create(
                     )
                 }
             )
+        if args.get("host_id") is not None or args.get("workspace") is not None:
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create 'host_id'/'workspace' are supported "
+                        "only with 'agent_id'; the 'config_path' create cannot "
+                        "carry a host binding."
+                    )
+                }
+            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -3089,6 +3111,8 @@ async def _execute_session_create(
         args.get("message"),
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
+        host_id=args.get("host_id"),
+        workspace=args.get("workspace"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
