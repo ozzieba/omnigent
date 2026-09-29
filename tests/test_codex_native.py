@@ -819,17 +819,22 @@ def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> 
     }
     assert codex_native_app_server.build_codex_remote_args(
         codex_args=tuple(args),
-        thread_id="thread_x",
+        thread_id=None,
         remote_url="ws://127.0.0.1:9876",
     ) == [
         *args,
         "-c",
         'approval_policy="never"',
-        "resume",
         "--remote",
         "ws://127.0.0.1:9876",
-        "thread_x",
     ]
+    # A remote resume carries none of them: codex rejects permission
+    # overrides there, and the app-server resume params above apply them.
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=tuple(args),
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+    ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_x"]
 
 
 def _started_event(turn_id: str) -> dict[str, Any]:
@@ -1422,6 +1427,121 @@ def test_build_codex_remote_args_bypass_hook_trust_with_resume() -> None:
     assert args[0] == "--dangerously-bypass-hook-trust"
     assert "resume" in args
     assert args.index("--dangerously-bypass-hook-trust") < args.index("resume")
+
+
+_PERSISTED_PERMISSION_LAUNCH_ARGS = (
+    "-c",
+    'default_permissions=":workspace"',
+    "-c",
+    'approval_policy="on-request"',
+    "-c",
+    'approvals_reviewer="auto_review"',
+)
+_MODEL_PROVIDER_OVERRIDES = (
+    'model="catalog-databricks-openai-default"',
+    'model_provider="omnigent_databricks"',
+)
+
+
+def test_build_codex_remote_args_resume_strips_permission_overrides() -> None:
+    """
+    A remote resume drops every permission override but keeps the rest.
+
+    Codex 0.156.1 aborts ``codex ... resume --remote ws://... <thread>`` with
+    "Permission overrides are not supported when resuming a remote task"
+    when the argv carries the session's persisted permission launch args,
+    so the tmux pane dies and the web UI shows no terminal. Model/provider
+    ``-c`` overrides and ``--dangerously-bypass-hook-trust`` are not
+    permission overrides and must survive, or the TUI falls back to the
+    OpenAI login screen / hook-review prompt.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(
+            *_PERSISTED_PERMISSION_LAUNCH_ARGS,
+            "--sandbox",
+            "workspace-write",
+            "-a=on-request",
+            "--config",
+            'sandbox_mode="read-only"',
+            "--config=approval_policy=never",
+            "-c",
+            'model_reasoning_effort="high"',
+        ),
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=_MODEL_PROVIDER_OVERRIDES,
+        bypass_hook_trust=True,
+    )
+
+    assert args == [
+        "-c",
+        'model="catalog-databricks-openai-default"',
+        "-c",
+        'model_provider="omnigent_databricks"',
+        "--dangerously-bypass-hook-trust",
+        "-c",
+        'model_reasoning_effort="high"',
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_x",
+    ]
+
+
+def test_build_codex_remote_args_fresh_launch_keeps_permission_overrides() -> None:
+    """A fresh (non-resume) launch still passes the permission args through."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(*_PERSISTED_PERMISSION_LAUNCH_ARGS, "--sandbox", "workspace-write"),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=_MODEL_PROVIDER_OVERRIDES,
+        bypass_hook_trust=True,
+    )
+
+    assert args == [
+        "-c",
+        'model="catalog-databricks-openai-default"',
+        "-c",
+        'model_provider="omnigent_databricks"',
+        "--dangerously-bypass-hook-trust",
+        *_PERSISTED_PERMISSION_LAUNCH_ARGS,
+        "--sandbox",
+        "workspace-write",
+        "--remote",
+        "ws://127.0.0.1:9876",
+    ]
+
+
+@pytest.mark.parametrize("thread_id", [None, "thread_x"])
+def test_build_codex_remote_args_bypass_sandbox_unchanged_by_resume_strip(
+    thread_id: str | None,
+) -> None:
+    """
+    ``bypass_sandbox=True`` keeps its single bypass flag on both paths.
+
+    The resume strip must not remove ``--dangerously-bypass-approvals-and-
+    sandbox`` or the provider overrides; the bypass path's own stripping of
+    ``--sandbox`` / ``--ask-for-approval`` is unchanged.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=("--sandbox", "danger-full-access", "--ask-for-approval", "never"),
+        thread_id=thread_id,
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=_MODEL_PROVIDER_OVERRIDES,
+        bypass_sandbox=True,
+    )
+
+    tail = ["--remote", "ws://127.0.0.1:9876"]
+    if thread_id is not None:
+        tail = ["resume", *tail, thread_id]
+    assert args == [
+        "-c",
+        'model="catalog-databricks-openai-default"',
+        "-c",
+        'model_provider="omnigent_databricks"',
+        "--dangerously-bypass-approvals-and-sandbox",
+        *tail,
+    ]
 
 
 def test_build_codex_remote_args_bypass_hook_trust_default_false() -> None:
@@ -8622,6 +8742,9 @@ def test_launch_codex_terminal_uses_remote_resume_order() -> None:
     Terminal launch uses the Codex resume subcommand with ``--remote``
     before the thread id, matching Codex CLI parsing coverage.
 
+    Global ``-c`` overrides precede ``resume``; permission overrides are
+    not used here because codex rejects them on a remote resume.
+
     :returns: None.
     """
     client = _FakeTerminalClient(httpx.Response(200, json={"id": "terminal_codex_main"}))
@@ -8630,7 +8753,7 @@ def test_launch_codex_terminal_uses_remote_resume_order() -> None:
         codex_native._launch_codex_terminal(
             client,  # type: ignore[arg-type]
             "conv_abc",
-            codex_args=("-c", "approval_policy=on-request"),
+            codex_args=("-c", "model_reasoning_effort=high"),
             command="/opt/codex/bin/codex",
             thread_id="thread_123",
             remote_url="ws://127.0.0.1:9876",
@@ -8649,7 +8772,7 @@ def test_launch_codex_terminal_uses_remote_resume_order() -> None:
                     "command": "/opt/codex/bin/codex",
                     "args": [
                         "-c",
-                        "approval_policy=on-request",
+                        "model_reasoning_effort=high",
                         "resume",
                         "--remote",
                         "ws://127.0.0.1:9876",
