@@ -41,8 +41,13 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: main
-          sparse-checkout: .github/scripts/maintainer_approval.py
+          sparse-checkout: |
+            .github/scripts/maintainer_approval.py
+            .github/scripts/maintainer_approval_test.py
+            .github/scripts/trusted_ci_api.py
+            .github/scripts/trusted_ci_api_test.py
           sparse-checkout-cone-mode: false
+          persist-credentials: false
 
       - name: Require maintainer approval
         env:
@@ -50,6 +55,8 @@ jobs:
           REPO:     ${{ github.repository }}
           PR:       ${{ github.event.pull_request.number }}
         run: |
+          python3 .github/scripts/trusted_ci_api_test.py
+          python3 .github/scripts/maintainer_approval_test.py
           python3 .github/scripts/maintainer_approval.py \
             --repository "$REPO" \
             --pr-number "$PR" \

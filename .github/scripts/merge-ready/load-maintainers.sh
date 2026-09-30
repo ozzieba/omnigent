@@ -18,7 +18,8 @@
 set -euo pipefail
 
 set +e
-CONTENT_B64=$(gh api "repos/$REPO/contents/.github/MAINTAINER?ref=main" --jq '.content' 2>/dev/null)
+CONTENT_B64=$(python3 .github/scripts/trusted_ci_api.py GET \
+  "repos/$REPO/contents/.github/MAINTAINER?ref=main" 2>/dev/null | jq -r '.content // empty')
 RC=$?
 set -e
 

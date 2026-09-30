@@ -74,7 +74,8 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.LLM_API_KEY }}
           E2E_UI_JUDGE_MODEL: ${{ vars.OMNIGENT_CI_E2E_JUDGE_MODEL }}
         run: |
-          : "${E2E_UI_JUDGE_MODEL:?Set OMNIGENT_CI_E2E_JUDGE_MODEL repository variable}"
+          python3 .github/scripts/trusted_ci_api_test.py
+          python3 .github/scripts/e2e-ui-required/check_test.py
           bash .github/scripts/e2e-ui-required/check.sh
 
       # Merge Ready (the single required gating check) does NOT re-evaluate when
@@ -92,5 +93,8 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          gh workflow run merge-ready.yml -R "$REPO" -f pr="$PR" \
+          dispatch_body=$(jq -n --arg pr "$PR" '{ref:"main",inputs:{pr:$pr}}')
+          python3 .github/scripts/trusted_ci_api.py POST \
+            "repos/$REPO/actions/workflows/merge-ready.yml/dispatches" \
+            --body "$dispatch_body" \
             || echo "::warning::could not dispatch Merge Ready re-evaluation for #$PR"

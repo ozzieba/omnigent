@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import argparse
 import base64
-import json
-import subprocess
-from collections.abc import Callable
+import os
 from dataclasses import dataclass
 from typing import Any
+
+from trusted_ci_api import TrustedCIAPI, api_base
 
 DECISIVE_REVIEW_STATES = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
 
@@ -133,27 +133,8 @@ def trusted_automatic_dismissal(
     return False
 
 
-def gh_json(arguments: list[str]) -> Any:
-    completed = subprocess.run(["gh", *arguments], check=True, capture_output=True, text=True)
-    return json.loads(completed.stdout)
-
-
-def paginated(endpoint: str, request: Callable[[list[str]], Any] = gh_json) -> list[dict]:
-    items: list[dict] = []
-    separator = "&" if "?" in endpoint else "?"
-    page = 1
-    while True:
-        value = request(["api", f"{endpoint}{separator}per_page=100&page={page}"])
-        if not isinstance(value, list):
-            raise TypeError(f"expected list response, got {type(value).__name__}")
-        items.extend(value)
-        if len(value) < 100:
-            return items
-        page += 1
-
-
-def maintainers(repository: str) -> set[str]:
-    value = gh_json(["api", f"repos/{repository}/contents/.github/MAINTAINER?ref=main"])
+def maintainers(repository: str, api: TrustedCIAPI) -> set[str]:
+    value = api.get(f"repos/{repository}/contents/.github/MAINTAINER?ref=main")
     content = base64.b64decode(value["content"]).decode()
     return {
         token.casefold()
@@ -170,21 +151,34 @@ def main() -> int:
     parser.add_argument("--trusted-successor", action="append", default=[])
     args = parser.parse_args()
 
-    pull = gh_json(["api", f"repos/{args.repository}/pulls/{args.pr_number}"])
-    reviews = paginated(f"repos/{args.repository}/pulls/{args.pr_number}/reviews")
-    commits = paginated(f"repos/{args.repository}/pulls/{args.pr_number}/commits")
-    timeline = paginated(f"repos/{args.repository}/issues/{args.pr_number}/timeline")
-    decision = approval_decision(
-        repository=args.repository,
-        author=str((pull.get("user") or {}).get("login") or ""),
-        head_repository=str(((pull.get("head") or {}).get("repo") or {}).get("full_name") or ""),
-        head_sha=str((pull.get("head") or {}).get("sha") or ""),
-        maintainers=maintainers(args.repository),
-        trusted_successors=set(args.trusted_successor),
-        reviews=reviews,
-        commits=commits,
-        timeline=timeline,
-    )
+    try:
+        api = TrustedCIAPI(os.environ.get("GH_TOKEN", ""), api_base())
+        pull = api.get(f"repos/{args.repository}/pulls/{args.pr_number}")
+        reviews = api.paginate(
+            f"repos/{args.repository}/pulls/{args.pr_number}/reviews?per_page=100&page=1"
+        )
+        commits = api.paginate(
+            f"repos/{args.repository}/pulls/{args.pr_number}/commits?per_page=100&page=1"
+        )
+        timeline = api.paginate(
+            f"repos/{args.repository}/issues/{args.pr_number}/timeline?per_page=100&page=1"
+        )
+        decision = approval_decision(
+            repository=args.repository,
+            author=str((pull.get("user") or {}).get("login") or ""),
+            head_repository=str(
+                ((pull.get("head") or {}).get("repo") or {}).get("full_name") or ""
+            ),
+            head_sha=str((pull.get("head") or {}).get("sha") or ""),
+            maintainers=maintainers(args.repository, api),
+            trusted_successors=set(args.trusted_successor),
+            reviews=reviews,
+            commits=commits,
+            timeline=timeline,
+        )
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+        print(f"::error::Could not evaluate maintainer approval: {exc}")
+        return 1
     if decision.approved:
         print(decision.reason)
         return 0

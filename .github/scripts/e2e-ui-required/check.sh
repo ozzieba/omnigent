@@ -48,8 +48,9 @@ fail() { echo "::error::$1"; exit 1; }
 pass() { echo "$1"; exit 0; }
 
 # --- 1. Changed files (REST, paginated -- robust for large PRs) -----------
-FILES=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
-  --jq '.[] | [.status, .filename] | @tsv')
+FILES=$(python3 .github/scripts/trusted_ci_api.py GET --paginate \
+  "repos/$REPO/pulls/$PR/files?per_page=100&page=1" \
+  | jq -r '.[] | [.status, .filename] | @tsv')
 
 touches_ui=false
 while IFS=$'\t' read -r fstatus path; do
@@ -80,10 +81,10 @@ MAX_BLOB_BYTES=60000
 # can crowd the other out, listing the test patches first.
 E2E_UI_BUDGET=$((MAX_BLOB_BYTES / 2))
 
-# `gh api --paginate` (no --jq) merges all pages into one JSON array; capture it
-# once and feed it to jq per category so --argjson reaches jq (gh api itself has
-# no --argjson flag).
-FILES_JSON=$(gh api "repos/$REPO/pulls/$PR/files" --paginate)
+# Capture all changed files once through the runner-configured REST API and feed
+# the JSON to jq per category so each patch budget is applied independently.
+FILES_JSON=$(python3 .github/scripts/trusted_ci_api.py GET --paginate \
+  "repos/$REPO/pulls/$PR/files?per_page=100&page=1")
 
 # Emit the truncated "=== status filename ===\n<patch>" block for every file
 # whose path starts with the given prefix.
@@ -113,7 +114,14 @@ AP_BUDGET=$(( MAX_BLOB_BYTES - ${#E2E_BLOB} ))
 AP_BLOB=${AP_BLOB:0:$AP_BUDGET}
 DIFF_BLOB="${E2E_BLOB}"$'\n'"${AP_BLOB}"
 
-PR_TITLE=$(gh pr view "$PR" --repo "$REPO" --json title --jq '.title')
+PR_TITLE=$(python3 .github/scripts/trusted_ci_api.py GET \
+  "repos/$REPO/pulls/$PR" | jq -r '.title')
+
+# Non-UI changes passed above without needing a model or judge call. UI changes
+# remain fail-closed when an explicit bounded judge configuration is absent.
+: "${E2E_UI_JUDGE_MODEL:?Set OMNIGENT_CI_E2E_JUDGE_MODEL repository variable}"
+: "${OPENAI_BASE_URL:?Set the bounded E2E judge gateway URL}"
+: "${OPENAI_API_KEY:?Set the bounded E2E judge credential}"
 
 SYSTEM_PROMPT='You are a CI gate that decides whether a pull request needs a browser end-to-end UI test.
 
@@ -175,8 +183,8 @@ fi
 echo "e2e_ui judge -> test required: $REASON"
 
 # --- 3. Skip label present? -----------------------------------------------
-HAS_LABEL=$(gh api "repos/$REPO/pulls/$PR" \
-  --jq '[.labels[].name] | index("skip-e2e-ui-test") != null')
+HAS_LABEL=$(python3 .github/scripts/trusted_ci_api.py GET \
+  "repos/$REPO/pulls/$PR" | jq -r '[.labels[].name] | index("skip-e2e-ui-test") != null')
 if [[ "$HAS_LABEL" != "true" ]]; then
   fail "This PR changes UI behavior (web/**) without a tests/e2e_ui/** test that covers it: $REASON. Add a UI test, or have a maintainer apply the 'skip-e2e-ui-test' label after reviewing your local-run proof."
 fi
@@ -188,7 +196,8 @@ fi
 
 MAINTAINERS_LC=$(echo "$MAINTAINERS" | tr '[:upper:]' '[:lower:]')
 
-AUTHOR=$(gh pr view "$PR" --repo "$REPO" --json author --jq '.author.login')
+AUTHOR=$(python3 .github/scripts/trusted_ci_api.py GET \
+  "repos/$REPO/pulls/$PR" | jq -r '.user.login')
 AUTHOR_LC=$(echo "$AUTHOR" | tr '[:upper:]' '[:lower:]')
 for m in $MAINTAINERS_LC; do
   if [[ "$m" == "$AUTHOR_LC" ]]; then
@@ -199,8 +208,9 @@ done
 # Latest decisive (non-COMMENTED) review per user; effective if a maintainer's
 # latest such review is APPROVED. Matches GitHub's UI: a later COMMENTED review
 # doesn't supersede an approval, but CHANGES_REQUESTED or DISMISSED does.
-APPROVERS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-  --jq '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
+APPROVERS=$(python3 .github/scripts/trusted_ci_api.py GET --paginate \
+  "repos/$REPO/pulls/$PR/reviews?per_page=100&page=1" \
+  | jq -r '[.[] | select(.state != "COMMENTED")] | group_by(.user.login) | map(max_by(.submitted_at)) | .[] | select(.state == "APPROVED") | .user.login')
 for u in $APPROVERS; do
   u_lc=$(echo "$u" | tr '[:upper:]' '[:lower:]')
   for m in $MAINTAINERS_LC; do
