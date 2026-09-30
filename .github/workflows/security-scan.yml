@@ -101,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$PR" =~ ^[0-9]+$ ]]
-          if [[ "${GITHUB_API_URL:-}" == */api/v1 ]]; then
+          if [[ -z "${GITHUB_API_URL:-}" || "$GITHUB_API_URL" == */api/v1 ]]; then
             diff_path="repos/$REPO/pulls/$PR.diff"
           else
             diff_path="repos/$REPO/pulls/$PR"
