@@ -331,7 +331,9 @@ jobs:
       - name: Install system MySQL client library
         run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
       - name: Install dependencies
-        run: uv sync --locked --extra all --group test --extra databricks && uv pip install mysqlclient
+        run: uv sync --locked --extra all --group test --extra databricks && uv pip install --python .venv/bin/python mysqlclient
+      - name: Verify MySQL driver in project environment
+        run: .venv/bin/python -c "import MySQLdb"
       - name: Run store + DB tests against MySQL
         env:
           OMNIGENT_TEST_DB_URI: mysql+mysqldb://root:omnigent@127.0.0.1:3306/omnigent_root
