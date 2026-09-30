@@ -53,7 +53,11 @@ jobs:
           sparse-checkout: |
             .github/scripts/security-scan
             .github/scripts/merge-ready
+            .github/scripts/trusted_ci_api.py
+            .github/scripts/trusted_ci_api_test.py
+            .github/actions/setup-uv
             .github/security
+          sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Load maintainers
@@ -84,6 +88,8 @@ jobs:
             echo "reason=scanner absent on main (bootstrap)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          python3 .github/scripts/trusted_ci_api_test.py
+          python3 .github/scripts/security-scan/should-scan_test.py
           bash .github/scripts/security-scan/should-scan.sh
 
       - name: Fetch PR diff
@@ -93,8 +99,19 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          gh pr diff "$PR" --repo "$REPO" > "$GITHUB_WORKSPACE/pr.diff"
-          gh pr diff "$PR" --repo "$REPO" --name-only > "$GITHUB_WORKSPACE/changed.txt"
+          set -euo pipefail
+          [[ "$PR" =~ ^[0-9]+$ ]]
+          if [[ "${GITHUB_API_URL:-}" == */api/v1 ]]; then
+            diff_path="repos/$REPO/pulls/$PR.diff"
+          else
+            diff_path="repos/$REPO/pulls/$PR"
+          fi
+          python3 .github/scripts/trusted_ci_api.py GET --raw \
+            --accept application/vnd.github.v3.diff "$diff_path" \
+            > "$GITHUB_WORKSPACE/pr.diff"
+          python3 .github/scripts/trusted_ci_api.py GET --paginate \
+            "repos/$REPO/pulls/$PR/files?per_page=100&page=1" \
+            | jq -r '.[].filename' > "$GITHUB_WORKSPACE/changed.txt"
           echo "Changed files:"; cat "$GITHUB_WORKSPACE/changed.txt"
 
       - name: Secret scan (added lines)
@@ -130,9 +147,15 @@ jobs:
           CHANGED_FILES: ${{ github.workspace }}/changed.txt
         run: python3 "$GITHUB_WORKSPACE/.github/scripts/security-scan/lint-workflow-misuse.py"
 
+      - name: Set up Python for uv
+        if: ${{ steps.gate.outputs.scan == 'true' }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
 
       - name: OSV advisory scan (uv.lock)
         # Checks every package version pinned in the PR's uv.lock against the

@@ -53,6 +53,28 @@ class TrustedCIAPITests(unittest.TestCase):
         self.assertEqual(seen[0].full_url, "https://forge.example/api/v1/repos/o/r/pulls/1")
         self.assertEqual(seen[0].get_header("Authorization"), "Bearer test-token")
 
+    def test_raw_request_preserves_diff_body_and_accept_header(self):
+        seen: list[Request] = []
+
+        class RawResponse(Response):
+            def __init__(self, body: bytes) -> None:
+                self.raw = body
+                self.headers = Message()
+
+        def opener(request, timeout):
+            self.assertEqual(timeout, 30)
+            seen.append(request)
+            return RawResponse(b"diff --git a/file b/file\n+line\n")
+
+        api = TrustedCIAPI("test-token", "https://forge.example/api/v1", opener)
+        raw = api.get_raw(
+            "repos/o/r/pulls/1.diff", "application/vnd.github.v3.diff"
+        )
+        self.assertEqual(raw, b"diff --git a/file b/file\n+line\n")
+        self.assertEqual(
+            seen[0].get_header("Accept"), "application/vnd.github.v3.diff"
+        )
+
     def test_pagination_stays_under_api_prefix_and_combines_pages(self):
         calls: list[str] = []
 

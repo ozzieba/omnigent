@@ -60,10 +60,11 @@ jobs:
       - name: Check uv.lock uses the public PyPI index
         run: python scripts/normalize_uv_lock_registry.py --check uv.lock
 
+      - name: Test pinned uv bootstrap
+        run: python3 .github/actions/setup-uv/test_install.py
+
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
-        with:
-          enable-cache: true
+        uses: ./.github/actions/setup-uv
 
       - name: Cache virtualenv
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4

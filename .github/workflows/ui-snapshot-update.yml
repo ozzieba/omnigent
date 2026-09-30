@@ -52,9 +52,8 @@ jobs:
       github.event.label.name == 'update-ui-snapshot' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    # Same digest-pinned image as the compare gate, so the regenerated baseline
-    # is byte-identical to what ui-snapshot.yml will then compare against. Keep
-    # this digest in lockstep with ui-snapshot.yml and regen_baseline_docker.sh.
+    # Exact same digest-pinned Playwright Python image as the compare gate and
+    # local regen script, so regenerated baselines are byte-identical.
     container:
       image: mcr.microsoft.com/playwright/python:v1.60.0-noble@sha256:8ff591d613b01c884cc488339ed4318b4513eaf0c57a164a878ba49e70e3f384
     # GitHub defaults `run:` steps inside a container to `sh` (dash); force bash
@@ -68,10 +67,24 @@ jobs:
       # The pinned image runs as root, where Chromium needs --no-sandbox; the
       # e2e_ui conftest adds it (+ --disable-dev-shm-usage) when this is set.
       OMNIGENT_PW_NO_SANDBOX: "1"
-      # Use the image's Python 3.12 (matches .python-version) rather than a uv
-      # download -- no setup-python step needed inside the container.
+      # Use the image's Python 3.12 (matches .python-version).
       UV_PYTHON_PREFERENCE: only-system
     steps:
+      # Actions' JS steps need a Node binary before checkout. Bootstrap the
+      # pinned Node 24 runtime with a verified upstream archive.
+      - name: Install Node.js action runtime
+        run: |
+          set -euo pipefail
+          node_version=24.15.0
+          node_archive="node-v${node_version}-linux-x64.tar.gz"
+          node_home="${RUNNER_TEMP}/node-${node_version}"
+          mkdir -p "$node_home"
+          curl -fsSL "https://nodejs.org/dist/v${node_version}/${node_archive}" -o "${RUNNER_TEMP}/${node_archive}"
+          echo "44836872d9aec49f1e6b52a9a922872db9a2b02d235a616a5681b6a85fec8d89  ${RUNNER_TEMP}/${node_archive}" | sha256sum --check
+          tar -xzf "${RUNNER_TEMP}/${node_archive}" --strip-components=1 -C "$node_home"
+          echo "$node_home/bin" >> "$GITHUB_PATH"
+          "$node_home/bin/node" --version
+
       - name: Checkout PR branch
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
@@ -80,13 +93,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           persist-credentials: false
 
-      # The pinned Playwright image doesn't ship Node, so install Node before
-      # the pnpm action (pnpm/action-setup's self-installer needs a Node binary).
-      - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-
       - name: Install pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
@@ -94,9 +100,7 @@ jobs:
           standalone: true
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
-        with:
-          enable-cache: true
+        uses: ./.github/actions/setup-uv
 
       - name: Cache virtualenv
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
@@ -143,7 +147,7 @@ jobs:
         run: tar -czf "$RUNNER_TEMP/ui-snapshots.tgz" tests/e2e_ui/visual/snapshots
 
       - name: Upload regenerated baselines
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: ui-snapshot-update-${{ github.run_id }}
           path: ${{ runner.temp }}/ui-snapshots.tgz
@@ -177,7 +181,7 @@ jobs:
 
       - name: Download regenerated baselines
         if: needs.render.result == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: https://code.forgejo.org/forgejo/download-artifact@246d7188e736d3686f6d19628d253ede9697bd55  # Forgejo v3-node20
         with:
           name: ui-snapshot-update-${{ github.run_id }}
           path: _ui_snapshot_artifact

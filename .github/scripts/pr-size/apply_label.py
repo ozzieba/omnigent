@@ -50,7 +50,7 @@ def main() -> int:
         pr_number = int(os.environ["PR_NUMBER"])
         print(f"Computed: {apply_label(api, repo, pr_number)}")
         return 0
-    except (KeyError, ValueError, RuntimeError) as exc:
+    except (KeyError, OSError, ValueError, RuntimeError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 1
 

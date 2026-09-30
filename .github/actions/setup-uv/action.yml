@@ -1,0 +1,7 @@
+name: Set up pinned uv
+description: Install the pinned uv wheel without using Forgejo's GitHub API compatibility endpoint.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash .github/actions/setup-uv/install.sh

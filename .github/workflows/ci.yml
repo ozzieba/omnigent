@@ -187,13 +187,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
-        with:
-          # An explicit release bypasses setup-uv's GitHub API lookup, which
-          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
-          version: 0.12.9
-          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
-          enable-cache: true
+        uses: ./.github/actions/setup-uv
 
       - name: Install ripgrep + bubblewrap + tmux
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
@@ -287,11 +281,8 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
-        with:
-          version: 0.12.9
-          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
-          enable-cache: true
+      - name: Set up uv
+        uses: ./.github/actions/setup-uv
       - name: Install dependencies
         run: uv sync --locked --extra all --group test --extra databricks
       - name: Run store + DB tests against PostgreSQL
@@ -335,11 +326,8 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
-        with:
-          version: 0.12.9
-          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
-          enable-cache: true
+      - name: Set up uv
+        uses: ./.github/actions/setup-uv
       - name: Install system MySQL client library
         run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
       - name: Install dependencies
@@ -377,11 +365,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
-        with:
-          version: 0.12.9
-          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
-          enable-cache: true
+        uses: ./.github/actions/setup-uv
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable

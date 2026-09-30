@@ -65,8 +65,11 @@ has_skip_label() {
   [[ -n "${GH_TOKEN:-}" && -n "${REPO:-}" && -n "${PR:-}" ]] || return 1
 
   local has_label
-  has_label=$(gh api "repos/$REPO/pulls/$PR" \
-    --jq "[.labels[].name] | index(\"$SKIP_LABEL\") != null" 2>/dev/null || echo "false")
+  has_label=$(python3 .github/scripts/trusted_ci_api.py GET \
+    "repos/$REPO/pulls/$PR" 2>/dev/null \
+    | jq -r --arg wanted_label "$SKIP_LABEL" \
+      '[.labels[].name] | index($wanted_label) != null' \
+    || echo "false")
   [[ "$has_label" == "true" ]]
 }
 
@@ -97,7 +100,8 @@ author_is_maintainer() {
 
   local maint_lc author_lc
   maint_lc=$(echo "$MAINTAINERS" | tr '[:upper:]' '[:lower:]')
-  author_lc=$(gh pr view "$PR" --repo "$REPO" --json author --jq '.author.login' 2>/dev/null \
+  author_lc=$(python3 .github/scripts/trusted_ci_api.py GET \
+    "repos/$REPO/pulls/$PR" 2>/dev/null | jq -r '.user.login // empty' \
     | tr '[:upper:]' '[:lower:]')
   [[ -n "$author_lc" ]] || return 1
   for m in $maint_lc; do

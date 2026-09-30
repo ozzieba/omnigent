@@ -58,7 +58,15 @@ class TrustedCIAPI:
         self.base_url = base_url.rstrip("/")
         self.opener = opener
 
-    def request(self, method: str, path: str, body: Any = None) -> tuple[Any, Any]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        accept: str = "application/json",
+        raw_response: bool = False,
+    ) -> tuple[Any, Any]:
         if path.startswith(("http://", "https://")):
             raise ValueError("absolute API request URLs are not allowed")
         relative = path.lstrip("/")
@@ -70,15 +78,22 @@ class TrustedCIAPI:
             data=data,
             method=method.upper(),
             headers={
-                "Accept": "application/json",
+                "Accept": accept,
                 "Authorization": f"Bearer {self.token}",
                 "Content-Type": "application/json",
             },
         )
         try:
             with self.opener(request, timeout=30) as response:
-                raw = response.read()
-                value = json.loads(raw.decode("utf-8")) if raw else None
+                response_body = response.read()
+                if raw_response:
+                    value = response_body
+                else:
+                    value = (
+                        json.loads(response_body.decode("utf-8"))
+                        if response_body
+                        else None
+                    )
                 return value, response.headers
         except urllib.error.HTTPError as error:
             # Never include response bodies, request headers, or URLs in logs.
@@ -86,6 +101,9 @@ class TrustedCIAPI:
 
     def get(self, path: str) -> Any:
         return self.request("GET", path)[0]
+
+    def get_raw(self, path: str, accept: str) -> bytes:
+        return self.request("GET", path, accept=accept, raw_response=True)[0]
 
     def paginate(self, path: str) -> list[Any]:
         result: list[Any] = []
@@ -119,19 +137,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("path")
     parser.add_argument("--paginate", action="store_true")
     parser.add_argument("--body", help="JSON request body")
+    parser.add_argument("--raw", action="store_true", help="write the response body unchanged")
+    parser.add_argument("--accept", default="application/json", help="Accept header for --raw")
     args = parser.parse_args(argv)
     try:
         client = TrustedCIAPI(os.environ.get("GH_TOKEN", ""), api_base())
         body = json.loads(args.body) if args.body is not None else None
+        if args.raw and (args.paginate or args.method != "GET" or body is not None):
+            raise ValueError("raw responses are available only for GET requests")
         if args.paginate:
             if args.method != "GET" or body is not None:
                 raise ValueError("pagination is available only for GET requests")
             result = client.paginate(args.path)
+        elif args.raw:
+            result = client.get_raw(args.path, args.accept)
         else:
             result, _ = client.request(args.method, args.path, body)
         if result is not None:
-            json.dump(result, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
+            if args.raw:
+                sys.stdout.buffer.write(result)
+            else:
+                json.dump(result, sys.stdout, separators=(",", ":"))
+                sys.stdout.write("\n")
         return 0
     except (OSError, ValueError, TypeError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
