@@ -136,3 +136,19 @@ def test_maintainer_authored_pr_still_passes():
         commits=[commit("new", "maintainer")],
     )
     assert decision.approved
+
+
+if __name__ == "__main__":
+    tests = [
+        test_current_head_approval_passes,
+        test_approval_survives_trusted_same_repo_successor_commits,
+        test_auto_dismissed_approval_survives_the_trusted_push_that_dismissed_it,
+        test_dismissed_approval_requires_a_trusted_matching_dismissal_event,
+        test_approval_does_not_survive_untrusted_or_fork_updates,
+        test_approval_does_not_survive_rewritten_history,
+        test_later_changes_requested_supersedes_approval,
+        test_maintainer_authored_pr_still_passes,
+    ]
+    for test in tests:
+        test()
+    print(f"{len(tests)} maintainer-approval tests passed")
