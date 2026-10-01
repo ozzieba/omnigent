@@ -56,6 +56,7 @@ class MainActivity : AppCompatActivity() {
     // Bridge-dependent work deferred until the page (and its injected emit
     // callbacks) exist — see onPageReady.
     private var pendingNavigatePath: String? = null
+
     // An OS-share text payload (ACTION_SEND EXTRA_TEXT, no attached file),
     // waiting for the same page-ready gate as pendingNavigatePath above. No
     // retry needed once emitted: the web layer persists it to sessionStorage
@@ -63,6 +64,7 @@ class MainActivity : AppCompatActivity() {
     // single delivery attempt is durable even if that page then navigates
     // away — unlike the file payload below, which has no such durable copy.
     private var pendingSharedTextValue: String? = null
+
     // An OS-share file payload already read off a worker thread, waiting for
     // the same page-ready gate as pendingNavigatePath above. NOT cleared on
     // emit — only on an explicit web-layer acknowledgement (see
@@ -705,7 +707,9 @@ class MainActivity : AppCompatActivity() {
                     list.orEmpty()
                 }
 
-                else -> emptyList()
+                else -> {
+                    emptyList()
+                }
             }
         if (uris.isNotEmpty()) {
             sharedFileReceiver.readAndQueue(uris) { json ->
