@@ -73,6 +73,8 @@ jobs:
       - name: Checkout (tags only)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
+          # Forgejo does not create refs/pull/N/merge; use the base commit for PRs.
+          ref: ${{ github.event.pull_request.base.sha || github.ref }}
           fetch-depth: 0
           sparse-checkout: .github/scripts/ci
           persist-credentials: false
