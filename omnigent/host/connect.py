@@ -2852,7 +2852,7 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=rows,
-                **({"error": "opencode model catalog is empty - see the host log"} if not rows else {}),
+                error="opencode model catalog is empty - see the host log" if not rows else None,
             )
 
         if harness != "claude-native":
