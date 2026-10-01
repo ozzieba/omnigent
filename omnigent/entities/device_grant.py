@@ -49,3 +49,5 @@ class DeviceGrant:
     expires_at: int
     approved_at: int | None
     last_polled_at: int | None
+    capability_json: str | None = None
+    approved_by_user_id: str | None = None

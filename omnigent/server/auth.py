@@ -34,7 +34,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from starlette.requests import HTTPConnection
 
@@ -468,6 +468,7 @@ class UnifiedAuthProvider(AuthProvider):
         # closed). Consulted only for delegated tokens (those carrying a
         # ``grant_id`` claim); left None disables the check.
         self._grant_revoked: Callable[[str], bool] | None = None
+        self._grant_context: Callable[[str], dict[str, Any] | None] | None = None
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -476,6 +477,12 @@ class UnifiedAuthProvider(AuthProvider):
             grant is revoked or unknown (fail closed).
         """
         self._grant_revoked = check
+
+    def set_grant_context_lookup(
+        self, lookup: Callable[[str], dict[str, Any] | None]
+    ) -> None:
+        """Wire live claim validation for restricted device grants."""
+        self._grant_context = lookup
 
     @property
     def login_url(self) -> str | None:
@@ -614,13 +621,41 @@ class UnifiedAuthProvider(AuthProvider):
                 return None
             if self._grant_revoked is not None and self._grant_revoked(grant_id):
                 return None
+            scope = payload.get("scope")
+            if scope == "slack-orchestrator":
+                from omnigent.server.slack_orchestrator_capability import path_allowed
+
+                actor = payload.get("act")
+                client_id = (
+                    actor.get("client_id")
+                    if isinstance(actor, dict) and set(actor) == {"client_id"}
+                    else None
+                )
+                if (
+                    self._grant_context is None
+                    or not path_allowed(str(request.scope.get("method", "")), request.url.path)
+                ):
+                    return None
+                context = self._grant_context(grant_id)
+                if context != {
+                    "client_id": client_id,
+                    "subject": user_id,
+                    "scope": scope,
+                }:
+                    return None
+                request.state.oauth_grant_id = grant_id
+                request.state.oauth_scope = scope
+                request.state.oauth_jti = payload.get("jti")
+                request.state.oauth_client_id = client_id
+                request.state.oauth_subject = user_id
+                return user_id
             # The allowlist restricts DELEGATED tokens — a third-party
             # client (e.g. Slack) acting on a user's behalf, marked by the
             # ``scope`` claim. A first-party login grant carries no scope:
             # its bearer is the user's own CLI/host, and the token renews
             # the session JWT it replaced, so it keeps that same authority
             # (still revocable via ``grant_id`` above).
-            if payload.get("scope") is not None and not delegated_path_allowed(request.url.path):
+            if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
             return user_id
 

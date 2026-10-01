@@ -208,6 +208,15 @@ from omnigent.server.schemas import (
     QuotaWaitInfo,
     SessionEventInput,
 )
+from omnigent.server.slack_orchestrator_capability import (
+    authorize_event as _authorize_capability_event,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    permitted_sessions as _capability_sessions,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    request_policy as _capability_policy,
+)
 from omnigent.session_lifecycle import (
     is_session_closed,
 )
@@ -491,6 +500,11 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        capability_policy = await _capability_policy(request, permission_store)
+        if capability_policy is not None:
+            raw_body = await request.json()
+            allowed = await _capability_sessions(request, capability_policy)
+            _authorize_capability_event(request, session_id, allowed, raw_body)
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store

@@ -31,7 +31,7 @@ from typing import cast
 from sqlalchemy import and_, delete, or_, update
 from sqlalchemy.engine import CursorResult
 
-from omnigent.db.db_models import SqlDeviceGrant, current_workspace_id
+from omnigent.db.db_models import SqlDeviceGrant, SqlDeviceGrantSession, current_workspace_id
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
 from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
 from omnigent.entities import DeviceGrant
@@ -67,6 +67,8 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         expires_at=row.expires_at,
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
+        capability_json=row.capability_json,
+        approved_by_user_id=row.approved_by_user_id,
     )
 
 
@@ -100,6 +102,7 @@ class DeviceGrantStore:
         client_id: str | None,
         created_at: int,
         expires_at: int,
+        capability_json: str | None = None,
     ) -> DeviceGrant:
         """Persist a new ``pending`` grant.
 
@@ -131,6 +134,8 @@ class DeviceGrantStore:
                 expires_at=expires_at,
                 approved_at=None,
                 last_polled_at=None,
+                capability_json=capability_json,
+                approved_by_user_id=None,
             )
             session.add(row)
             session.flush()
@@ -181,6 +186,8 @@ class DeviceGrantStore:
                 expires_at=created_at,
                 approved_at=created_at,
                 last_polled_at=None,
+                capability_json=None,
+                approved_by_user_id=None,
             )
             session.add(row)
             session.flush()
@@ -232,6 +239,7 @@ class DeviceGrantStore:
         grant_id: str,
         *,
         user_id: str,
+        approved_by_user_id: str | None = None,
         now_epoch_seconds: int,
     ) -> DeviceGrant | None:
         """Atomically bind a ``pending`` grant to an approving identity.
@@ -268,6 +276,7 @@ class DeviceGrantStore:
                         status=encode_device_grant_status("approved"),
                         user_id=user_id,
                         approved_at=now_epoch_seconds,
+                        approved_by_user_id=approved_by_user_id,
                     )
                 ),
             )
@@ -275,6 +284,47 @@ class DeviceGrantStore:
                 return None
             row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
             return _to_device_grant(row) if row is not None else None
+
+    def get_capability_json(self, grant_id: str) -> str | None:
+        """Return the immutable capability snapshot for a grant."""
+        with self._session("select_device_grant_capability") as session:
+            row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            return row.capability_json if row is not None else None
+
+    def get_auth_context(self, grant_id: str) -> dict[str, str | None] | None:
+        """Return non-secret claims used to validate a restricted token."""
+        with self._session("select_device_grant_auth_context") as session:
+            row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            if row is None:
+                return None
+            return {
+                "client_id": row.client_id,
+                "subject": row.user_id,
+                "scope": "slack-orchestrator" if row.capability_json is not None else None,
+            }
+
+    def list_capability_sessions(self, grant_id: str) -> list[str]:
+        """List sessions created under a restricted grant."""
+        with self._session("select_device_grant_sessions") as session:
+            rows = (
+                session.query(SqlDeviceGrantSession.session_id)
+                .filter(
+                    SqlDeviceGrantSession.workspace_id == current_workspace_id(),
+                    SqlDeviceGrantSession.grant_id == grant_id,
+                )
+                .all()
+            )
+            return [row[0] for row in rows]
+
+    def register_capability_session(self, grant_id: str, session_id: str) -> None:
+        """Idempotently bind a server-created session to its grant."""
+        with self._session("insert_device_grant_session") as session:
+            exists = session.get(
+                SqlDeviceGrantSession,
+                (current_workspace_id(), grant_id, session_id),
+            )
+            if exists is None:
+                session.add(SqlDeviceGrantSession(grant_id=grant_id, session_id=session_id))
 
     def deny(self, grant_id: str) -> bool:
         """Mark a ``pending`` grant ``denied``. Returns True if it flipped."""

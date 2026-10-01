@@ -63,6 +63,16 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.slack_orchestrator_capability import (
+    CLIENT_ID as SLACK_ORCHESTRATOR_CLIENT_ID,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    SCOPE as SLACK_ORCHESTRATOR_SCOPE,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    CapabilityPolicy,
+    policy_for_device_client,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -461,7 +471,12 @@ def create_oauth_token_router(
         # A first-party login grant renews with the SAME authority as the
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
-        scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
+        capability = device_grant_store.get_capability_json(grant_id)
+        scope = (
+            SLACK_ORCHESTRATOR_SCOPE
+            if capability is not None
+            else None if _is_login_grant(client_id) else DELEGATED_SCOPE
+        )
         return mint_delegated_token(
             user_id,
             cookie_secret,
@@ -673,6 +688,7 @@ def create_device_auth_router(
     _last_purge = {"at": 0.0}
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        capability = device_grant_store.get_capability_json(grant_id)
         return mint_delegated_token(
             user_id,
             cookie_secret,
@@ -681,6 +697,7 @@ def create_device_auth_router(
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
+            scope=SLACK_ORCHESTRATOR_SCOPE if capability is not None else DELEGATED_SCOPE,
         )
 
     # ── Device authorization (public) ─────────────────────────────
@@ -731,6 +748,11 @@ def create_device_auth_router(
                 "device/authorize: refused reserved client_id %r", LOGIN_GRANT_CLIENT_ID
             )
             return _oauth_error("invalid_request")
+        try:
+            capability_json = policy_for_device_client(client_id)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            _logger.error("device/authorize: invalid restricted-client policy: %s", exc)
+            return _oauth_error("invalid_client", status_code=401)
 
         device_code = secrets.token_urlsafe(32)
         grant_id = secrets.token_urlsafe(16)
@@ -743,6 +765,7 @@ def create_device_auth_router(
             client_id=client_id,
             created_at=now,
             expires_at=now + _DEVICE_CODE_TTL_SECONDS,
+            capability_json=capability_json,
         )
         verification_uri = f"{base_url}/oauth/device"
         verification_uri_complete = f"{verification_uri}?user_code={user_code}"
@@ -881,9 +904,33 @@ def create_device_auth_router(
                 status_code=200,
             )
 
+        approved_user_id = user_id
+        approved_by_user_id = None
+        if grant.client_id == SLACK_ORCHESTRATOR_CLIENT_ID:
+            if grant.capability_json is None:
+                return HTMLResponse(
+                    _consent_html(error="This restricted request has no policy."),
+                    status_code=200,
+                )
+            try:
+                policy = CapabilityPolicy.from_json(grant.capability_json)
+            except (KeyError, TypeError, ValueError):
+                return HTMLResponse(
+                    _consent_html(error="This restricted request has an invalid policy."),
+                    status_code=200,
+                )
+            if user_id != policy.approver_subject:
+                return HTMLResponse(
+                    _consent_html(error="This request requires its configured approver."),
+                    status_code=403,
+                )
+            approved_user_id = policy.subject
+            approved_by_user_id = user_id
+
         approved = device_grant_store.approve(
             grant.id,
-            user_id=user_id,
+            user_id=approved_user_id,
+            approved_by_user_id=approved_by_user_id,
             now_epoch_seconds=now,
         )
         if approved is None:
@@ -897,7 +944,7 @@ def create_device_auth_router(
             grant.client_id,
         )
         return HTMLResponse(
-            _consent_html(approved_as=user_id),
+            _consent_html(approved_as=approved_user_id),
             status_code=200,
         )
 

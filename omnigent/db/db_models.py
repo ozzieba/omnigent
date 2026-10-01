@@ -584,6 +584,8 @@ class SqlDeviceGrant(OmnigentBase):
     expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    capability_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_by_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),
@@ -596,6 +598,26 @@ class SqlDeviceGrant(OmnigentBase):
         # digest; index both so those paths stay point lookups.
         Index("ix_device_grants_refresh_hash", "workspace_id", "refresh_token_hash"),
         Index("ix_device_grants_prev_refresh_hash", "workspace_id", "prev_refresh_token_hash"),
+    )
+
+
+class SqlDeviceGrantSession(OmnigentBase):
+    """Sessions created under a restricted device grant."""
+
+    __tablename__ = "device_grant_sessions"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    grant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "session_id", name="uq_device_grant_sessions_session"),
     )
 
 

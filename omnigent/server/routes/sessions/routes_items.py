@@ -41,6 +41,15 @@ from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
 )
+from omnigent.server.slack_orchestrator_capability import (
+    authorize_items as _authorize_capability_items,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    permitted_sessions as _capability_sessions,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    request_policy as _capability_policy,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -87,6 +96,10 @@ def register_items_routes(
         :returns: A :class:`PaginatedList` of conversation items.
         :raises OmnigentError: 404 if no session exists.
         """
+        capability_policy = await _capability_policy(request, permission_store)
+        if capability_policy is not None:
+            allowed = await _capability_sessions(request, capability_policy)
+            _authorize_capability_items(request, session_id, allowed)
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
