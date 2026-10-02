@@ -1712,26 +1712,28 @@ function HarnessConfigModal({
             </>
           )}
 
-          {!autoRouting && hasModelPicker && !hasPermission && entryHarness === "opencode-native" && (
-            <>
-              <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
-                <SearchableModelPicker
-                  value={modelValue}
-                  options={opencodeModelSelectOptions.map((m) => ({
-                    id: m.id,
-                    displayName: m.label,
-                  }))}
-                  loading={opencodeModelsLoading}
-                  onValueChange={onModelChange}
-                />
-              </ConfigRow>
-              <p className="text-xs text-muted-foreground">
-                Catalog resolved by the host: OpenCode's ambient CLI models plus
-                llmq-routed opencode-go models, with per-million prices where llmq
-                knows them.
-              </p>
-            </>
-          )}
+          {!autoRouting &&
+            hasModelPicker &&
+            !hasPermission &&
+            entryHarness === "opencode-native" && (
+              <>
+                <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
+                  <SearchableModelPicker
+                    value={modelValue}
+                    options={opencodeModelSelectOptions.map((m) => ({
+                      id: m.id,
+                      displayName: m.label,
+                    }))}
+                    loading={opencodeModelsLoading}
+                    onValueChange={onModelChange}
+                  />
+                </ConfigRow>
+                <p className="text-xs text-muted-foreground">
+                  Catalog resolved by the host: OpenCode's ambient CLI models plus llmq-routed
+                  opencode-go models, with per-million prices where llmq knows them.
+                </p>
+              </>
+            )}
 
           {!autoRouting && hasPermission && (
             <>
@@ -2408,10 +2410,8 @@ export function NewChatLandingScreen() {
     "pi-native",
     !sandboxSelected,
   );
-  const {
-    data: hostOpencodeModelOptions,
-    isLoading: hostOpencodeModelsLoading,
-  } = useHostModelOptions(selectedHostId, "opencode-native", !sandboxSelected);
+  const { data: hostOpencodeModelOptions, isLoading: hostOpencodeModelsLoading } =
+    useHostModelOptions(selectedHostId, "opencode-native", !sandboxSelected);
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
