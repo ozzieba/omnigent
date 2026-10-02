@@ -185,6 +185,24 @@ from omnigent.server.schemas import (
     SessionSwitchAgentRequest,
     UpdateSessionRequest,
 )
+from omnigent.server.slack_orchestrator_capability import (
+    GRANT_LABEL as _SLACK_ORCHESTRATOR_GRANT_LABEL,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    authorize_create as _authorize_capability_create,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    authorize_list as _authorize_capability_list,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    permitted_sessions as _capability_sessions,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    register_session as _register_capability_session,
+)
+from omnigent.server.slack_orchestrator_capability import (
+    request_policy as _capability_policy,
+)
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
 )
@@ -397,6 +415,20 @@ def register_core_routes(
 
         try:
             payload = await request.json()
+            capability_policy = await _capability_policy(request, permission_store)
+            if capability_policy is not None:
+                _authorize_capability_create(request, capability_policy, payload)
+                payload = dict(payload)
+                payload["labels"] = {
+                    **payload["labels"],
+                    _SLACK_ORCHESTRATOR_GRANT_LABEL: request.state.oauth_grant_id,
+                }
+            elif (
+                isinstance(payload, dict)
+                and isinstance(payload.get("labels"), dict)
+                and _SLACK_ORCHESTRATOR_GRANT_LABEL in payload["labels"]
+            ):
+                raise HTTPException(status_code=403, detail="reserved session label")
             # Dispatch on the VALUE, not key presence: a null project_id is
             # "no project", so it must keep the legacy request shape (and its
             # 422 contract) byte-identical to an absent key.
@@ -441,6 +473,8 @@ def register_core_routes(
             background_title_coordinator=background_title_coordinator,
             project_store=project_store,
         )
+        if capability_policy is not None:
+            await _register_capability_session(request, resp.id)
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
@@ -1053,6 +1087,11 @@ def register_core_routes(
         # with 401 instead (user_id stays None only when auth is
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
+        capability_policy = await _capability_policy(request, permission_store)
+        if capability_policy is not None:
+            _authorize_capability_list(request)
+            if not isinstance(user_id, str):
+                raise HTTPException(status_code=401, detail="capability identity missing")
         normalized_query = search_query if search_query else None
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
@@ -1069,7 +1108,11 @@ def register_core_routes(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
-            accessible_by=user_id,
+            # Restricted capability lists must also recover a create that
+            # committed immediately before ownership/binding bookkeeping.
+            # The response is filtered to reviewed or server-labelled ids
+            # below before any row is returned.
+            accessible_by=None if capability_policy is not None else user_id,
             owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API
@@ -1085,6 +1128,21 @@ def register_core_routes(
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
         )
+        if capability_policy is not None:
+            # The server-owned label makes an uncertain create recoverable:
+            # a crash after conversation commit but before binding-table
+            # commit is repaired on the next exact list request.
+            grant_id = request.state.oauth_grant_id
+            for conv in page.data:
+                if conv.labels.get(_SLACK_ORCHESTRATOR_GRANT_LABEL) == grant_id:
+                    await _register_capability_session(request, conv.id)
+                    if permission_store is not None and user_id is not None:
+                        await asyncio.to_thread(permission_store.ensure_user, user_id)
+                        await asyncio.to_thread(
+                            permission_store.grant, user_id, conv.id, LEVEL_OWNER
+                        )
+            allowed = await _capability_sessions(request, capability_policy)
+            page.data = [conv for conv in page.data if conv.id in allowed]
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
         conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
@@ -1720,6 +1778,8 @@ def register_core_routes(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
+            if _SLACK_ORCHESTRATOR_GRANT_LABEL in body.labels:
+                raise HTTPException(status_code=403, detail="reserved session label")
             _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any

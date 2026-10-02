@@ -3827,6 +3827,22 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     mockAgents([
       {
         id: "a_bare",
+        name: "kiro-native-ui",
+        display_name: "Kiro",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+      },
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    // kiro-native has no knobs and isn't routable → no gear.
+    expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
+  });
+
+  it("shows the gear for opencode-native: its pre-launch Model knob needs it", () => {
+    mockAgents([
+      {
+        id: "a_opencode",
         name: "opencode-native-ui",
         display_name: "OpenCode",
         description: null,
@@ -3835,8 +3851,9 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
       },
     ]);
     renderLanding({ smart_routing_enabled: true });
-    // opencode-native has no knobs and isn't routable → no gear.
-    expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
+    // opencode-native declares `modelPicker` → the gear opens the config
+    // modal whose Model row lists the host's OpenCode catalog (llmq-priced).
+    expect(screen.queryByTestId("new-chat-landing-config-gear")).not.toBeNull();
   });
 });
 

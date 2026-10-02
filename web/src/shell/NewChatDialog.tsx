@@ -1434,6 +1434,8 @@ function HarnessConfigModal({
   codexModelsError,
   piModelOptions,
   piModelsLoading,
+  opencodeModelOptions,
+  opencodeModelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1468,6 +1470,11 @@ function HarnessConfigModal({
   codexModelsError: string | null;
   piModelOptions: readonly { id: string; displayName: string }[];
   piModelsLoading: boolean;
+  opencodeModelOptions: readonly Pick<
+    NativeModelOption,
+    "id" | "displayName" | "isDefault" | "pricing"
+  >[];
+  opencodeModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1546,6 +1553,10 @@ function HarnessConfigModal({
   const codexModelSelectOptions = useMemo(
     () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
+  );
+  const opencodeModelSelectOptions = useMemo(
+    () => opencodeModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
+    [opencodeModelOptions],
   );
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
@@ -1662,7 +1673,7 @@ function HarnessConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {!autoRouting && hasModelPicker && !hasPermission && (
+          {!autoRouting && hasModelPicker && !hasPermission && entryHarness === "pi-native" && (
             <>
               <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
                 <SearchableModelPicker
@@ -1698,6 +1709,27 @@ function HarnessConfigModal({
                   </SelectContent>
                 </Select>
               </ConfigRow>
+            </>
+          )}
+
+          {!autoRouting && hasModelPicker && !hasPermission && entryHarness === "opencode-native" && (
+            <>
+              <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
+                <SearchableModelPicker
+                  value={modelValue}
+                  options={opencodeModelSelectOptions.map((m) => ({
+                    id: m.id,
+                    displayName: m.label,
+                  }))}
+                  loading={opencodeModelsLoading}
+                  onValueChange={onModelChange}
+                />
+              </ConfigRow>
+              <p className="text-xs text-muted-foreground">
+                Catalog resolved by the host: OpenCode's ambient CLI models plus
+                llmq-routed opencode-go models, with per-million prices where llmq
+                knows them.
+              </p>
             </>
           )}
 
@@ -2376,6 +2408,10 @@ export function NewChatLandingScreen() {
     "pi-native",
     !sandboxSelected,
   );
+  const {
+    data: hostOpencodeModelOptions,
+    isLoading: hostOpencodeModelsLoading,
+  } = useHostModelOptions(selectedHostId, "opencode-native", !sandboxSelected);
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -2405,6 +2441,10 @@ export function NewChatLandingScreen() {
             displayName: option.displayName ?? option.id,
           })),
     [hostPiModelOptions, sandboxSelected],
+  );
+  const opencodeModelOptions = useMemo(
+    () => (sandboxSelected ? [] : (hostOpencodeModelOptions ?? [])),
+    [hostOpencodeModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -3046,6 +3086,17 @@ export function NewChatLandingScreen() {
       return [{ label: "Permissions", value: AUTO_PERMISSION_MODE.label }];
     }
     if (supportsModelPicker && !supportsPermissionMode) {
+      if (nativeCodingAgentForAvailableAgent(selectedAgent)?.harness === "opencode-native") {
+        const pickedOpencodeRow = opencodeModelOptions.find((m) => m.id === pickedModel);
+        return [
+          {
+            label: "Model",
+            value: pickedOpencodeRow
+              ? nativeModelLabel(pickedOpencodeRow)
+              : defaultModelLabel(opencodeModelOptions),
+          },
+        ];
+      }
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
       return [{ label: "Model", value: modelValue }];
@@ -3133,6 +3184,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    opencodeModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -3227,6 +3279,15 @@ export function NewChatLandingScreen() {
       options.some((m) => m.id === projectDefaultModel)
         ? projectDefaultModel
         : null;
+    if (selectedNativeHarness === "opencode-native") {
+      setPickedModel(
+        !storedRoutingOn &&
+          stored.model != null &&
+          opencodeModelOptions.some((m) => m.id === stored.model)
+          ? stored.model
+          : "",
+      );
+    }
     if (selectedNativeHarness === "pi-native") {
       setPickedModel(
         projectSeed(piModelOptions) ??
@@ -3298,6 +3359,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    opencodeModelOptions,
     projectDefaultModel,
   ]);
   // Smart Routing is remembered per harness alongside the mode/model
@@ -5094,6 +5156,10 @@ export function NewChatLandingScreen() {
                     piModelOptions={piModelOptions}
                     piModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostPiModelsLoading
+                    }
+                    opencodeModelOptions={opencodeModelOptions}
+                    opencodeModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostOpencodeModelsLoading
                     }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}

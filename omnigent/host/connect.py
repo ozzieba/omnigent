@@ -2828,6 +2828,33 @@ class HostProcess:
                 models=[{"id": model.id, "displayName": model.id} for model in listing.models],
                 routable_models=[model.id for model in listing.models],
             )
+        if harness in ("opencode-native", "opencode"):
+            # Pre-launch preview: the ambient `opencode models` CLI catalog,
+            # enriched with the llmq-routed opencode-go models and their
+            # per-million prices. Best-effort on both layers: a CLI failure
+            # still yields llmq rows; an llmq failure still yields CLI rows.
+            rows: list[dict[str, Any]] = []
+            try:
+                from omnigent.opencode_native_app_server import (
+                    list_opencode_cli_model_options,
+                )
+
+                rows = await asyncio.to_thread(list_opencode_cli_model_options)
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch OpenCode CLI model options")
+            try:
+                from omnigent.opencode_llmq_catalog import merge_llmq_pricing
+
+                rows = await asyncio.to_thread(merge_llmq_pricing, rows)
+            except Exception:
+                _logger.exception("Failed to enrich OpenCode model options with llmq pricing")
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=rows,
+                error="opencode model catalog is empty - see the host log" if not rows else None,
+            )
+
         if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,

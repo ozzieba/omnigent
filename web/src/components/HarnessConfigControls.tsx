@@ -9,6 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import type { NativeModelOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // Sentinel Select values for the Model row. Radix requires a non-empty value,
@@ -34,11 +35,22 @@ interface NativeModelLabelFields {
   id: string;
   displayName?: string;
   isDefault?: boolean;
+  pricing?: NativeModelOption["pricing"];
+}
+
+/** Compact "$in/$out per M" price suffix, or "" when unpriced. */
+function modelPriceSuffix(pricing: NativeModelOption["pricing"]): string {
+  const input = pricing?.input_per_million_usd;
+  const output = pricing?.output_per_million_usd;
+  if (input == null && output == null) return "";
+  const fmt = (v: number | null | undefined) =>
+    v == null ? "?" : v === 0 ? "0" : v < 0.1 ? v.toFixed(3).replace(/0+$/, "") : v.toFixed(2);
+  return ` · $${fmt(input)}/$${fmt(output)} per M`;
 }
 
 /** A catalog row's user-facing name: what the harness advertises, else its id. */
 export function nativeModelLabel(option: NativeModelLabelFields): string {
-  return option.displayName ?? option.id;
+  return `${option.displayName ?? option.id}${modelPriceSuffix(option.pricing)}`;
 }
 
 /**

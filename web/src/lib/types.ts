@@ -571,4 +571,10 @@ export interface NativeModelOption {
   supportedReasoningEfforts?: NativeReasoningEffortOption[];
   /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
+  /** USD per million tokens, when the catalog source knows the prices. */
+  pricing?: {
+    input_per_million_usd?: number | null;
+    cached_input_per_million_usd?: number | null;
+    output_per_million_usd?: number | null;
+  };
 }

@@ -1207,7 +1207,9 @@ export function ChatPage() {
       ? "codex-native"
       : fallbackPickerKind === "claude"
         ? "claude-native"
-        : null;
+        : fallbackPickerKind === "opencode"
+          ? "opencode-native"
+          : null;
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
