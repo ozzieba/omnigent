@@ -280,6 +280,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Install dependencies
@@ -321,7 +325,7 @@ jobs:
             --sessions 5000 --items-per-session 200
 
       - name: Upload seeded corpus
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: bench-db-${{ github.run_id }}
           path: bench.db
@@ -346,7 +350,7 @@ jobs:
           persist-credentials: false
 
       - name: Download seeded corpus
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: https://code.forgejo.org/forgejo/download-artifact@246d7188e736d3686f6d19628d253ede9697bd55  # Forgejo v3-node20
         with:
           name: bench-db-${{ github.run_id }}
           path: .
@@ -359,6 +363,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Install dependencies
@@ -372,7 +380,7 @@ jobs:
           echo "Baseline benchmark complete." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload baseline results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: baseline-results-${{ github.run_id }}
           path: baseline.json
@@ -397,7 +405,7 @@ jobs:
           persist-credentials: false
 
       - name: Download seeded corpus
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: https://code.forgejo.org/forgejo/download-artifact@246d7188e736d3686f6d19628d253ede9697bd55  # Forgejo v3-node20
         with:
           name: bench-db-${{ github.run_id }}
           path: .
@@ -410,6 +418,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Install dependencies
@@ -433,7 +445,7 @@ jobs:
           echo "Candidate benchmark complete." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload candidate results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: candidate-results-${{ github.run_id }}
           path: candidate.json
@@ -470,6 +482,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Install dependencies
@@ -514,7 +530,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload comparison artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         if: always()
         with:
           name: benchmark-release-${{ github.run_id }}
@@ -585,6 +601,10 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: false
 
       - name: Stamp the lockstep version

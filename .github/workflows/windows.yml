@@ -47,6 +47,9 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
           enable-cache: true
 
       - name: Install dependencies

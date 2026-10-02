@@ -7,7 +7,7 @@ name: UI Snapshot
 # Cross-OS rendering note: screenshots differ across rendering environments
 # (font rasterizer + hinting + anti-aliasing), so the committed baseline and the
 # PR comparison MUST be produced by the same renderer. This job renders INSIDE a
-# digest-pinned Playwright image (mcr.microsoft.com/playwright/python) -- the
+# digest-pinned Playwright image (mcr.microsoft.com/playwright) -- the
 # exact same image the local regen script uses
 # (tests/e2e_ui/visual/regen_baseline_docker.sh), so a baseline regenerated
 # locally matches this gate byte-for-byte. The test only renders the SPA, so it
@@ -117,7 +117,10 @@ jobs:
     # locally regenerated baseline matches. Keep this digest in lockstep with
     # ui-snapshot-update.yml and regen_baseline_docker.sh.
     container:
-      image: mcr.microsoft.com/playwright/python:v1.60.0-noble@sha256:8ff591d613b01c884cc488339ed4318b4513eaf0c57a164a878ba49e70e3f384
+      # The Node variant, not playwright/python: Forgejo's runner injects no node of
+      # its own, and actions/checkout needs one inside the container. The browsers
+      # and fonts are the same build; uv installs the pinned CPython 3.12.
+      image: mcr.microsoft.com/playwright:v1.60.0-noble@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
     # GitHub defaults `run:` steps inside a container to `sh` (dash); force bash
     # so the snapshot step's arrays / [[ ]] work (bash ships in the image).
     defaults:
@@ -146,6 +149,10 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Cache virtualenv
@@ -203,7 +210,7 @@ jobs:
       - name: Upload screenshots
         id: upload_screens
         if: ${{ always() && (steps.snapshot.conclusion == 'success' || steps.snapshot.conclusion == 'failure') }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: ui-snapshot-${{ github.run_id }}
           # snapshots/ is this run's render (identical to the baseline on a pass;

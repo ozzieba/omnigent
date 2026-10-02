@@ -40,7 +40,8 @@ Baselines are committed under `snapshots/<test_module>/<test_name>/<name>[chromi
 Screenshots differ across rendering environments (font rasterizer, hinting,
 anti-aliasing), and no diff threshold can reconcile two rendering engines. So we
 render everywhere in **one** environment: a digest-pinned Playwright image
-(`mcr.microsoft.com/playwright/python`, which bakes in Chromium + fonts). CI
+(`mcr.microsoft.com/playwright`, the Node variant, which bakes in Chromium + fonts;
+uv installs Python inside it). CI
 renders in it, and you can reproduce that exact render locally with Docker — see
 [Updating the baseline](#updating-the-baseline). Because the renderer is the
 image, your host OS doesn't matter; you just need Docker (or let CI do it).

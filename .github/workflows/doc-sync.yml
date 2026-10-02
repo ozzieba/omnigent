@@ -236,6 +236,10 @@ jobs:
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
+          # An explicit release bypasses setup-uv's GitHub API lookup, which
+          # Forgejo otherwise redirects to its own nonexistent astral-sh user.
+          version: 0.12.9
+          checksum: ec7a99cd05e0cd7f80243f135ce1361c76835cb0ee60055d14d20eba8eba1460
           enable-cache: true
 
       - name: Cache virtualenv
@@ -794,7 +798,7 @@ jobs:
 
       - name: Upload logs on failure
         if: always() && steps.plan.outputs.proceed == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@97a0fba1372883ab732affbe8f94b823f91727db  # Forgejo v3-node20
         with:
           name: doc-sync-${{ steps.plan.outputs.pr }}-${{ github.run_id }}
           path: |
