@@ -3000,3 +3000,98 @@ async def test_replayed_status_for_drained_dispatch_is_acknowledged_without_entr
     finally:
         runner_app._drained_delivered_subagent_children.discard(child_id)
         runner_app._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_native_subagent_mirror_idle_without_parent_inbox_is_acknowledged() -> None:
+    """
+    A native harness's own sub-agent mirror is never held for inbox delivery.
+
+    The claude-native forwarder mints a child per Claude Code ``Task`` run and
+    posts quiescence ``idle`` for it. Claude Code already handed that result to
+    the parent, so the runner must not rebuild a work entry from the child's
+    ``parent_session_id`` and 503 on a missing parent inbox: the forwarder
+    retries that 503 for the life of the runner (attempt 49+ observed on r820
+    2026-10-02, 21 children, a 30 s retry each).
+    """
+    from omnigent import _wrapper_labels
+    from omnigent.runner import app as runner_app
+
+    parent_id = "3e1f6c0a9b8d47e2a5c4b3d2e1f0a9b8"
+    child_id = "8c7b6a5f4e3d42c1b0a9f8e7d6c5b4a3"
+    server_client = _LabelledChildServerClient(
+        parent_id,
+        child_id,
+        {_wrapper_labels.WRAPPER_LABEL_KEY: _wrapper_labels.CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE},
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    runner_app._session_inboxes_ref.pop(parent_id, None)
+    try:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "TASK_RESULT"},
+                },
+            )
+        entry = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert resp.status_code == 204, resp.text
+    assert entry is None
+
+
+@pytest.mark.asyncio
+async def test_native_subagent_mirror_idle_neither_queues_nor_wakes_parent() -> None:
+    """
+    A mirror's ``idle`` puts nothing in the parent inbox and posts no wake.
+
+    With a live parent inbox the pre-fix runner delivered the mirror's output
+    and posted a ``[System: sub-agent ... finished]`` wake to the parent, which
+    a claude-native parent receives as an extra user prompt for a result its
+    ``Task`` tool call already returned.
+    """
+    from omnigent import _wrapper_labels
+    from omnigent.runner import app as runner_app
+
+    parent_id = "4f2a7d1b0c9e48f3b6d5c4e3f2a1b0c9"
+    child_id = "9d8c7b6a5f4e43d2c1b0a9f8e7d6c5b4"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _LabelledChildServerClient(
+        parent_id,
+        child_id,
+        {_wrapper_labels.WRAPPER_LABEL_KEY: _wrapper_labels.CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE},
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    try:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "TASK_RESULT"},
+                },
+            )
+            for _ in range(5):
+                await asyncio.sleep(0)
+        entry = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._drained_delivered_subagent_children.discard(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert resp.status_code == 204, resp.text
+    assert entry is None
+    assert session_inbox.empty()
+    assert server_client.wake_posts == []
