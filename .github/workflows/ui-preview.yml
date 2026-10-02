@@ -29,6 +29,16 @@ name: UI Preview
 # (Settings -> Environments) with "Required reviewers" set to the maintainer
 # team. Without it the gate is a no-op (the job just runs), so it must be
 # configured for guard #2 to take effect. See .github/ui-preview/README.md.
+#
+# Repository guard. Every job is gated on
+# `github.repository == 'omnigent-ai/omnigent'` (same convention as
+# doc-sync.yml). This workflow also runs wherever the repo is mirrored (GitHub
+# forks, a private Forgejo working remote), and there the Environment gate above
+# is a no-op: without the guard, a push to main touching web/** would build the
+# UI and run `deploy` with whatever DATABRICKS_* secrets the mirror holds, or
+# fail at auth and burn a runner on every web change.
+# tests/github/test_workflow_repo_guards.py enforces the guard on the
+# `databricks apps` jobs.
 
 on:
   push:
@@ -62,7 +72,8 @@ permissions: {}
 jobs:
   notify:
     if: >-
-      github.event_name != 'push'
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event_name != 'push'
       && github.event.action != 'closed'
       && contains(github.event.pull_request.labels.*.name, 'ui-preview')
       && github.event.pull_request.draft == false
@@ -100,11 +111,14 @@ jobs:
 
   build:
     if: >-
-      github.event_name == 'push'
-      || (
-        github.event.action != 'closed'
-        && contains(github.event.pull_request.labels.*.name, 'ui-preview')
-        && github.event.pull_request.draft == false
+      github.repository == 'omnigent-ai/omnigent'
+      && (
+        github.event_name == 'push'
+        || (
+          github.event.action != 'closed'
+          && contains(github.event.pull_request.labels.*.name, 'ui-preview')
+          && github.event.pull_request.draft == false
+        )
       )
     runs-on: ubuntu-latest
     permissions:
@@ -230,6 +244,9 @@ jobs:
 
   deploy:
     needs: build
+    # Repeated here rather than relying on `build` being skipped: this is the
+    # job that holds the Databricks credentials, so it carries its own guard.
+    if: github.repository == 'omnigent-ai/omnigent'
     # Gate the secret-bearing deploy behind a protected Environment for
     # UNTRUSTED fork PRs only: a labelled outside-contributor fork PR that gets a
     # new commit must wait for a human reviewer to approve this run before it can
@@ -417,7 +434,8 @@ jobs:
     # and workspace files forever. Run on every close; the delete step is a cheap
     # no-op (one existence check) for PRs that never had a preview.
     if: >-
-      github.event_name != 'push'
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event_name != 'push'
       && github.event.action == 'closed'
     runs-on: ubuntu-latest
     permissions:
