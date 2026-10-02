@@ -1314,6 +1314,8 @@ def register_events_routes(
                 # Codex-internal children are tracked inside the same
                 # app-server thread tree; they have no runner inbox entry
                 # to forward terminal status to.
+                from omnigent.server.routes import sessions as _sf
+
                 if runner_result is None:
                     # The child's pinned runner_id is stale — its runner was
                     # relaunched under a new id and only the parent was
@@ -1322,8 +1324,6 @@ def register_events_routes(
                     # parent hangs waiting for the child's inbox result. Heal
                     # the binding and re-deliver through the parent's live
                     # runner before failing.
-                    from omnigent.server.routes import sessions as _sf
-
                     recovered = await _sf._recover_subagent_status_forward_via_parent(
                         conv,
                         runner_router,
@@ -1338,6 +1338,18 @@ def register_events_routes(
                     status,
                     runner_result,
                 )
+                # A host-bound child runs on its own host's runner, while the
+                # dispatch entry that feeds the parent inbox lives in the
+                # parent's runner. Relay the terminal edge there too, or that
+                # entry stays "launching" and every later send is rejected.
+                relayed = await _sf._forward_subagent_terminal_to_parent_runner(
+                    conv,
+                    runner_router,
+                    conversation_store,
+                    forward_body,
+                )
+                if relayed is not None:
+                    _require_external_status_forward(session_id, status, relayed)
             return {"queued": False}
         if body.type == _EXTERNAL_COMPACTION_STATUS_TYPE:
             # Terminal-observed compaction edge (claude-native forwarder):

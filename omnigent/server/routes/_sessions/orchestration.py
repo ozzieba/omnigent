@@ -2552,6 +2552,82 @@ async def _recover_subagent_status_forward_via_parent(
     )
 
 
+async def _forward_subagent_terminal_to_parent_runner(
+    child_conv: Conversation,
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """
+    Relay a sub-agent terminal status to the parent's runner when it differs.
+
+    The ``sys_session_send`` bookkeeping whose completion feeds the parent
+    inbox lives in the runner that dispatched the turn: the parent's. A
+    host-bound child (``host_id`` set, e.g. a Docloop child on
+    ``r820-docloop``) runs on its own host's runner, so the ordinary forward
+    reaches a runner that holds no entry for it and acknowledges the status
+    as an untracked no-op. The parent's entry then stays ``launching`` forever
+    and every later send to that child is rejected. This re-posts the same
+    terminal edge through the parent's runner so the entry completes.
+
+    Same-runner children skip the relay: the ordinary forward already reached
+    the runner that holds the entry.
+
+    :param child_conv: The sub-agent child whose terminal status was just
+        forwarded to its own runner.
+    :param runner_router: Router used to resolve the parent's runner client,
+        or ``None`` in in-process setups.
+    :param conversation_store: Store used to look up the parent conversation.
+    :param forward_body: The ``external_session_status`` event body to re-POST.
+    :returns: The parent runner's result when a relay was attempted, or
+        ``None`` when the parent shares the child's runner, has no runner
+        binding, or its runner could not be reached (the ordinary forward's
+        result stands).
+    """
+    parent_id = child_conv.parent_conversation_id
+    if not parent_id or parent_id == child_conv.id:
+        return None
+    parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+    if parent is None or parent.runner_id is None:
+        return None
+    if parent.runner_id == child_conv.runner_id:
+        return None
+    client = await _get_runner_client(parent_id, runner_router, conversation=parent)
+    if client is None:
+        _logger.warning(
+            "Sub-agent terminal relay skipped: parent runner unresolved child=%s parent=%s",
+            child_conv.id,
+            parent_id,
+            extra={"session_id": child_conv.id},
+        )
+        return None
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{child_conv.id}/events",
+            json=forward_body,
+            timeout=5.0,
+        )
+    except (httpx.HTTPError, ConnectionError):
+        _logger.exception(
+            "Sub-agent terminal relay to parent runner failed child=%s parent=%s",
+            child_conv.id,
+            parent_id,
+            extra={"session_id": child_conv.id},
+        )
+        return None
+    if resp.status_code >= 400:
+        _logger.warning(
+            "Sub-agent terminal relay rejected by parent runner child=%s parent=%s "
+            "status=%s body=%s",
+            child_conv.id,
+            parent_id,
+            resp.status_code,
+            resp.text,
+            extra={"session_id": child_conv.id},
+        )
+    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
+
+
 def _drive_terminal_resolved_elicitation(session_id: str, persisted: ConversationItem) -> None:
     """
     Feed a mirrored tool item into the terminal-resolved fast path.
