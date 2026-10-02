@@ -8457,6 +8457,125 @@ async def test_sys_session_send_named_child_recovers_from_session_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_send_named_child_recovers_untracked_dispatch_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Named-mode reuse recovers a restart-lost dispatch from the session snapshot.
+
+    With no local entry, the ``child_sessions`` summary (which has no lifecycle
+    ``status``) is not enough to decide recovery. When its labels show an
+    undelivered dispatch the send must read ``GET /v1/sessions/{id}``, recover
+    the reply under the stamped dispatch id and accept the next turn after the
+    drain receipt, instead of refusing forever with status=None.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_caller"] = session_inbox
+    labels = {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_unread"}
+    event_posts: list[dict[str, Any]] = []
+    snapshot_reads = 0
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal snapshot_reads
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_caller/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_child",
+                            "title": "researcher:auth",
+                            "sub_agent_name": "researcher",
+                            "busy": False,
+                            "labels": labels,
+                        }
+                    ]
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            snapshot_reads += 1
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                    "status": "idle",
+                    "labels": labels,
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child/items":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Survived the restart."}],
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            labels.update(json.loads(request.content).get("labels", {}))
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    arguments = json.dumps({"agent": "researcher", "title": "auth", "args": "continue"})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            first_output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=arguments,
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+            assert "recovered to the inbox" in first_output, first_output
+            assert snapshot_reads == 1
+            assert event_posts == []
+            recovered = session_inbox.get_nowait()
+            assert recovered["work_id"] == "subagent_unread"
+            assert recovered["status"] == "completed"
+            assert recovered["output"] == "Survived the restart."
+
+            labels[runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY] = "subagent_unread"
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=arguments,
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._drained_delivered_subagent_children.discard("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert len(event_posts) == 1
+    assert "continue" in json.dumps(event_posts[0])
+    assert json.loads(output)["status"] == "launching"
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_recovery_refuses_to_stamp_replaced_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

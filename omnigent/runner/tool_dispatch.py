@@ -2291,16 +2291,23 @@ async def _execute_subagent_tool(
                 "after completion."
             )
         # The child summary carries ``busy`` and ``current_task_status`` but no
-        # lifecycle ``status``. Recovering a runner-local turn that is still
-        # launching or running needs the authoritative SessionResponse, so read
-        # it only then; terminal entries are settled from labels alone.
+        # lifecycle ``status``. Recovery needs the authoritative SessionResponse
+        # in two cases: a runner-local turn that is still launching or running,
+        # and no local turn while the child's labels show an undelivered
+        # dispatch (the parent runner restarted). Terminal local entries are
+        # settled from labels alone.
         child_snapshot: _JsonObject = existing
         local_work = _runner_app.get_subagent_work(child_session_id)
-        if local_work is not None and local_work.status not in (
-            "completed",
-            "failed",
-            "cancelled",
-        ):
+        summary_labels = existing.get("labels")
+        needs_snapshot = (
+            local_work is not None
+            and local_work.status not in ("completed", "failed", "cancelled")
+        ) or (
+            local_work is None
+            and isinstance(summary_labels, dict)
+            and _runner_app.undelivered_subagent_dispatch_id(summary_labels) is not None
+        )
+        if needs_snapshot:
             fetched = await _fetch_child_session_snapshot(server_client, child_session_id)
             if isinstance(fetched, str):
                 return fetched
