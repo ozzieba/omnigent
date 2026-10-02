@@ -1134,13 +1134,18 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     spec = captured["spec"]
     # The gateway env points ``claude`` at the Databricks gateway, and
     # ENABLE_TOOL_SEARCH forces Claude Code to defer MCP tool schemas
-    # instead of loading all 200+ bridge tools into startup context.
+    # instead of loading all 200+ bridge tools into startup context. The
+    # terminal also names the session it serves and drops the runner's
+    # primary-session marker, so a managed-host launch shim binds the
+    # harness process to this session rather than to a parent's.
     assert spec.env == {
         **gateway_env,
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID": "13efa494411f3ae60211e6be5635062a",
     }
+    assert "OMNIGENT_RUNNER_PRIMARY_SESSION_ID" in spec.env_unset
     assert spec.command == "claude"
     # The gateway default model is applied (no per-session override here).
     assert "--model" in spec.args
