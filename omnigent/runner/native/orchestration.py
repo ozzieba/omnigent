@@ -43,7 +43,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -6279,6 +6279,8 @@ def _build_claude_native_base_args(
 
 def _claude_terminal_env_unset(
     claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    session_id: str | None = None,
 ) -> list[str]:
     """
     Env vars to strip from a native Claude terminal child.
@@ -6294,14 +6296,24 @@ def _claude_terminal_env_unset(
     API key" menu, whose selected row uses the same ``❯`` glyph the tmux
     delivery path waits for, so the first web message is typed into the menu.
 
+    When the terminal serves a session, also drops
+    ``OMNIGENT_RUNNER_PRIMARY_SESSION_ID``: a subagent terminal runs in its
+    parent's runner, and a launch shim that falls back to that marker would
+    bind the child to its parent's identity. The served session is named
+    explicitly by :func:`build_native_claude_terminal_env` instead.
+
     :param claude_config: The resolved native launch config, or ``None``
         (Claude's own login) — which still strips the nested-session marker.
+    :param session_id: The served session, e.g. ``"conv_abc123"``, or
+        ``None`` for a sessionless probe that keeps runner attribution.
     :returns: The env var names to unset, e.g.
         ``["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE", "ANTHROPIC_API_KEY"]``.
     """
     env_unset = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE"]
     if claude_config is not None and claude_config.api_key_helper:
         env_unset.append("ANTHROPIC_API_KEY")
+    if session_id is not None:
+        env_unset.append(PRIMARY_SESSION_ID_ENV_VAR)
     return env_unset
 
 
@@ -7364,7 +7376,9 @@ async def _auto_create_claude_terminal(
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
 
-    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+    # Bind the terminal to the session it serves: a subagent terminal runs in
+    # its parent's runner, whose env names the parent as the primary session.
+    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config, session_id=session_id)
 
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
@@ -7383,7 +7397,7 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(claude_config),
+        env=build_native_claude_terminal_env(claude_config, session_id=session_id),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
