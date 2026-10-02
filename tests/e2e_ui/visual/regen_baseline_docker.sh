@@ -25,7 +25,11 @@
 set -euo pipefail
 
 # Keep these in lockstep with ui-snapshot.yml / ui-snapshot-update.yml.
-PW_IMAGE="mcr.microsoft.com/playwright/python:v1.60.0-noble@sha256:8ff591d613b01c884cc488339ed4318b4513eaf0c57a164a878ba49e70e3f384"
+# The Node variant, not playwright/python: Forgejo's runner injects no node into
+# containers, so CI needs it in the image. Same Chromium build and fonts; uv
+# installs the pinned CPython 3.12 inside the container.
+PW_IMAGE="mcr.microsoft.com/playwright:v1.60.0-noble@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948"
+UV_VERSION="0.12.9"
 NODE_IMAGE="node:20-bookworm"
 # The pinned digest is a multi-arch manifest, and CI renders the linux/amd64
 # variant. Force it here too so an arm64 host (e.g. Apple Silicon) renders the
@@ -78,10 +82,12 @@ if ! "$CONTAINER_RUNTIME" run --rm --platform "$PLATFORM" -v "$PWD":/work -w /wo
   -e GITHUB_ACTIONS=true \
   -e OMNIGENT_PW_NO_SANDBOX=1 \
   -e OMNIGENT_SKIP_WEB_UI=true \
-  -e UV_PYTHON_PREFERENCE=only-system \
   -e UV_PROJECT_ENVIRONMENT=/opt/uv-venv \
+  -e UV_INSTALL_DIR=/opt/uv-bin \
+  -e UV_VERSION="$UV_VERSION" \
   "$PW_IMAGE" bash -c '
-    pip install --quiet uv &&
+    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh -s -- --quiet &&
+    export PATH=/opt/uv-bin:$PATH &&
     uv sync --extra all --group test &&
     (uv run pytest tests/e2e_ui/visual -m visual \
       -p no:rerunfailures --ui-skip-build || true) &&

@@ -25,6 +25,9 @@ concurrency:
 jobs:
   label-pr-size:
     name: PR Size Labeling
+    # Needs the gh CLI, which Forgejo's runner image does not ship. This is a
+    # GitHub-process job, so it only runs there.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
