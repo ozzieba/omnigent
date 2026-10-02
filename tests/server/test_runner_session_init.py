@@ -149,6 +149,35 @@ async def test_session_init_readiness_is_explicit_and_backward_compatible(
     assert ready is expected_ready
 
 
+def test_init_envelope_carries_environment_profile() -> None:
+    """The session's immutable environment profile reaches the runner envelope.
+
+    ``_initialize_session`` seeds ``resource_registry.set_session_environment_profile``
+    from ``envelope.snapshot.environment_profile`` so a child inherits its parent's
+    profile without a snapshot GET. The snapshot must therefore project the
+    conversation's profile and read back as ``None`` when the session has none.
+    """
+    conversation = Conversation(
+        id="conv_profile",
+        created_at=10,
+        updated_at=11,
+        root_conversation_id="conv_profile",
+        agent_id="agent_init",
+        runner_id="runner_init",
+        environment_profile="workspace-readonly@2",
+    )
+    payload = build_runner_session_init_payload(conversation, server_version="0.6.0.dev0")
+    envelope = parse_runner_session_init_envelope(payload)
+    assert envelope is not None
+    assert envelope.snapshot.environment_profile == "workspace-readonly@2"
+
+    bare = parse_runner_session_init_envelope(
+        build_runner_session_init_payload(_conversation(), server_version="0.6.0.dev0")
+    )
+    assert bare is not None
+    assert bare.snapshot.environment_profile is None
+
+
 def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) -> None:
     """A forked native session's fork directives survive to the runner envelope.
 
