@@ -18,6 +18,7 @@ import cachetools
 import httpx
 from pydantic import TypeAdapter
 
+import omnigent._wrapper_labels as _wrapper_labels
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
@@ -160,7 +161,7 @@ _ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
 _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
 
 
-_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "claude-code-native-ui-subagent"
+_CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = _wrapper_labels.CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE
 
 
 _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY = "omnigent.claude_native.subagent_id"
@@ -175,7 +176,7 @@ _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY = "omnigent.claude_native.description"
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE: str = "external_codex_subagent_start"
 
 
-_CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "codex-native-ui-subagent"
+_CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = _wrapper_labels.CODEX_NATIVE_SUBAGENT_WRAPPER_VALUE
 
 
 _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY = "omnigent.codex_native.subagent_thread_id"
@@ -229,7 +230,9 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE: str = "external_antigravity_subagent_start"
 
 
-_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "antigravity-native-ui-subagent"
+_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = (
+    _wrapper_labels.ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE
+)
 
 
 _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY = (

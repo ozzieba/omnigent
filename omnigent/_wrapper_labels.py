@@ -80,3 +80,19 @@ KIMI_NATIVE_WRAPPER_VALUE = "kimi-native-ui"
 # Value the ``omnigent hermes`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"
+
+# Values the server stamps on the child rows it mints to MIRROR a native
+# harness's own in-process sub-agents (Claude Code ``Task``, Codex and
+# Antigravity sub-agents). The native harness returns those results to the
+# parent itself, so these children never carry an Omnigent dispatch whose
+# result belongs in the parent's sub-agent inbox.
+CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE = "claude-code-native-ui-subagent"
+CODEX_NATIVE_SUBAGENT_WRAPPER_VALUE = "codex-native-ui-subagent"
+ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE = "antigravity-native-ui-subagent"
+NATIVE_SUBAGENT_MIRROR_WRAPPER_VALUES = frozenset(
+    {
+        CLAUDE_NATIVE_SUBAGENT_WRAPPER_VALUE,
+        CODEX_NATIVE_SUBAGENT_WRAPPER_VALUE,
+        ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    }
+)

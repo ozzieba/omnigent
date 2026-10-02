@@ -43,6 +43,10 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent._wrapper_labels import (
+    NATIVE_SUBAGENT_MIRROR_WRAPPER_VALUES,
+    WRAPPER_LABEL_KEY,
+)
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.session_resources import (
@@ -999,6 +1003,10 @@ class _SessionSnapshot:
         ``"cursor-native-ui"``. Used as the sub-agent label when rebuilding a
         work entry for a child the server did not record a ``sub_agent_name``
         for. ``None`` when unbound / the fetch failed.
+    :param wrapper_label: The session's ``omnigent.wrapper`` label, e.g.
+        ``"claude-code-native-ui-subagent"`` for a child the server minted to
+        mirror a native harness's own in-process sub-agent. ``None`` when
+        absent / the fetch failed. Immutable once stamped, so safe to cache.
     """
 
     ok: bool
@@ -1009,6 +1017,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    wrapper_label: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3216,6 +3225,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            wrapper_label: str | None = None
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -3237,6 +3247,11 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    raw_labels = body.get("labels")
+                    if isinstance(raw_labels, dict):
+                        raw_wrapper = raw_labels.get(WRAPPER_LABEL_KEY)
+                        if isinstance(raw_wrapper, str) and raw_wrapper:
+                            wrapper_label = raw_wrapper
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -3248,6 +3263,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                wrapper_label=wrapper_label,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -3328,6 +3344,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            wrapper_label=snapshot.labels.get(WRAPPER_LABEL_KEY) or None,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -4794,6 +4811,26 @@ def create_runner_app(
         if name:
             _session_sub_agent_names[conv_id] = name
         return name
+
+    async def _is_native_subagent_mirror(conv_id: str) -> bool:
+        """
+        Whether *conv_id* mirrors a native harness's in-process sub-agent.
+
+        The claude-native forwarder mints these children (``Task`` tool runs)
+        and posts quiescence ``idle`` for them. A child the runner itself
+        dispatched keeps its work entry and is never treated as a mirror.
+
+        :param conv_id: Child session id, e.g. ``"conv_child456"``.
+        :returns: ``True`` only for a child with no runner work entry whose
+            ``omnigent.wrapper`` label is a native sub-agent mirror value.
+        """
+        if get_subagent_work(conv_id) is not None:
+            return False
+        try:
+            snapshot = await _session_snapshot(conv_id)
+        except Exception:  # noqa: BLE001 — best-effort; fall back to delivery
+            return False
+        return snapshot.wrapper_label in NATIVE_SUBAGENT_MIRROR_WRAPPER_VALUES
 
     async def _ensure_subagent_work_entry(conv_id: str) -> _SubagentWorkEntry | None:
         existing = get_subagent_work(conv_id)
@@ -8493,6 +8530,11 @@ def create_runner_app(
                     allow_history_preview_fallback=False,
                 )
             if status in ("idle", "failed"):
+                if await _is_native_subagent_mirror(conversation_id):
+                    # The native harness already handed this in-process
+                    # sub-agent's result to its parent; there is no Omnigent
+                    # dispatch to deliver, so no inbox entry and no wake.
+                    return Response(status_code=204)
                 recovered_entry = await _ensure_subagent_work_entry(conversation_id)
             if status == "idle":
                 delivery_ack = _mark_subagent_terminal_and_wake(
