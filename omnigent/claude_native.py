@@ -89,6 +89,7 @@ from omnigent.claude_model_vocabulary import (
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
+    REQUEST_SESSION_ID_ENV_VAR,
     augment_claude_args,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
@@ -1235,6 +1236,8 @@ def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None
 
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build env overrides for a native Claude Code terminal process.
@@ -1249,6 +1252,12 @@ def build_native_claude_terminal_env(
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
         ``None`` means use Claude Code's own native auth.
+    :param session_id: The Omnigent session this terminal serves, e.g.
+        ``"conv_abc123"``. When given, the env names it in
+        :data:`REQUEST_SESSION_ID_ENV_VAR` so a managed-host launch shim
+        binds the harness process to this session rather than to the
+        runner's primary session (a subagent terminal runs in its parent's
+        runner). ``None`` for sessionless probes.
     :returns: Environment overrides for the terminal process, e.g.
         ``{"ENABLE_TOOL_SEARCH": "true"}``.
     """
@@ -1262,6 +1271,8 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
+    if session_id is not None:
+        terminal_env[REQUEST_SESSION_ID_ENV_VAR] = session_id
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.

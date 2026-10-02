@@ -20,6 +20,8 @@ from omnigent.claude_native import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
 )
+from omnigent.claude_native_bridge import REQUEST_SESSION_ID_ENV_VAR
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal_env_unset
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
@@ -195,6 +197,37 @@ def test_claude_terminal_env_unset_without_helper_keeps_key() -> None:
     bedrock_env_unset = _claude_terminal_env_unset(bedrock_like)
     assert bedrock_env_unset == expected
     assert "ANTHROPIC_API_KEY" not in bedrock_env_unset
+
+
+def test_claude_terminal_binds_the_session_it_serves_not_the_runner_primary() -> None:
+    """A subagent terminal must identify ITS session, not the runner's primary.
+
+    Subagent child sessions co-locate in their parent's runner, whose process
+    env carries ``OMNIGENT_RUNNER_PRIMARY_SESSION_ID=<parent>``. A managed-host
+    ``claude`` shim resolves the session it is launching from that marker when
+    no harness-specific request id is present, so every child terminal was
+    launched -- and posted to the fleet's coordination channels -- as its
+    parent. The terminal env must name the served session and strip the runner
+    marker, mirroring ``codex_launch_env`` for Codex app-servers.
+    """
+    inherited = {PRIMARY_SESSION_ID_ENV_VAR: "parent-session", "HOME": "/home/agent"}
+    terminal_env = build_native_claude_terminal_env(None, session_id="child-session")
+    env_unset = _claude_terminal_env_unset(None, session_id="child-session")
+    # Replay the terminal layer: ``env`` overrides first, then ``env_unset`` wins.
+    child_env = {**inherited, **terminal_env}
+    for name in env_unset:
+        child_env.pop(name, None)
+    assert child_env[REQUEST_SESSION_ID_ENV_VAR] == "child-session"
+    assert PRIMARY_SESSION_ID_ENV_VAR not in child_env
+    # The existing leak-prevention names are still stripped.
+    assert "CLAUDECODE" in env_unset
+    assert "DATABRICKS_CONFIG_PROFILE" in env_unset
+
+
+def test_claude_terminal_env_without_a_session_leaves_runner_attribution_alone() -> None:
+    """Sessionless launches (background title probes) keep today's env shape."""
+    assert REQUEST_SESSION_ID_ENV_VAR not in build_native_claude_terminal_env(None)
+    assert PRIMARY_SESSION_ID_ENV_VAR not in _claude_terminal_env_unset(None)
 
 
 def test_native_launch_passes_synthesized_model_as_flag() -> None:
