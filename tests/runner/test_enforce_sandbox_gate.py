@@ -418,7 +418,11 @@ async def test_create_session_seeds_model_override_into_spawn_env() -> None:
 
 
 def _session_init_body(
-    *, session_id: str, agent_id: str, model_override: str | None
+    *,
+    session_id: str,
+    agent_id: str,
+    model_override: str | None,
+    environment_profile: str | None = None,
 ) -> dict[str, Any]:
     """Build a protocol-v2 ``session_init`` POST body carrying model_override.
 
@@ -443,6 +447,7 @@ def _session_init_body(
             created_at=0,
             updated_at=0,
             model_override=model_override,
+            environment_profile=environment_profile,
         ),
     )
     return {
@@ -523,6 +528,64 @@ async def test_create_session_seeds_model_override_from_envelope() -> None:
     assert env.get("HARNESS_CLAUDE_SDK_MODEL") == "model-x", (
         "_initialize_session must seed the envelope's model_override into the "
         f"initial spawn env; got {env.get('HARNESS_CLAUDE_SDK_MODEL')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_session_seeds_environment_profile_from_envelope() -> None:
+    """Envelope path: the inherited environment profile is seeded into the registry.
+
+    A child session inherits its parent's immutable environment profile through
+    the ``session_init`` envelope. ``_initialize_session`` must read
+    ``snapshot.environment_profile`` and record it on the resource registry
+    before the primary environment is built, so the generated guide and catalog
+    describe the inherited profile. Regression guard: the snapshot model once
+    lacked the field, which raised ``AttributeError`` on every envelope init.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="profile-seed-agent",
+        executor=ExecutorSpec(
+            config={"harness": "claude-sdk"},
+            model="databricks-claude-sonnet-4-6",
+        ),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient())
+    registry = SessionResourceRegistry()
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=registry,
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_body(
+                session_id="conv_env_profile",
+                agent_id="ag_test",
+                model_override=None,
+                environment_profile="workspace-readonly@2",
+            ),
+        )
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert registry.session_environment_profile("conv_env_profile") == "workspace-readonly@2", (
+        "_initialize_session must seed the envelope's environment_profile into the "
+        "resource registry"
     )
 
 

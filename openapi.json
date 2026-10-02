@@ -6298,6 +6298,27 @@
             "title": "Created At",
             "type": "integer"
           },
+          "environment_capabilities": {
+            "description": "Public capability catalog for the selected environment profile. This lets agents inspect the actual interfaces and authorization state available to their session.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Environment Capabilities",
+            "type": "array"
+          },
+          "environment_profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Immutable server-published profile revision selected when this session was created, e.g. `workspace-readonly@1`.",
+            "title": "Environment Profile"
+          },
           "external_session_id": {
             "anyOf": [
               {
@@ -8787,6 +8808,30 @@
           }
         },
         "summary": "Branding Logo"
+      }
+    },
+    "/v1/environment-profiles": {
+      "get": {
+        "description": "List server-published immutable environment profile revisions.",
+        "operationId": "list_environment_profiles_v1_environment_profiles_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Environment Profiles V1 Environment Profiles Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Environment Profiles",
+        "tags": [
+          "sessions"
+        ]
       }
     },
     "/v1/harnesses": {
