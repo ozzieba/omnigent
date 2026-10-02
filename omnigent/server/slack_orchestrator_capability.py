@@ -274,6 +274,17 @@ def authorize_event(request: Request, session_id: str, allowed: frozenset[str], 
         _deny("capability message size denied")
 
 
+def deny_bundled_create(request: Request) -> None:
+    """Refuse the multipart bundled create to a capability token.
+
+    That branch of ``POST /v1/sessions`` stores a caller-supplied agent
+    bundle, so it can never match a reviewed template. The auth layer cannot
+    tell it from the JSON create (same method and path), so the route must.
+    """
+    if getattr(request.state, "oauth_scope", None) == SCOPE:
+        _deny("capability create request denied")
+
+
 def authorize_create(request: Request, policy: CapabilityPolicy, body: Any) -> None:
     if request.method != "POST" or _raw_path(request) != "/v1/sessions" or _query(request):
         _deny("capability create request denied")

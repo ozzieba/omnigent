@@ -195,6 +195,9 @@ from omnigent.server.slack_orchestrator_capability import (
     authorize_list as _authorize_capability_list,
 )
 from omnigent.server.slack_orchestrator_capability import (
+    deny_bundled_create as _deny_capability_bundled_create,
+)
+from omnigent.server.slack_orchestrator_capability import (
     permitted_sessions as _capability_sessions,
 )
 from omnigent.server.slack_orchestrator_capability import (
@@ -399,6 +402,9 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
+            # A restricted Slack orchestrator token may only create from a
+            # reviewed JSON template; this branch stores an arbitrary bundle.
+            _deny_capability_bundled_create(request)
             result, project_warnings = await _create_bundled_session_from_multipart(
                 request, user_id
             )
@@ -747,6 +753,10 @@ def register_core_routes(
         parsed_metadata = project_resolution.body
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
+        # Same rule as the JSON create: the capability list registers any
+        # session carrying its grant id, so no caller may seed that label.
+        if parsed_metadata.labels and _SLACK_ORCHESTRATOR_GRANT_LABEL in parsed_metadata.labels:
+            raise HTTPException(status_code=403, detail="reserved session label")
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
