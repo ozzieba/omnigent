@@ -2877,3 +2877,126 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
         f"If non-empty, _publish_event fired before the 503 early "
         f"return — same reordering concern as the marker."
     )
+
+
+class _JsonResponse:
+    """Minimal response stand-in for a JSON ``GET /v1/sessions/{id}``."""
+
+    def __init__(self, status_code: int, body: dict[str, Any]) -> None:
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> dict[str, Any]:
+        return self._body
+
+
+class _LabelledChildServerClient(_WakeRecordingServerClient):
+    """Serve one child's session snapshot with labels; record parent wakes."""
+
+    def __init__(self, parent_id: str, child_id: str, labels: dict[str, str]) -> None:
+        super().__init__(parent_id)
+        self._child_path = f"/v1/sessions/{child_id}"
+        self._body = {
+            "id": child_id,
+            "parent_session_id": parent_id,
+            "sub_agent_name": "worker",
+            "agent_id": "6eadea15d6e06f43d026b25b656a73ec",
+            "status": "idle",
+            "created_at": 1_700_000_000,
+            "labels": labels,
+        }
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if url == self._child_path:
+            return _JsonResponse(200, self._body)
+        return await super().get(url, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_work_entry_adopts_child_dispatch_label() -> None:
+    """
+    A work entry rebuilt after runner state loss carries the child's dispatch id.
+
+    The parent stamped ``omnigent.subagent.dispatch_id`` on the child when it
+    sent the turn. Rebuilding the lost entry under a fresh id would make the
+    inbox drain write a mismatched receipt and block every later send to the
+    child; the rebuilt entry must use the stamped id.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = "5c3dd5a4a18c4d2fb4a2c3a2d1f0b9e8"
+    child_id = "9f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _LabelledChildServerClient(
+        parent_id,
+        child_id,
+        {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_stamped"},
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    try:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "REBUILT_RESULT"},
+                },
+            )
+            assert resp.status_code == 204, resp.text
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5)
+        delivered = session_inbox.get_nowait()
+        assert delivered["work_id"] == "subagent_stamped"
+        assert delivered["output"] == "REBUILT_RESULT"
+        entry = runner_app.get_subagent_work(child_id)
+        assert entry is not None and entry.work_id == "subagent_stamped"
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._drained_delivered_subagent_children.discard(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_replayed_status_for_drained_dispatch_is_acknowledged_without_entry() -> None:
+    """A terminal edge for a dispatch the parent already drained queues nothing."""
+    from omnigent.runner import app as runner_app
+
+    parent_id = "7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d"
+    child_id = "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _LabelledChildServerClient(
+        parent_id,
+        child_id,
+        {
+            runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_drained",
+            runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_drained",
+        },
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    try:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "REPLAYED"},
+                },
+            )
+            assert resp.status_code == 204, resp.text
+            for _ in range(5):
+                await asyncio.sleep(0)
+        assert session_inbox.empty()
+        assert runner_app.get_subagent_work(child_id) is None
+        assert server_client.wake_posts == []
+    finally:
+        runner_app._drained_delivered_subagent_children.discard(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)

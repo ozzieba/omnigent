@@ -404,6 +404,7 @@ _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
+_SUBAGENT_DELIVERY_DISPATCH_MISMATCH = "dispatch_mismatch"
 # Runner-owned labels on a child session that make sub-agent result delivery
 # durable across a runner restart. The dispatch id is stamped when a turn is
 # sent to the child; the delivered id is the receipt the parent's
@@ -1840,6 +1841,63 @@ async def _fetch_latest_assistant_text(
         params["after"] = page["last_id"]
 
 
+@dataclasses.dataclass(frozen=True)
+class _LatestSessionMessage:
+    """
+    Newest message item of a session transcript, whatever its role.
+
+    :param role: Message role, e.g. ``"assistant"`` or ``"user"``.
+    :param text: Joined text blocks of the message; empty when it has none.
+    :param created_at: Server-side creation time in Unix seconds, or ``None``
+        when the item carries no timestamp.
+    """
+
+    role: str
+    text: str
+    created_at: float | None
+
+
+async def _fetch_latest_session_message(
+    server_client: httpx.AsyncClient, session_id: str
+) -> _LatestSessionMessage | None:
+    """
+    Return the newest message item of a session, reading newest first.
+
+    Unlike :func:`_fetch_latest_assistant_text` this does not skip past a
+    trailing user message: a transcript whose newest message is the parent's
+    own dispatch holds no reply to recover for that dispatch.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_child456"``.
+    :returns: The newest message, or ``None`` when the transcript has none.
+    :raises _SubagentRecoveryReadError: When a page read fails.
+    """
+    params: dict[str, str] = {"limit": "100", "order": "desc"}
+    while True:
+        page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
+        for item in page.get("data", []):
+            if item.get("type") != "message":
+                continue
+            role = item.get("role")
+            if not isinstance(role, str):
+                continue
+            raw_created = item.get("created_at")
+            created_at = (
+                float(raw_created)
+                if isinstance(raw_created, (int, float)) and not isinstance(raw_created, bool)
+                else None
+            )
+            text = "\n".join(
+                block["text"]
+                for block in item.get("content", [])
+                if block.get("type") in {"output_text", "text", "input_text"} and block.get("text")
+            )
+            return _LatestSessionMessage(role=role, text=text, created_at=created_at)
+        if not page.get("has_more") or not page.get("last_id"):
+            return None
+        params["after"] = page["last_id"]
+
+
 async def _recover_subagent_results_from_server(
     *,
     server_client: httpx.AsyncClient,
@@ -1902,6 +1960,7 @@ def mark_subagent_work_terminal(
     *,
     status: str,
     output: str | None,
+    work_id: str | None = None,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
@@ -1914,6 +1973,11 @@ def mark_subagent_work_terminal(
         If an earlier terminal report could not be delivered, a later
         report for the same child replaces the undelivered status and
         output before retrying parent inbox delivery.
+    :param work_id: Optional dispatch id guard, e.g.
+        ``"subagent_a1b2c3d4e5f6"``. When provided, the report is applied
+        only if the registered entry still belongs to that dispatch; a
+        newer dispatch is left untouched and ``"dispatch_mismatch"`` is
+        returned.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
@@ -1936,6 +2000,16 @@ def mark_subagent_work_terminal(
             delivered=False,
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_UNTRACKED,
+        )
+    if work_id is not None and entry.work_id != work_id:
+        # The caller recovered a result for an older dispatch, but a newer
+        # turn has replaced it since. Never stamp that result onto the new
+        # turn.
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=False,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_DISPATCH_MISMATCH,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
         if entry.delivered:
@@ -2177,6 +2251,10 @@ def _subagent_delivery_not_confirmed_response(
         ),
         _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX: (
             "Sub-agent terminal status arrived, but the parent inbox is missing on this runner."
+        ),
+        _SUBAGENT_DELIVERY_DISPATCH_MISMATCH: (
+            "Sub-agent terminal status arrived for an older dispatch than the one this runner "
+            "tracks for the child."
         ),
     }
     detail = detail_by_reason[reason]
@@ -4731,12 +4809,52 @@ def create_runner_app(
         if not parent_id or parent_id == conv_id:
             return None
         agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
+        # Rebuild the entry under the dispatch id the parent stamped on the
+        # child, so the inbox drain writes a matching delivery receipt. A fresh
+        # id would leave the labels permanently "undelivered" and block every
+        # later sys_session_send to this child.
+        labels = await _fresh_session_labels(conv_id)
+        dispatch_id = labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+        if dispatch_id and labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
+            # The parent already drained this dispatch; this terminal edge is a
+            # replay. Acknowledge it without queueing a duplicate result.
+            _drained_delivered_subagent_children.add(conv_id)
+            return None
         return register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            work_id=dispatch_id or None,
         )
+
+    async def _fresh_session_labels(conv_id: str) -> dict[str, str]:
+        """
+        Read a session's current labels straight from the server.
+
+        The snapshot cache may predate the dispatch, so this bypasses it.
+
+        :param conv_id: Session id, e.g. ``"conv_child456"``.
+        :returns: String labels, or ``{}`` when they cannot be read.
+        """
+        try:
+            resp = await server_client.get(f"/v1/sessions/{conv_id}")
+        except Exception:  # noqa: BLE001 — best-effort recovery
+            return {}
+        if resp.status_code != 200:
+            return {}
+        try:
+            body = resp.json()
+        except Exception:  # noqa: BLE001 — best-effort recovery
+            return {}
+        raw = body.get("labels") if isinstance(body, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            key: value
+            for key, value in raw.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
 
     async def _recover_undrained_subagent_results(parent_id: str) -> None:
         """

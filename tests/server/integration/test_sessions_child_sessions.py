@@ -2211,3 +2211,103 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     assert child_ids == {child.id}, (
         f"parent's children must be exactly the untouched source, got {child_ids}"
     )
+
+
+async def test_subagent_idle_forward_relays_to_parent_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-agent ``idle`` is also relayed through the parent's runner.
+
+    The direct forward lands on the child's own runner (204), which for a
+    host-bound child holds no dispatch entry. The terminal branch must then
+    invoke ``_forward_subagent_terminal_to_parent_runner`` for THIS child and,
+    when the relay lands, accept the event.
+    """
+    child = await _create_native_child(client, name="orch-relay-ok")
+
+    async def _forward_ok(*_args: Any, **_kwargs: Any) -> Any:
+        """Child's own runner acknowledges the status as a no-op."""
+        return sessions_module._RunnerForwardResult(status_code=204, body="")
+
+    relayed_for: list[str] = []
+
+    async def _relay_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        relayed_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_ok)
+    monkeypatch.setattr(sessions_module, "_forward_subagent_terminal_to_parent_runner", _relay_spy)
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    assert relayed_for == [child["id"]]
+
+
+async def test_subagent_idle_forward_fails_when_parent_relay_is_rejected(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent-runner relay that is rejected fails the status post loudly."""
+    child = await _create_native_child(client, name="orch-relay-rejected")
+
+    async def _forward_ok(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions_module._RunnerForwardResult(status_code=204, body="")
+
+    async def _relay_rejected(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions_module._RunnerForwardResult(status_code=503, body="not confirmed")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_ok)
+    monkeypatch.setattr(
+        sessions_module, "_forward_subagent_terminal_to_parent_runner", _relay_rejected
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert resp.status_code == 503, resp.text
+
+
+async def test_subagent_idle_forward_accepts_relay_when_child_runner_lacks_parent_inbox(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A host-bound child's own runner answers 503; the parent-runner relay decides.
+
+    The child's runner has no parent inbox, so the ordinary forward comes back
+    503 missing_parent_inbox. That must not fail the status post when the
+    relay to the parent's runner lands: the parent's dispatch entry is the one
+    that matters.
+    """
+    child = await _create_native_child(client, name="orch-relay-child-503")
+
+    async def _forward_503(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions_module._RunnerForwardResult(
+            status_code=503, body='{"reason": "missing_parent_inbox"}'
+        )
+
+    relayed_for: list[str] = []
+
+    async def _relay_ok(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        relayed_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_503)
+    monkeypatch.setattr(sessions_module, "_forward_subagent_terminal_to_parent_runner", _relay_ok)
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert relayed_for == [child["id"]]

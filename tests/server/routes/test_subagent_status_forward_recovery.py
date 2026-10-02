@@ -9,6 +9,7 @@ the parent never receives the child result.
 
 from __future__ import annotations
 
+import json
 import types
 from typing import Any
 
@@ -17,6 +18,7 @@ import pytest
 
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes.sessions import (
+    _forward_subagent_terminal_to_parent_runner,
     _recover_subagent_status_forward_via_parent,
     _RunnerForwardResult,
 )
@@ -324,3 +326,171 @@ async def test_recover_real_body_retry_resolves_healed_runner() -> None:
     # ...and the retry forwarded via the CHILD id, which the resolver — reading
     # the freshly healed runner_id — routed to the live runner.
     assert posted == ["/v1/sessions/conv_child/events"]
+
+
+# ── _forward_subagent_terminal_to_parent_runner ──────────────────────────────
+#
+# A host-bound child (e.g. a Docloop child on r820-docloop) runs on its own
+# host's runner, while the dispatch entry that feeds the parent inbox lives in
+# the parent's runner. The ordinary forward therefore lands on a runner with no
+# entry; the relay re-posts the terminal edge through the parent's runner.
+
+
+def _relay_body() -> dict[str, Any]:
+    """Return a minimal terminal ``external_session_status`` body."""
+    return {"type": "external_session_status", "data": {"status": "idle"}}
+
+
+class _RelayStore:
+    """Serve a fixed set of conversations by id."""
+
+    def __init__(self, convs: dict[str, Any]) -> None:
+        self._convs = convs
+
+    def get_conversation(self, conversation_id: str) -> Any | None:
+        return self._convs.get(conversation_id)
+
+
+async def test_relay_posts_terminal_status_through_parent_runner_when_runners_differ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-bound child's terminal edge is re-posted via the parent's runner client."""
+    child = _conv("conv_child", runner_id="R_child_host", parent_id="conv_parent")
+    parent = _conv("conv_parent", runner_id="R_parent")
+    posted: list[tuple[str, dict[str, Any]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(204)
+
+    parent_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+    resolved: list[str] = []
+
+    async def _fake_get_client(session_id: str, *_a: Any, **_k: Any) -> Any:
+        resolved.append(session_id)
+        return parent_client
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _fake_get_client)
+    try:
+        result = await _forward_subagent_terminal_to_parent_runner(
+            child,
+            None,
+            _RelayStore({"conv_parent": parent}),  # type: ignore[arg-type]
+            _relay_body(),
+        )
+    finally:
+        await parent_client.aclose()
+
+    assert result is not None and result.status_code == 204
+    # Resolved through the PARENT's binding, posted against the CHILD's path.
+    assert resolved == ["conv_parent"]
+    assert posted == [("/v1/sessions/conv_child/events", _relay_body())]
+
+
+async def test_relay_skips_when_parent_shares_child_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same-runner children need no relay: the ordinary forward already landed there."""
+    child = _conv("conv_child", runner_id="R_same", parent_id="conv_parent")
+    parent = _conv("conv_parent", runner_id="R_same")
+    resolved: list[str] = []
+
+    async def _fake_get_client(session_id: str, *_a: Any, **_k: Any) -> Any:
+        resolved.append(session_id)
+        return object()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _fake_get_client)
+
+    result = await _forward_subagent_terminal_to_parent_runner(
+        child,
+        None,
+        _RelayStore({"conv_parent": parent}),  # type: ignore[arg-type]
+        _relay_body(),
+    )
+
+    assert result is None
+    assert resolved == []
+
+
+async def test_relay_returns_none_without_parent_or_parent_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No parent, or a parent without a runner binding, leaves nothing to relay to."""
+    orphan = _conv("conv_orphan", runner_id="R_child")
+    unbound_parent = _conv("conv_parent", runner_id=None)
+    child = _conv("conv_child", runner_id="R_child", parent_id="conv_parent")
+
+    async def _never(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("runner client must not be resolved")
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _never)
+    store = _RelayStore({"conv_parent": unbound_parent})
+
+    assert (
+        await _forward_subagent_terminal_to_parent_runner(
+            orphan,
+            None,
+            store,  # type: ignore[arg-type]
+            _relay_body(),
+        )
+        is None
+    )
+    assert (
+        await _forward_subagent_terminal_to_parent_runner(
+            child,
+            None,
+            store,  # type: ignore[arg-type]
+            _relay_body(),
+        )
+        is None
+    )
+
+
+async def test_relay_returns_none_when_parent_runner_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved parent runner degrades to no relay rather than an error."""
+    child = _conv("conv_child", runner_id="R_child_host", parent_id="conv_parent")
+    parent = _conv("conv_parent", runner_id="R_parent")
+
+    async def _no_client(*_a: Any, **_k: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _no_client)
+
+    result = await _forward_subagent_terminal_to_parent_runner(
+        child,
+        None,
+        _RelayStore({"conv_parent": parent}),  # type: ignore[arg-type]
+        _relay_body(),
+    )
+
+    assert result is None
+
+
+async def test_relay_skips_when_heal_already_repointed_child_to_parent_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the heal path persisted the parent's runner on the child, nothing is relayed."""
+    stale_child = _conv("conv_child", runner_id="R_old", parent_id="conv_parent")
+    healed_child = _conv("conv_child", runner_id="R_live", parent_id="conv_parent")
+    parent = _conv("conv_parent", runner_id="R_live")
+    resolved: list[str] = []
+
+    async def _fake_get_client(session_id: str, *_a: Any, **_k: Any) -> Any:
+        resolved.append(session_id)
+        return object()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _fake_get_client)
+
+    result = await _forward_subagent_terminal_to_parent_runner(
+        stale_child,
+        None,
+        _RelayStore({"conv_parent": parent, "conv_child": healed_child}),  # type: ignore[arg-type]
+        _relay_body(),
+    )
+
+    assert result is None
+    assert resolved == []

@@ -28,6 +28,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ from omnigent.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.runner.app import _LatestSessionMessage
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
@@ -2281,6 +2283,42 @@ async def _execute_subagent_tool(
                 "fresh session with the requested budget."
             )
         child_wrapper_label = _session_wrapper_label(existing)
+        if existing.get("busy") is True:
+            return (
+                f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
+                "is already running. Use a distinct task-based title for independent "
+                "parallel work; reuse this title only to continue the same conversation "
+                "after completion."
+            )
+        # The child summary carries ``busy`` and ``current_task_status`` but no
+        # lifecycle ``status``. Recovery needs the authoritative SessionResponse
+        # in two cases: a runner-local turn that is still launching or running,
+        # and no local turn while the child's labels show an undelivered
+        # dispatch (the parent runner restarted). Terminal local entries are
+        # settled from labels alone.
+        child_snapshot: _JsonObject = existing
+        local_work = _runner_app.get_subagent_work(child_session_id)
+        summary_labels = existing.get("labels")
+        needs_snapshot = (
+            local_work is not None
+            and local_work.status not in ("completed", "failed", "cancelled")
+        ) or (
+            local_work is None
+            and isinstance(summary_labels, dict)
+            and _runner_app.undelivered_subagent_dispatch_id(summary_labels) is not None
+        )
+        if needs_snapshot:
+            fetched = await _fetch_child_session_snapshot(server_client, child_session_id)
+            if isinstance(fetched, str):
+                return fetched
+            child_snapshot = fetched
+        reconcile_error = await _reconcile_idle_subagent_work(
+            server_client=server_client,
+            child_session_id=child_session_id,
+            session_data=child_snapshot,
+        )
+        if reconcile_error is not None:
+            return reconcile_error
         existing_work = _runner_app.get_subagent_work(child_session_id)
         if existing_work is not None and existing_work.status in (
             "launching",
@@ -2292,13 +2330,6 @@ async def _execute_subagent_tool(
                 "already has a launching or running turn. Use a distinct task-based title "
                 "for independent parallel work; reuse this title only to continue the same "
                 "conversation after completion."
-            )
-        if existing.get("busy") is True:
-            return (
-                f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "is already running. Use a distinct task-based title for independent "
-                "parallel work; reuse this title only to continue the same conversation "
-                "after completion."
             )
     else:
         _auto_ordinal = False
@@ -2734,6 +2765,349 @@ async def _execute_subagent_tool(
     )
 
 
+#: Tolerance when comparing a server-stamped item time with the parent
+#: runner's local dispatch time. Both hosts are NTP-synced; this only absorbs
+#: drift, so a reply older than this before the dispatch is not its result.
+_SUBAGENT_REPLY_CLOCK_SKEW_S = 120.0
+
+
+def _is_reply_to_dispatch(
+    role: str | None,
+    created_at: float | None,
+    *,
+    dispatched_at: float,
+) -> bool:
+    """
+    Decide whether the newest transcript message answers a given dispatch.
+
+    :param role: Role of the newest message, e.g. ``"assistant"``; ``None``
+        when the transcript holds no message at all.
+    :param created_at: Server timestamp of that message in Unix seconds, or
+        ``None`` when the item carries none.
+    :param dispatched_at: Runner-local Unix time the dispatch was registered.
+    :returns: ``True`` only for an assistant message that is not older than
+        the dispatch, within :data:`_SUBAGENT_REPLY_CLOCK_SKEW_S`.
+    """
+    if role != "assistant":
+        return False
+    if created_at is None:
+        return True
+    return created_at >= dispatched_at - _SUBAGENT_REPLY_CLOCK_SKEW_S
+
+
+_SUBAGENT_NO_REPLY_OUTPUT = (
+    "The child session is idle but recorded no reply to this dispatch; no result was produced."
+)
+#: A dispatched turn whose user message is younger than this and has no reply yet
+#: may simply not have started (a host-bound runner still booting), so it is not
+#: recorded as a failure until the grace period has passed.
+_SUBAGENT_UNSTARTED_GRACE_S = 600.0
+
+
+def _classify_idle_reply(
+    latest: _LatestSessionMessage | None,
+    *,
+    dispatched_at: float | None,
+) -> tuple[str, str | None] | None:
+    """
+    Turn the newest transcript message of an idle child into a terminal result.
+
+    :param latest: Newest message, or ``None`` for an empty transcript.
+    :param dispatched_at: Runner-local dispatch time, or ``None`` when unknown
+        (the entry was lost with a runner restart).
+    :returns: ``(status, output)`` to record, or ``None`` when the dispatch is
+        recent and unanswered and the caller should wait instead.
+    """
+    if latest is None:
+        return ("failed", _SUBAGENT_NO_REPLY_OUTPUT)
+    if latest.role == "assistant":
+        if dispatched_at is None or _is_reply_to_dispatch(
+            latest.role, latest.created_at, dispatched_at=dispatched_at
+        ):
+            return ("completed", latest.text)
+        return ("failed", _SUBAGENT_NO_REPLY_OUTPUT)
+    if (
+        latest.created_at is not None
+        and time.time() - latest.created_at < _SUBAGENT_UNSTARTED_GRACE_S
+    ):
+        return None
+    return ("failed", _SUBAGENT_NO_REPLY_OUTPUT)
+
+
+async def _recover_undelivered_dispatch(
+    *,
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    session_data: _JsonObject,
+    dispatch_id: str,
+) -> str:
+    """
+    Rebuild and queue the result of a dispatch this runner no longer tracks.
+
+    After a parent-runner restart the in-memory work entry is gone while the
+    child's labels still show an undelivered dispatch. The once-per-process
+    inbox scan skips children it has already seen, so the result is recovered
+    here instead of being deferred to it.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :param session_data: Fresh ``SessionResponse`` of the child.
+    :param dispatch_id: The undelivered dispatch id from the child's labels.
+    :returns: A fail-closed message; the new send is never performed here.
+    """
+    from omnigent.runner import app as _runner_app
+
+    server_status = session_data.get("status")
+    if server_status not in ("idle", "failed"):
+        return (
+            f"Error: session {child_session_id!r} has an undelivered dispatch that is still "
+            f"in progress (status={server_status!r}); wait for completion before sending again"
+        )
+    parent_id = session_data.get("parent_session_id")
+    if not isinstance(parent_id, str) or not parent_id:
+        return (
+            f"Error: session {child_session_id!r} has an undelivered dispatch but no parent; "
+            "no new turn was sent"
+        )
+    output: str | None
+    if server_status == "failed":
+        terminal_status = "failed"
+        error = session_data.get("last_task_error")
+        output = error.get("message") if isinstance(error, dict) else None
+    else:
+        try:
+            latest = await _runner_app._fetch_latest_session_message(
+                server_client, child_session_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            return (
+                f"Error: session {child_session_id!r} is idle, but its previous result "
+                f"could not be recovered ({type(exc).__name__}); no new turn was sent"
+            )
+        # The dispatch time is unknown after a restart; the newest reply is its result.
+        classified = _classify_idle_reply(latest, dispatched_at=None)
+        if classified is None:
+            return (
+                f"Error: session {child_session_id!r} is idle but has not started answering "
+                "its last dispatch yet; wait before sending again"
+            )
+        terminal_status, output = classified
+    raw_title = session_data.get("title")
+    parsed = _parse_session_title(raw_title if isinstance(raw_title, str) else None)
+    sub_agent_name = session_data.get("sub_agent_name")
+    agent = parsed.agent or (sub_agent_name if isinstance(sub_agent_name, str) else None)
+    _runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_session_id,
+        agent=agent or "sub-agent",
+        title=parsed.title or "",
+        work_id=dispatch_id,
+    )
+    ack = _runner_app.mark_subagent_work_terminal(
+        child_session_id,
+        status=terminal_status,
+        output=output,
+        work_id=dispatch_id,
+    )
+    if not ack.delivered:
+        _runner_app.unregister_subagent_work(child_session_id, work_id=dispatch_id)
+        return (
+            f"Error: session {child_session_id!r} is idle, but the previous result "
+            "could not be delivered to the parent; no new turn was sent"
+        )
+    return (
+        f"Error: session {child_session_id!r} finished its previous turn and the result "
+        "was recovered to the inbox; call sys_read_inbox, then retry the send"
+    )
+
+
+async def _fetch_child_session_snapshot(
+    server_client: httpx.AsyncClient, child_session_id: str
+) -> _JsonObject | str:
+    """
+    Read the authoritative session snapshot of an existing child.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The decoded ``SessionResponse`` object, or a fail-closed error
+        string when it could not be read.
+    """
+    try:
+        resp = await server_client.get(f"/v1/sessions/{child_session_id}", timeout=10.0)
+    except (httpx.HTTPError, RuntimeError) as exc:
+        return (
+            f"Error: could not read session {child_session_id!r} to confirm its state "
+            f"({type(exc).__name__}); no new turn was sent"
+        )
+    if resp.status_code != 200:
+        return (
+            f"Error: could not read session {child_session_id!r} to confirm its state "
+            f"(HTTP {resp.status_code}); no new turn was sent"
+        )
+    snapshot = _string_object_dict(resp.json())
+    if snapshot is None:
+        return (
+            f"Error: session {child_session_id!r} snapshot was not an object; no new turn was sent"
+        )
+    return snapshot
+
+
+async def _reconcile_idle_subagent_work(
+    *,
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    session_data: _JsonObject,
+) -> str | None:
+    """Recover local work bookkeeping when the server confirms a child is idle.
+
+    A child runner can finish a turn without its parent runner receiving the
+    terminal status event. Before replacing the local dispatch, recover its
+    assistant result under the original dispatch id.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: Child session whose local turn may be stale.
+    :param session_data: Fresh session snapshot returned by the server.
+    :returns: ``None`` when no recovery is needed or it succeeded; otherwise
+        a fail-closed error string.
+    """
+    from omnigent.runner import app as _runner_app
+
+    work = _runner_app.get_subagent_work(child_session_id)
+    labels = session_data.get("labels")
+    if not isinstance(labels, dict):
+        if work is None:
+            return None
+        return (
+            f"Error: session {child_session_id!r} has local sub-agent work, "
+            "but its dispatch labels "
+            "are unavailable; refusing to replace the pending sub-agent turn"
+        )
+    dispatch_id = labels.get(_runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        if work is None:
+            return None
+        return (
+            f"Error: session {child_session_id!r} has local sub-agent work, "
+            "but its current dispatch "
+            "does not match the runner-local turn; refusing to replace it"
+        )
+    if labels.get(_runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
+        if work is not None and work.work_id == dispatch_id:
+            _runner_app.unregister_subagent_work(
+                child_session_id,
+                work_id=dispatch_id,
+                remember_drained_delivery=True,
+            )
+        return None
+
+    # The label pair is durable. Never overwrite an undelivered result, even
+    # after the parent runner restarts and loses its local work map. The inbox
+    # drain can reconstruct the result and persist its delivery receipt.
+    if work is None:
+        return await _recover_undelivered_dispatch(
+            server_client=server_client,
+            child_session_id=child_session_id,
+            session_data=session_data,
+            dispatch_id=dispatch_id,
+        )
+    if dispatch_id != work.work_id:
+        return (
+            f"Error: session {child_session_id!r} has an undelivered dispatch that "
+            "does not match the runner-local turn; call sys_read_inbox before sending again"
+        )
+    if work.status in ("completed", "failed", "cancelled"):
+        # Preserve the established named-child workflow: once the previous
+        # result is queued in this parent's inbox, the child may start its
+        # next turn before that inbox is drained. Receipt cleanup is guarded
+        # by work_id, so draining the older item cannot unregister the new
+        # turn. Results that could not be queued remain blocked above this
+        # point and must be recovered before a new dispatch can replace them.
+        if work.delivered:
+            return None
+        # The result exists but never reached the parent inbox (it was missing
+        # when the child finished). The parent is active now, so deliver it.
+        ack = _runner_app._deliver_subagent_completion(work)
+        if ack.delivered:
+            return (
+                f"Error: session {child_session_id!r} finished its previous turn and the "
+                "result was recovered to the inbox; call sys_read_inbox, then retry the send"
+            )
+        return (
+            f"Error: session {child_session_id!r} has a finished turn whose result could not "
+            "be delivered to the parent inbox; no new turn was sent"
+        )
+    # The session snapshot's authoritative lifecycle field is ``status``.
+    # ``busy`` exists on sub-agent list summaries, not SessionResponse, so it
+    # is absent from GET /v1/sessions/{id} and cannot gate recovery here.
+    server_status = session_data.get("status")
+    if server_status not in ("idle", "failed"):
+        return (
+            f"Error: session {child_session_id!r} has an active runner-local turn, "
+            "and the server did not confirm a terminal state "
+            f"(status={server_status!r}); wait for completion before sending again"
+        )
+
+    # A parent runner on another host never receives the child's running or
+    # terminal edges, so a local ``launching`` status says nothing about whether
+    # the child ran. The child transcript is authoritative: an assistant reply
+    # recorded after this dispatch is its result; anything older, or a trailing
+    # user message, means no reply exists for it.
+    if server_status == "failed":
+        terminal_status = "failed"
+        error = session_data.get("last_task_error")
+        output = error.get("message") if isinstance(error, dict) else None
+    else:
+        try:
+            latest = await _runner_app._fetch_latest_session_message(
+                server_client, child_session_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            return (
+                f"Error: session {child_session_id!r} is idle, but its previous result "
+                f"could not be recovered ({type(exc).__name__}); no new turn was sent"
+            )
+        classified = _classify_idle_reply(latest, dispatched_at=work.created_at)
+        if classified is None:
+            return (
+                f"Error: session {child_session_id!r} is idle but has not started answering "
+                "its last dispatch yet; wait before sending again"
+            )
+        terminal_status, output = classified
+    # The transcript read yielded to the event loop. Refuse to stamp the
+    # recovered result onto a dispatch that replaced this one meanwhile.
+    current = _runner_app.get_subagent_work(child_session_id)
+    if (
+        current is not work
+        or current.work_id != dispatch_id
+        or current.status in ("completed", "failed", "cancelled")
+    ):
+        return (
+            f"Error: session {child_session_id!r} changed while its previous result "
+            "was being recovered; retry the send"
+        )
+    ack = _runner_app.mark_subagent_work_terminal(
+        child_session_id,
+        status=terminal_status,
+        output=output,
+        work_id=dispatch_id,
+    )
+    if ack.reason == _runner_app._SUBAGENT_DELIVERY_DISPATCH_MISMATCH:
+        return (
+            f"Error: session {child_session_id!r} changed while its previous result "
+            "was being recovered; retry the send"
+        )
+    if not ack.delivered:
+        return (
+            f"Error: session {child_session_id!r} is idle, but the previous result "
+            "could not be delivered to the parent; no new turn was sent"
+        )
+
+    return (
+        f"Error: session {child_session_id!r} finished its previous turn and the result "
+        "was recovered to the inbox; call sys_read_inbox, then retry the send"
+    )
+
+
 async def _send_to_existing_session(
     target_session_id: str,
     message: str,
@@ -2799,15 +3173,23 @@ async def _send_to_existing_session(
         )
     parsed = _parse_session_title(snap_data.get("title"))
     agent_label = parsed.agent or "agent"
+    reconcile_error = await _reconcile_idle_subagent_work(
+        server_client=server_client,
+        child_session_id=target_session_id,
+        session_data=snap_data,
+    )
+    if reconcile_error is not None:
+        return reconcile_error
+    # SessionResponse carries ``status``; ``busy`` exists only on child summaries.
+    if snap_data.get("status") in ("running", "waiting"):
+        return (
+            f"Error: session {target_session_id!r} is already running; "
+            "wait for completion before sending again"
+        )
     existing_work = _runner_app.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
         return (
             f"Error: session {target_session_id!r} already has a launching or running turn; "
-            "wait for completion before sending again"
-        )
-    if snap_data.get("busy") is True:
-        return (
-            f"Error: session {target_session_id!r} is already running; "
             "wait for completion before sending again"
         )
     work_id = _runner_app.new_subagent_work_id()
