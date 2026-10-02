@@ -2252,6 +2252,10 @@ def _subagent_delivery_not_confirmed_response(
         _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX: (
             "Sub-agent terminal status arrived, but the parent inbox is missing on this runner."
         ),
+        _SUBAGENT_DELIVERY_DISPATCH_MISMATCH: (
+            "Sub-agent terminal status arrived for an older dispatch than the one this runner "
+            "tracks for the child."
+        ),
     }
     detail = detail_by_reason[reason]
     return JSONResponse(
@@ -4805,12 +4809,52 @@ def create_runner_app(
         if not parent_id or parent_id == conv_id:
             return None
         agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
+        # Rebuild the entry under the dispatch id the parent stamped on the
+        # child, so the inbox drain writes a matching delivery receipt. A fresh
+        # id would leave the labels permanently "undelivered" and block every
+        # later sys_session_send to this child.
+        labels = await _fresh_session_labels(conv_id)
+        dispatch_id = labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+        if dispatch_id and labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
+            # The parent already drained this dispatch; this terminal edge is a
+            # replay. Acknowledge it without queueing a duplicate result.
+            _drained_delivered_subagent_children.add(conv_id)
+            return None
         return register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            work_id=dispatch_id or None,
         )
+
+    async def _fresh_session_labels(conv_id: str) -> dict[str, str]:
+        """
+        Read a session's current labels straight from the server.
+
+        The snapshot cache may predate the dispatch, so this bypasses it.
+
+        :param conv_id: Session id, e.g. ``"conv_child456"``.
+        :returns: String labels, or ``{}`` when they cannot be read.
+        """
+        try:
+            resp = await server_client.get(f"/v1/sessions/{conv_id}")
+        except Exception:  # noqa: BLE001 — best-effort recovery
+            return {}
+        if resp.status_code != 200:
+            return {}
+        try:
+            body = resp.json()
+        except Exception:  # noqa: BLE001 — best-effort recovery
+            return {}
+        raw = body.get("labels") if isinstance(body, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            key: value
+            for key, value in raw.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
 
     async def _recover_undrained_subagent_results(parent_id: str) -> None:
         """

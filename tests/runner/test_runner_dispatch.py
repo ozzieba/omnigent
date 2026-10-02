@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -8607,10 +8608,104 @@ async def test_sys_session_send_keeps_local_turn_guard_when_server_is_busy(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_send_does_not_overwrite_undelivered_dispatch_after_restart(
+async def test_sys_session_send_recovers_untracked_dispatch_after_runner_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Durable dispatch labels protect inbox results absent from local memory."""
+    """
+    Durable dispatch labels let a restarted runner recover a result it never tracked.
+
+    The in-memory work entry is gone, the child's labels still show an
+    undelivered dispatch and the server reports the child idle. The send must
+    rebuild the entry under that dispatch id, queue the reply and only then
+    accept a new turn after the drain receipt, instead of deferring to an inbox
+    scan that would skip the child forever.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_caller"] = session_inbox
+    event_posts: list[dict[str, Any]] = []
+    labels = {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_unread"}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                    "status": "idle",
+                    "labels": labels,
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child/items":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Restart-era result."}],
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            first_output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+            assert "recovered to the inbox" in first_output
+            assert event_posts == []
+            recovered = session_inbox.get_nowait()
+            assert recovered["work_id"] == "subagent_unread"
+            assert recovered["status"] == "completed"
+            assert recovered["output"] == "Restart-era result."
+            assert recovered["agent"] == "researcher"
+
+            labels[runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY] = "subagent_unread"
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._drained_delivered_subagent_children.discard("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert event_posts[0]["data"]["content"][0]["text"] == "continue"
+    assert json.loads(output)["status"] == "launching"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_waits_while_untracked_dispatch_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An untracked but still running dispatch blocks the send without a result."""
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -8625,7 +8720,7 @@ async def test_sys_session_send_does_not_overwrite_undelivered_dispatch_after_re
                     "id": "conv_child",
                     "parent_session_id": "conv_caller",
                     "title": "researcher:auth",
-                    "status": "idle",
+                    "status": "running",
                     "labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_unread"},
                 },
             )
@@ -8647,8 +8742,217 @@ async def test_sys_session_send_does_not_overwrite_undelivered_dispatch_after_re
             session_inbox=asyncio.Queue(),
         )
 
-    assert "undelivered prior result" in output
-    assert "sys_read_inbox" in output
+    assert "still in progress" in output
+    assert runner_app.get_subagent_work("conv_child") is None
+    assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_waits_for_recent_unstarted_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A fresh dispatch with no reply yet is not recorded as a failed result.
+
+    An idle server status also describes a dispatched turn that has not started
+    (a host-bound runner still booting). Within the grace window the send waits
+    instead of stamping "no reply", which would swallow the genuine reply later.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref["conv_caller"] = session_inbox
+    work = runner_app.register_subagent_work(
+        parent_session_id="conv_caller",
+        child_session_id="conv_child",
+        agent="researcher",
+        title="auth",
+        work_id="subagent_previous",
+    )
+    work.status = "launching"
+    event_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                    "status": "idle",
+                    "labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_previous"},
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child/items":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "created_at": int(time.time()) - 30,
+                            "content": [{"type": "input_text", "text": "the dispatched prompt"}],
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+            assert work.status == "launching"
+            assert work.output is None
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert "has not started answering" in output
+    assert session_inbox.empty()
+    assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_redelivers_undelivered_terminal_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished result that never reached the inbox is delivered before a new send."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    # The inbox was missing when the child finished, so delivery failed then.
+    work = runner_app.register_subagent_work(
+        parent_session_id="conv_caller",
+        child_session_id="conv_child",
+        agent="researcher",
+        title="auth",
+        work_id="subagent_previous",
+    )
+    failed_ack = runner_app.mark_subagent_work_terminal(
+        "conv_child", status="completed", output="LATE_RESULT"
+    )
+    assert failed_ack.delivered is False
+    runner_app._session_inboxes_ref["conv_caller"] = session_inbox
+    event_posts: list[dict[str, Any]] = []
+    labels = {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_previous"}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                    "status": "idle",
+                    "labels": labels,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            first_output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+            assert "recovered to the inbox" in first_output
+            assert event_posts == []
+            assert work.delivered is True
+            assert session_inbox.get_nowait()["output"] == "LATE_RESULT"
+
+            labels[runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY] = "subagent_previous"
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._drained_delivered_subagent_children.discard("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert event_posts[0]["data"]["content"][0]["text"] == "continue"
+    assert json.loads(output)["status"] == "launching"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_rejects_child_running_on_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child the server reports running is not sent to, even with no local turn."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    event_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                    "status": "running",
+                    "labels": {},
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps({"session_id": "conv_child", "args": "continue"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+            session_inbox=asyncio.Queue(),
+        )
+
+    assert "is already running" in output
     assert event_posts == []
 
 

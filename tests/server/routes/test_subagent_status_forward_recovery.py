@@ -468,3 +468,29 @@ async def test_relay_returns_none_when_parent_runner_unreachable(
     )
 
     assert result is None
+
+
+async def test_relay_skips_when_heal_already_repointed_child_to_parent_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the heal path persisted the parent's runner on the child, nothing is relayed."""
+    stale_child = _conv("conv_child", runner_id="R_old", parent_id="conv_parent")
+    healed_child = _conv("conv_child", runner_id="R_live", parent_id="conv_parent")
+    parent = _conv("conv_parent", runner_id="R_live")
+    resolved: list[str] = []
+
+    async def _fake_get_client(session_id: str, *_a: Any, **_k: Any) -> Any:
+        resolved.append(session_id)
+        return object()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _fake_get_client)
+
+    result = await _forward_subagent_terminal_to_parent_runner(
+        stale_child,
+        None,
+        _RelayStore({"conv_parent": parent, "conv_child": healed_child}),  # type: ignore[arg-type]
+        _relay_body(),
+    )
+
+    assert result is None
+    assert resolved == []

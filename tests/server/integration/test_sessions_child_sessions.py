@@ -2274,3 +2274,40 @@ async def test_subagent_idle_forward_fails_when_parent_relay_is_rejected(
     )
 
     assert resp.status_code == 503, resp.text
+
+
+async def test_subagent_idle_forward_accepts_relay_when_child_runner_lacks_parent_inbox(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A host-bound child's own runner answers 503; the parent-runner relay decides.
+
+    The child's runner has no parent inbox, so the ordinary forward comes back
+    503 missing_parent_inbox. That must not fail the status post when the
+    relay to the parent's runner lands: the parent's dispatch entry is the one
+    that matters.
+    """
+    child = await _create_native_child(client, name="orch-relay-child-503")
+
+    async def _forward_503(*_args: Any, **_kwargs: Any) -> Any:
+        return sessions_module._RunnerForwardResult(
+            status_code=503, body='{"reason": "missing_parent_inbox"}'
+        )
+
+    relayed_for: list[str] = []
+
+    async def _relay_ok(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        relayed_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=204, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_503)
+    monkeypatch.setattr(sessions_module, "_forward_subagent_terminal_to_parent_runner", _relay_ok)
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert relayed_for == [child["id"]]

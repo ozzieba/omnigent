@@ -2590,7 +2590,13 @@ async def _forward_subagent_terminal_to_parent_runner(
     parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
     if parent is None or parent.runner_id is None:
         return None
-    if parent.runner_id == child_conv.runner_id:
+    # The heal path may have just repointed the child's runner_id in the store;
+    # compare against the persisted binding, not the request-time snapshot.
+    current_child = await asyncio.to_thread(conversation_store.get_conversation, child_conv.id)
+    child_runner_id = (
+        current_child.runner_id if current_child is not None else child_conv.runner_id
+    )
+    if parent.runner_id == child_runner_id:
         return None
     client = await _get_runner_client(parent_id, runner_router, conversation=parent)
     if client is None:
