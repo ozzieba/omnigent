@@ -3250,6 +3250,11 @@ def inject_user_message(
             "consuming the paste — the message was not submitted. Retry the send."
         )
     time.sleep(_PASTE_SETTLE_S)
+    # The bridge's own ``UserPromptSubmit`` hook appends a record the moment
+    # Claude Code accepts a prompt, so a new record after this cursor is
+    # positive proof of submission. Bridges whose hook log is still empty
+    # (hooks not wired yet) fall back to judging by the input box alone.
+    hook_cursor = count_hook_events(bridge_dir)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
@@ -3259,18 +3264,49 @@ def inject_user_message(
     # empty prompt or a permission dialog of the started turn.
     deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
     last_enter = time.monotonic()
+    draft_gone = False
     while time.monotonic() < deadline:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(info["socket_path"], info["tmux_target"])
-        if not _draft_in_input_box(pane, needle):
+        if hook_cursor and _user_prompt_submitted_since(bridge_dir, hook_cursor):
             return
+        pane = _capture_pane(info["socket_path"], info["tmux_target"])
+        if not pane.strip():
+            # A failed or torn capture shows nothing; it proves neither way.
+            continue
+        if not _draft_in_input_box(pane, needle):
+            if not hook_cursor:
+                return
+            # The draft left the box but Claude Code has not reported the
+            # prompt: a resumed session's re-render can wipe an unsent
+            # draft. Keep waiting for the hook rather than calling it sent.
+            draft_gone = True
+            continue
+        draft_gone = False
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
             _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
             last_enter = time.monotonic()
+    if draft_gone:
+        raise RuntimeError(
+            f"The draft left Claude Code's input box but no prompt was submitted within "
+            f"{_SUBMIT_VERIFY_TIMEOUT_S}s (no UserPromptSubmit hook record). The message "
+            "was not delivered."
+        )
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
+
+
+def _user_prompt_submitted_since(bridge_dir: Path, hook_cursor: int) -> bool:
+    """
+    Whether a ``UserPromptSubmit`` hook record landed after *hook_cursor*.
+
+    :param bridge_dir: Bridge directory path.
+    :param hook_cursor: Hook record count taken before the submit Enter.
+    :returns: ``True`` once Claude Code has reported accepting a prompt.
+    """
+    _cursor, names = read_hook_events_since(bridge_dir, hook_cursor)
+    return "UserPromptSubmit" in names
 
 
 def inject_interrupt(
@@ -4184,13 +4220,22 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         only the paste placeholder is then considered.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
+    lines = pane.splitlines()
+    glyph_rows = [idx for idx, line in enumerate(lines) if _CLAUDE_PROMPT_GLYPH in line]
+    if not glyph_rows:
         return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
+    start = glyph_rows[-1]
+    # The draft can wrap past the glyph row: a collapsed paste renders as an
+    # empty ``❯`` row with the ``[Pasted text #1 +N lines]`` placeholder on
+    # the row below. Read every row of the box down to its closing rule.
+    box_rows = [lines[start].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]]
+    for line in lines[start + 1 :]:
+        if _is_box_rule(line):
+            break
+        box_rows.append(line)
+    if any(_PASTED_PLACEHOLDER_PREFIX in row for row in box_rows):
         return True
-    return bool(needle) and needle in tail
+    return bool(needle) and any(needle in row for row in box_rows)
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
