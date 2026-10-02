@@ -1136,7 +1136,7 @@ def register_core_routes(
             for conv in page.data:
                 if conv.labels.get(_SLACK_ORCHESTRATOR_GRANT_LABEL) == grant_id:
                     await _register_capability_session(request, conv.id)
-                    if permission_store is not None:
+                    if permission_store is not None and user_id is not None:
                         await asyncio.to_thread(permission_store.ensure_user, user_id)
                         await asyncio.to_thread(
                             permission_store.grant, user_id, conv.id, LEVEL_OWNER

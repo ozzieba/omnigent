@@ -478,9 +478,7 @@ class UnifiedAuthProvider(AuthProvider):
         """
         self._grant_revoked = check
 
-    def set_grant_context_lookup(
-        self, lookup: Callable[[str], dict[str, Any] | None]
-    ) -> None:
+    def set_grant_context_lookup(self, lookup: Callable[[str], dict[str, Any] | None]) -> None:
         """Wire live claim validation for restricted device grants."""
         self._grant_context = lookup
 
@@ -631,9 +629,8 @@ class UnifiedAuthProvider(AuthProvider):
                     if isinstance(actor, dict) and set(actor) == {"client_id"}
                     else None
                 )
-                if (
-                    self._grant_context is None
-                    or not path_allowed(str(request.scope.get("method", "")), request.url.path)
+                if self._grant_context is None or not path_allowed(
+                    str(request.scope.get("method", "")), request.url.path
                 ):
                     return None
                 context = self._grant_context(grant_id)

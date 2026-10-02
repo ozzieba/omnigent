@@ -16,6 +16,7 @@ Everything is cached: an in-process TTL cache plus a on-disk snapshot under
 ``~/.cache/omnigent/``. A gateway failure degrades to the last snapshot and
 then to unpriced CLI rows, so the picker still renders.
 """
+
 from __future__ import annotations
 
 import json
@@ -51,6 +52,7 @@ TTL_SECONDS = float(os.environ.get("LLMQ_CATALOG_TTL_SECONDS", "600"))
 _TIMEOUT_S = 8.0
 
 _cache: dict[str, Any] = {"fetched_at": 0.0, "models": []}
+
 
 def _fetch_llmq_catalog(token: str) -> list[dict[str, Any]]:
     """The merged cross-upstream catalog: prices + pareto + eval scores."""
@@ -89,9 +91,9 @@ def _catalog_entry(upstream: str, bare: str) -> dict[str, Any] | None:
     by_key = _catalog_by_key()
     entry = by_key.get((upstream, bare))
     if entry is None:
-        for (up, model), entry in by_key.items():
+        for (_up, model), candidate in by_key.items():
             if model == bare or model.endswith("/" + bare):
-                return entry
+                return candidate
     return entry
 
 
@@ -110,7 +112,6 @@ def _decorate(display: str, entry: dict[str, Any] | None) -> str:
     if entry.get("pareto"):
         bits.append("\u2605")
     return display + "  [" + " \u00b7 ".join(bits) + "]"
-
 
 
 def _gateway_token() -> str | None:
@@ -257,9 +258,7 @@ def merge_llmq_pricing(cli_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "id": display,
                 "model": llmq_row["bare_id"],
                 "providerID": _UPSTREAM,
-                "displayName": _decorate(
-                    display, _catalog_entry(_UPSTREAM, llmq_row["bare_id"])
-                ),
+                "displayName": _decorate(display, _catalog_entry(_UPSTREAM, llmq_row["bare_id"])),
                 "name": llmq_row["bare_id"],
                 "isDefault": False,
                 "pricing": llmq_row.get("pricing"),
@@ -287,22 +286,28 @@ def merge_llmq_pricing(cli_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             in_usd = float(entry.get("input_usd_per_million") or 0)
             out_usd = float(entry.get("output_usd_per_million") or 0)
-            price = {"input_per_million_usd": in_usd,
-                     "cached_input_per_million_usd": float(entry.get("cached_input_per_million_usd") or 0),
-                     "output_per_million_usd": out_usd}
+            price = {
+                "input_per_million_usd": in_usd,
+                "cached_input_per_million_usd": float(
+                    entry.get("cached_input_per_million_usd") or 0
+                ),
+                "output_per_million_usd": out_usd,
+            }
             decorated = _decorate(full, entry)
-            rows.append({
-                "id": full,
-                "model": model,
-                "providerID": upstream,
-                "displayName": decorated,
-                "name": model,
-                "isDefault": False,
-                "pricing": price,
-                "eval_score": entry.get("eval_score"),
-                "pareto": True,
-                "source": "llmq-catalog",
-            })
+            rows.append(
+                {
+                    "id": full,
+                    "model": model,
+                    "providerID": upstream,
+                    "displayName": decorated,
+                    "name": model,
+                    "isDefault": False,
+                    "pricing": price,
+                    "eval_score": entry.get("eval_score"),
+                    "pareto": True,
+                    "source": "llmq-catalog",
+                }
+            )
             appended_ids.add(full)
     except Exception:  # noqa: BLE001 - the picker must render without llmq
         pass

@@ -20,11 +20,15 @@ def _isolated_cache(monkeypatch: pytest.MonkeyPatch, tmp_path):
 
 def _llmq_rows() -> list[dict]:
     return [
-        {"id": "opencode-go/glm-5.3-flash", "bare_id": "glm-5.3-flash", "pricing": {
-            "input_per_million_usd": 0.2,
-            "cached_input_per_million_usd": 0.05,
-            "output_per_million_usd": 1.0,
-        }},
+        {
+            "id": "opencode-go/glm-5.3-flash",
+            "bare_id": "glm-5.3-flash",
+            "pricing": {
+                "input_per_million_usd": 0.2,
+                "cached_input_per_million_usd": 0.05,
+                "output_per_million_usd": 1.0,
+            },
+        },
         {"id": "opencode-go/minimax-m3", "bare_id": "minimax-m3", "pricing": None},
     ]
 

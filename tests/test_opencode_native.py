@@ -670,3 +670,29 @@ def test_run_with_remote_server_records_launch_after_create(
     )
 
     assert order == ["ensure-daemon", "prepare", "record", "attach"]
+
+
+def test_materialized_spec_declares_personal_cloud_mcp_only_when_bridge_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fleet's personal-cloud MCP bridge is declared only where it is installed.
+
+    r820 carries the bridge at the default path; other hosts must not get a dead
+    ``mcp`` command in the synthesized opencode config.
+    """
+    from omnigent.opencode_native import _materialize_opencode_agent_spec
+
+    bridge = tmp_path / "personal-cloud-stdio-bridge"
+    bridge.write_text("#!/bin/sh\nexit 0\n")
+    bridge.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_PERSONAL_CLOUD_STDIO_BRIDGE", str(bridge))
+    with_bridge = tmp_path / "with"
+    with_bridge.mkdir()
+    spec = yaml.safe_load(_materialize_opencode_agent_spec(with_bridge).read_text())
+    assert spec["tools"] == {"personal-cloud": {"type": "mcp", "command": str(bridge)}}
+
+    monkeypatch.setenv("OMNIGENT_PERSONAL_CLOUD_STDIO_BRIDGE", str(tmp_path / "missing"))
+    without = tmp_path / "without"
+    without.mkdir()
+    spec = yaml.safe_load(_materialize_opencode_agent_spec(without).read_text())
+    assert "tools" not in spec

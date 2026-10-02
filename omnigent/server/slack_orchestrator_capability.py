@@ -14,7 +14,6 @@ from typing import Any, NoReturn
 
 from fastapi import HTTPException, Request
 
-
 CLIENT_ID = "slack-orchestrator-gateway"
 SCOPE = "slack-orchestrator"
 POLICY_FILE_ENV = "OMNIGENT_SLACK_ORCHESTRATOR_CAPABILITY_FILE"
@@ -98,10 +97,20 @@ class CapabilityPolicy:
         if not self.templates or len({item.key for item in self.templates}) != len(self.templates):
             raise ValueError("invalid templates")
         for item in self.templates:
-            if (not NAME.fullmatch(item.name_prefix) or
-                    not item.name_prefix.endswith("-orch") or
-                    not all((item.key, item.family, item.agent_id, item.model_override,
-                             item.harness_override, item.host_id))):
+            if (
+                not NAME.fullmatch(item.name_prefix)
+                or not item.name_prefix.endswith("-orch")
+                or not all(
+                    (
+                        item.key,
+                        item.family,
+                        item.agent_id,
+                        item.model_override,
+                        item.harness_override,
+                        item.host_id,
+                    )
+                )
+            ):
                 raise ValueError("invalid template")
 
 
@@ -128,8 +137,13 @@ def _raw_path(request: Request) -> str:
         path = bytes(value).decode("ascii")
     except (UnicodeDecodeError, TypeError, ValueError):
         _deny("non-canonical capability path")
-    if ("%" in path or "\\" in path or "//" in path or path.endswith("/") or
-            any(part in {".", ".."} for part in path.split("/"))):
+    if (
+        "%" in path
+        or "\\" in path
+        or "//" in path
+        or path.endswith("/")
+        or any(part in {".", ".."} for part in path.split("/"))
+    ):
         _deny("non-canonical capability path")
     return path
 
@@ -214,18 +228,23 @@ def authorize_list(request: Request) -> None:
 
 
 def authorize_items(request: Request, session_id: str, allowed: frozenset[str]) -> None:
-    if (request.method != "GET" or
-            _raw_path(request) != f"/v1/sessions/{session_id}/items" or
-            session_id not in allowed
-            or _query(request) != {"limit": "50", "order": "asc"}
-            or _raw_query(request) != b"limit=50&order=asc"):
+    if (
+        request.method != "GET"
+        or _raw_path(request) != f"/v1/sessions/{session_id}/items"
+        or session_id not in allowed
+        or _query(request) != {"limit": "50", "order": "asc"}
+        or _raw_query(request) != b"limit=50&order=asc"
+    ):
         _deny("capability items request denied")
 
 
 def authorize_event(request: Request, session_id: str, allowed: frozenset[str], body: Any) -> None:
-    if (request.method != "POST" or
-            _raw_path(request) != f"/v1/sessions/{session_id}/events" or
-            session_id not in allowed or _query(request)):
+    if (
+        request.method != "POST"
+        or _raw_path(request) != f"/v1/sessions/{session_id}/events"
+        or session_id not in allowed
+        or _query(request)
+    ):
         _deny("capability event request denied")
     if (
         not isinstance(body, Mapping)
@@ -274,14 +293,21 @@ def authorize_create(request: Request, policy: CapabilityPolicy, body: Any) -> N
             or not isinstance(labels, Mapping)
         ):
             continue
-        keys = {"slack_orch.registry_id", "slack_orch.type", "slack_orch.family",
-                "slack_orch.name", "slack_orch.catalog_sha256"}
+        keys = {
+            "slack_orch.registry_id",
+            "slack_orch.type",
+            "slack_orch.family",
+            "slack_orch.name",
+            "slack_orch.catalog_sha256",
+        }
         if set(labels) != keys:
             continue
-        if (REGISTRY.fullmatch(str(labels["slack_orch.registry_id"])) and
-                labels["slack_orch.type"] == template.key and
-                labels["slack_orch.family"] == template.family and
-                labels["slack_orch.name"] == title and
-                labels["slack_orch.catalog_sha256"] == policy.catalog_sha256):
+        if (
+            REGISTRY.fullmatch(str(labels["slack_orch.registry_id"]))
+            and labels["slack_orch.type"] == template.key
+            and labels["slack_orch.family"] == template.family
+            and labels["slack_orch.name"] == title
+            and labels["slack_orch.catalog_sha256"] == policy.catalog_sha256
+        ):
             return
     _deny("create body does not match a reviewed template")

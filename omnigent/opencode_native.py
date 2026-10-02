@@ -71,9 +71,19 @@ _AGENT_NAME = "opencode-native-ui"
 # Personal-cloud MCP stdio bridge installed by the agent fleet. Declared on the
 # generated spec so the server translates it into the session's opencode ``mcp``
 # block (the per-session XDG config otherwise hides the user's global entry).
-_PERSONAL_CLOUD_STDIO_BRIDGE = (
+# Override the path with OMNIGENT_PERSONAL_CLOUD_STDIO_BRIDGE. The entry is only
+# declared when the bridge is executable on this host, so a host without the
+# fleet install does not hand opencode a dead MCP command.
+_PERSONAL_CLOUD_STDIO_BRIDGE_ENV = "OMNIGENT_PERSONAL_CLOUD_STDIO_BRIDGE"
+_PERSONAL_CLOUD_STDIO_BRIDGE_DEFAULT = (
     "/home/oz/.local/libexec/oz-agent-fleet/personal-cloud-stdio-bridge"
 )
+
+
+def _personal_cloud_stdio_bridge() -> str | None:
+    """Return the personal-cloud MCP bridge path when it is installed here."""
+    path = os.environ.get(_PERSONAL_CLOUD_STDIO_BRIDGE_ENV) or _PERSONAL_CLOUD_STDIO_BRIDGE_DEFAULT
+    return path if os.access(path, os.X_OK) else None
 
 
 def _materialize_opencode_agent_spec(
@@ -115,19 +125,16 @@ def _materialize_opencode_agent_spec(
         # is a non-empty ``terminals:`` block on this spec). Its command
         # follows the user's ``$SHELL`` (zsh/fish/bash).
         "terminals": native_shell_terminal_spec(),
-        # The per-session XDG_CONFIG_HOME override hides the user's global
-        # ~/.config/opencode/opencode.json, so the personal-cloud MCP declared
-        # there never reaches the session. Declare it on the agent spec: the
-        # runner translates ``mcp_servers`` into opencode's ``mcp`` block
-        # (see _opencode_native_mcp_servers_from_spec). Only declared servers
-        # reach the synthesized config; the global mcp block is not inherited.
-        "tools": {
-            "personal-cloud": {
-                "type": "mcp",
-                "command": _PERSONAL_CLOUD_STDIO_BRIDGE,
-            },
-        },
     }
+    # The per-session XDG_CONFIG_HOME override hides the user's global
+    # ~/.config/opencode/opencode.json, so the personal-cloud MCP declared
+    # there never reaches the session. Declare it on the agent spec: the
+    # runner translates ``mcp_servers`` into opencode's ``mcp`` block
+    # (see _opencode_native_mcp_servers_from_spec). Only declared servers
+    # reach the synthesized config; the global mcp block is not inherited.
+    bridge = _personal_cloud_stdio_bridge()
+    if bridge is not None:
+        raw["tools"] = {"personal-cloud": {"type": "mcp", "command": bridge}}
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path
 

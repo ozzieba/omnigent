@@ -32,13 +32,13 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint(
             "workspace_id", "grant_id", "session_id", name="pk_device_grant_sessions"
         ),
-        sa.UniqueConstraint(
-            "workspace_id", "session_id", name="uq_device_grant_sessions_session"
-        ),
+        sa.UniqueConstraint("workspace_id", "session_id", name="uq_device_grant_sessions_session"),
     )
 
 
 def downgrade() -> None:
     op.drop_table("device_grant_sessions")
-    op.drop_column("device_grants", "approved_by_user_id")
-    op.drop_column("device_grants", "capability_json")
+    # Batched so the downgrade also works on SQLite (no raw DROP COLUMN).
+    with op.batch_alter_table("device_grants") as batch_op:
+        batch_op.drop_column("approved_by_user_id")
+        batch_op.drop_column("capability_json")

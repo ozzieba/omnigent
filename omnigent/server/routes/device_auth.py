@@ -475,7 +475,9 @@ def create_oauth_token_router(
         scope = (
             SLACK_ORCHESTRATOR_SCOPE
             if capability is not None
-            else None if _is_login_grant(client_id) else DELEGATED_SCOPE
+            else None
+            if _is_login_grant(client_id)
+            else DELEGATED_SCOPE
         )
         return mint_delegated_token(
             user_id,
