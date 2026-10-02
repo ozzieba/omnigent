@@ -795,11 +795,11 @@ class SessionResourceRegistry:
         if existing is not None:
             return existing
 
+        from omnigent.server.environment_discovery import environment_profile_discovery_index
         from omnigent.server.environment_profiles import (
             environment_profile_agent_guide,
             environment_profile_catalog,
         )
-        from omnigent.server.environment_discovery import environment_profile_discovery_index
 
         tempdir = tempfile.TemporaryDirectory(prefix="omnigent-environment-")
         root = Path(tempdir.name)

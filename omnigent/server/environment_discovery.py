@@ -29,7 +29,10 @@ def environment_profile_discovery_index(reference: str) -> dict[str, Any] | None
                 "authorization_owner": sessions.authorization_owner,
                 "interfaces": list(sessions.interfaces),
                 "workflow": [
-                    "Call sys_session_list to discover sessions visible under the current session.",
+                    (
+                        "Call sys_session_list to discover sessions visible "
+                        "under the current session."
+                    ),
                     "Call sys_session_get_info for one returned session ID.",
                     "Call sys_session_get_history only when transcript context is needed.",
                 ],
@@ -45,8 +48,14 @@ def environment_profile_discovery_index(reference: str) -> dict[str, Any] | None
                 "authorization_owner": agents.authorization_owner,
                 "interfaces": list(agents.interfaces),
                 "workflow": [
-                    "Call sys_agent_list to discover built-in, local, and accessible session agents.",
-                    "Use sys_agent_get or sys_agent_download only with an agent ID returned by an authorized listing.",
+                    (
+                        "Call sys_agent_list to discover built-in, local, and "
+                        "accessible session agents."
+                    ),
+                    (
+                        "Use sys_agent_get or sys_agent_download only with an "
+                        "agent ID returned by an authorized listing."
+                    ),
                 ],
             }
         )
