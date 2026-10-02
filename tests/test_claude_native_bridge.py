@@ -9212,3 +9212,186 @@ def test_inject_user_message_whitespace_only_content_submits_blind(
 
     # Whitespace-only content has no identifiable needle — must not raise.
     inject_user_message(bridge_dir, content="   \n  \n  ")
+
+
+def _stuck_paste_pane() -> str:
+    """
+    Render the composer as a swallowed submit left it on r820, 2026-10-02.
+
+    The Enter folded into the paste as a newline: the ``❯`` row is empty
+    and the collapsed-paste placeholder sits on the row below it, still
+    inside the box.
+
+    :returns: The pane text.
+    """
+    return """\
+──────────────────────────────
+❯ 
+  [Pasted text #1 +11 lines]
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
+def _seed_hook_log(bridge_dir: Path, *names: str) -> Path:
+    """
+    Write hook records the bridge's own hooks would have appended.
+
+    :param bridge_dir: Bridge directory path.
+    :param names: Hook event names, e.g. ``"SessionStart"``.
+    :returns: The ``hooks.jsonl`` path.
+    """
+    hooks_path = bridge_dir / "hooks.jsonl"
+    with hooks_path.open("a", encoding="utf-8") as handle:
+        for name in names:
+            handle.write(json.dumps({"payload": {"hook_event_name": name}}) + "\n")
+    return hooks_path
+
+
+def test_draft_in_input_box_sees_placeholder_wrapped_below_prompt_row() -> None:
+    """A placeholder on the row under an empty ``❯`` row is still the draft."""
+    assert claude_native_bridge._draft_in_input_box(_stuck_paste_pane(), "brief line")
+    # The shortcuts row under the closing rule is never part of the draft.
+    assert not claude_native_bridge._draft_in_input_box(_composer_pane(), "for shortcuts")
+
+
+def _patch_fast_submit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """
+    Shrink submit polling to milliseconds and return a ready bridge dir.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest temporary directory.
+    :returns: Bridge directory with a tmux target written.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    return bridge_dir
+
+
+def test_inject_user_message_retries_enter_when_placeholder_wraps_below_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A swallowed Enter that pushes the placeholder below ``❯`` is retried.
+
+    The check used to read only the ``❯`` row, so this frame counted as
+    submitted and the brief sat unsent in the composer.
+    """
+    bridge_dir = _patch_fast_submit(monkeypatch, tmp_path)
+    enters: list[list[str]] = []
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("[Pasted text #1 +11 lines]")
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            tui["pane"] = _stuck_paste_pane() if len(enters) == 1 else _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="brief line\n" + "detail\n" * 11)
+
+    assert len(enters) == 2
+
+
+def test_inject_user_message_raises_when_draft_vanishes_without_prompt_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A draft wiped without a ``UserPromptSubmit`` record is not delivered.
+
+    A resumed session's re-render cleared the unsent draft on p16v; an
+    empty box used to read as submitted and the turn ended silently.
+    """
+    bridge_dir = _patch_fast_submit(monkeypatch, tmp_path)
+    _seed_hook_log(bridge_dir, "SessionStart")
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()  # draft gone, no prompt accepted
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="no UserPromptSubmit"):
+        inject_user_message(bridge_dir, content="fix the flaky test")
+
+
+def test_inject_user_message_accepts_submit_confirmed_by_hook_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``UserPromptSubmit`` record confirms delivery even if a dialog hides the box."""
+    bridge_dir = _patch_fast_submit(monkeypatch, tmp_path)
+    _seed_hook_log(bridge_dir, "SessionStart")
+    enters: list[list[str]] = []
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            _seed_hook_log(bridge_dir, "UserPromptSubmit")
+            tui["pane"] = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert len(enters) == 1
+
+
+def test_inject_user_message_ignores_empty_capture_after_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank capture after Enter is not proof the message was submitted."""
+    bridge_dir = _patch_fast_submit(monkeypatch, tmp_path)
+    enters: list[list[str]] = []
+    tui = {"pane": _composer_pane(), "blank_reads": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            if enters and tui["blank_reads"] < 2:
+                tui["blank_reads"] += 1
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            if len(enters) > 1:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    # The first Enter was swallowed (draft still there behind two blank
+    # reads); only a retry clears it.
+    assert len(enters) == 2
