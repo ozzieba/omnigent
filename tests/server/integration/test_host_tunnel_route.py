@@ -849,3 +849,58 @@ async def test_invalid_managed_token_refused_before_accept(
     assert registry.get(_HOST_ID) is None
     host = store.get_host(_HOST_ID)
     assert host is None or host.status == "offline"
+
+
+async def test_ping_loop_heals_offline_status_of_registered_host(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live, registered tunnel must not stay ``offline`` after a stray set_offline."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+
+    app, registry, store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    store.set_offline(_HOST_ID)
+
+    async def _wait_online() -> None:
+        while not store.is_online(_HOST_ID):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_wait_online(), timeout=2.0)
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_failed_duplicate_connect_keeps_live_host_online(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second connect that fails after upsert must not mark a live host offline."""
+    app, registry, store = host_app
+    live = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(live, registry)
+    live_conn = registry.get(_HOST_ID)
+    assert live_conn is not None
+
+    def _fail_register(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(registry, "register", _fail_register)
+    dup = await _connect_route(app, _TUNNEL_PATH)
+    await dup.send_input({"type": "websocket.receive", "text": _make_hello()})
+    sent = await dup.receive_output(timeout=1.0)
+    assert decode_host_frame(sent["text"]).stage == "registry"
+    # Let the failed handler run to completion, including its error-path cleanup.
+    await dup.wait(timeout=2.0)
+
+    assert registry.get(_HOST_ID) is live_conn
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "online"
+
+    await live.send_input({"type": "websocket.disconnect", "code": 1000})

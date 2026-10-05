@@ -961,3 +961,28 @@ def test_register_managed_host_refuses_cross_owner_recredential(db_uri: str) -> 
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+def test_heartbeat_mark_online_restores_stuck_offline_status(host_store: HostStore) -> None:
+    """
+    Verify a heartbeat from the registered tunnel heals a stuck ``offline`` row.
+
+    ``set_offline`` can run for a host whose live tunnel is still registered (a
+    failed duplicate connect, or a peer replica's error path). Plain heartbeats
+    keep ``updated_at`` fresh but never touch ``status``, so the host would read
+    offline forever while it is in fact serving launches.
+    """
+    host_id = "5d1f0c7e2b9a4e8f9c3d6a1b0e7f2c4d"
+    host_store.upsert_on_connect(host_id, "server", "alice@example.com")
+    host_store.set_offline(host_id)
+
+    host_store.heartbeat(host_id)
+    stuck = host_store.get_host(host_id)
+    assert stuck is not None
+    assert stuck.status == "offline"
+
+    host_store.heartbeat(host_id, mark_online=True)
+    healed = host_store.get_host(host_id)
+    assert healed is not None
+    assert healed.status == "online"
+    assert host_store.is_online(host_id)
