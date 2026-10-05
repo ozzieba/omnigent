@@ -5644,7 +5644,7 @@ export function Composer({
                   type="button"
                   onClick={() => removeMentionedItem(i)}
                   className="ml-0.5 rounded-full hover:text-foreground"
-                  aria-label={`Remove ${item.path}`}
+                  aria-label={`Remove ${mentionItemPath(item)}`}
                 >
                   <XIcon className="size-3" />
                 </button>
