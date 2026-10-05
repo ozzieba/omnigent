@@ -7717,7 +7717,7 @@ _INLINE_REVERSE_SEARCH_PANE = """\
 ❯ hello history entry
   ⎿  Not logged in · Please run /login
 ──────────────────────────────
-❯ 
+❯\u00a0
 ──────────────────────────────
   search prompts:   ⏸ manual mode on · ← for agents
 """
@@ -7728,7 +7728,7 @@ _INLINE_REVERSE_SEARCH_PANE = """\
 _INLINE_REVERSE_SEARCH_WRAPPED_PANE = """\
 ❯ hello history entry
 ──────────────────────────────
-❯ 
+❯\u00a0
 ──────────────────────────────
   search        ⏸ manual mode on · gh auth login fo
   prompts:
@@ -7740,7 +7740,7 @@ _INLINE_REVERSE_SEARCH_WRAPPED_PANE = """\
 _INLINE_REVERSE_SEARCH_NO_MATCH_PANE = """\
 ❯ hello history entry
 ──────────────────────────────
-❯ 
+❯\u00a0
 ──────────────────────────────
   no matching prompt: usr-2-injected  ⏸ manual mode on
 """
@@ -9226,7 +9226,7 @@ def _stuck_paste_pane() -> str:
     """
     return """\
 ──────────────────────────────
-❯ 
+❯\x20
   [Pasted text #1 +11 lines]
 ──────────────────────────────
   ? for shortcuts
