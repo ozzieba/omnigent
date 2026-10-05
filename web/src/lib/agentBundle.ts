@@ -75,7 +75,7 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
     lines.push("    type: auto");
     lines.push(
       input.environmentProfile === "workspace-editable@1" ||
-      input.environmentProfile === "workspace-editable@2"
+        input.environmentProfile === "workspace-editable@2"
         ? '    write_paths: ["."]'
         : "    write_paths: []",
     );

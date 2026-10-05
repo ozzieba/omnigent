@@ -9,6 +9,7 @@ falls back to the PTY watcher when the file never appears or vanishes.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -174,7 +175,7 @@ def test_poller_publishes_edges_only(tmp_path: Path) -> None:
     assert poller.active
     assert published == [RUNNING]
 
-    poller.tick()  # unchanged mtime → no-op
+    poller.tick()  # same content → no new edge
     assert published == [RUNNING]
 
     # Turn ends: file flips to idle.
@@ -266,6 +267,29 @@ def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> N
     assert published == [RUNNING, RUNNING]
 
 
+def test_poller_reads_distinct_statuses_with_identical_mtime_and_size(tmp_path: Path) -> None:
+    """Coarse timestamps cannot hide an unknown state and the next real edge."""
+    sessions = tmp_path / "sessions"
+    path = _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    frozen_mtime = path.stat().st_mtime_ns
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+
+    # All three JSON files have the same length and modified timestamp.
+    for literal in ("nope", "busy"):
+        _write_session_file(sessions, pid=1, session_id="s", status=literal)
+        os.utime(path, ns=(frozen_mtime, frozen_mtime))
+        poller.tick()
+
+    assert published == [RUNNING, RUNNING]
+
+
 def test_stale_busy_is_reported_as_written(tmp_path: Path) -> None:
     """A long-standing ``busy`` still reads as running — no freshness window.
 
@@ -334,7 +358,7 @@ def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
 
     The file is rewritten only when its value *changes*, so a poller mid-turn
     has nothing more to say — which strands the server when the SERVER is what
-    restarted and lost its cache. A resync drops the edge/mtime baselines so the
+    restarted and lost its cache. A resync drops the edge baseline so the
     same value publishes again.
     """
     sessions = tmp_path / "sessions"

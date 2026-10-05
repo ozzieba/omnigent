@@ -301,7 +301,9 @@ export function CreateAgentDialog({
             </Select>
             <p className="text-xs text-muted-foreground">
               {environmentProfiles.find((profile) => profile.reference === environmentProfile)
-                ?.description ?? environmentProfilesError ?? "Select a published environment profile."}
+                ?.description ??
+                environmentProfilesError ??
+                "Select a published environment profile."}
             </p>
             {environmentProfiles.find((profile) => profile.reference === environmentProfile)
               ?.capabilities?.length ? (
