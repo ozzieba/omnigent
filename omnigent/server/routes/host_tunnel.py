@@ -316,7 +316,7 @@ def create_host_tunnel_router(
                 name=f"host-sender:{host_id}",
             )
             ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, host_store),
+                _ping_loop(ws, conn, host_id, host_store, host_registry),
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
@@ -421,7 +421,9 @@ def create_host_tunnel_router(
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
                     await asyncio.to_thread(host_store.set_offline, host_id)
-            elif host_persisted:
+            elif host_persisted and host_registry.get(host_id) is None:
+                # Only when no live tunnel is registered: a failed duplicate
+                # connect must not flip a healthy, connected host offline.
                 await asyncio.to_thread(host_store.set_offline, host_id)
 
     return router
@@ -806,6 +808,7 @@ async def _ping_loop(
     conn: HostConnection,
     host_id: str,
     host_store: HostStore,
+    host_registry: HostRegistry,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
@@ -821,6 +824,8 @@ async def _ping_loop(
     :param conn: Host connection for timing checks.
     :param host_id: Host id for logging.
     :param host_store: Persistent host store the heartbeat is written to.
+    :param host_registry: Live registry; the heartbeat restores
+        ``status="online"`` only while ``conn`` is the registered connection.
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
@@ -837,7 +842,11 @@ async def _ping_loop(
             return
         # The host is still within the liveness window — refresh its
         # last-seen so the freshness gate keeps it in the online set.
-        await asyncio.to_thread(host_store.heartbeat, host_id)
+        await asyncio.to_thread(
+            host_store.heartbeat,
+            host_id,
+            mark_online=host_registry.get(host_id) is conn,
+        )
         try:
             ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
             conn.outbound_queue.put_nowait(ping_text)

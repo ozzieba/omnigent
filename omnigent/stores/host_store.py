@@ -529,21 +529,30 @@ class HostStore:
                 )
             )
 
-    def heartbeat(self, host_id: str) -> None:
+    def heartbeat(self, host_id: str, *, mark_online: bool = False) -> None:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
 
         Bumps ``updated_at`` to now so the liveness freshness gate
         (see :data:`HOST_LIVENESS_TTL_S`) keeps treating the host as
         online. Called from the host tunnel's ping loop every
-        ``PING_INTERVAL_S``. Does not change ``status`` — a host whose
-        ping loop is running is, by construction, still ``"online"``.
+        ``PING_INTERVAL_S``.
+
+        With ``mark_online`` the heartbeat also writes ``status="online"``.
+        The ping loop passes it only while its connection is the one
+        registered for the host, which heals a row that a stray
+        ``set_offline`` (a failed duplicate connect, or another replica's
+        error path) left offline under a still-live tunnel.
 
         No-op if the host does not exist.
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param mark_online: Also restore ``status`` to ``"online"``.
         """
+        values: dict[str, object] = {"updated_at": now_epoch()}
+        if mark_online:
+            values["status"] = encode_host_status("online")
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
         # pure overhead. A missing host simply matches no rows (a no-op).
@@ -554,7 +563,7 @@ class HostStore:
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                 )
-                .values(updated_at=now_epoch())
+                .values(**values)
             )
 
     def is_online(self, host_id: str) -> bool:
