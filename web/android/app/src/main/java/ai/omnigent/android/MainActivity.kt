@@ -58,12 +58,11 @@ class MainActivity : AppCompatActivity() {
     private var pendingNavigatePath: String? = null
 
     // An OS-share text payload (ACTION_SEND EXTRA_TEXT, no attached file),
-    // waiting for the same page-ready gate as pendingNavigatePath above. No
-    // retry needed once emitted: the web layer persists it to sessionStorage
-    // synchronously inside the same callback (see shareIntake.ts), so a
-    // single delivery attempt is durable even if that page then navigates
-    // away — unlike the file payload below, which has no such durable copy.
-    private var pendingSharedTextValue: String? = null
+    // waiting for the same page-ready gate as pendingNavigatePath above. Like
+    // the file payload below, it is retained until the web layer acknowledges
+    // it — a single emit is NOT durable, because the page it lands on may
+    // never mount a subscriber at all. See [SharedTextHandoff].
+    private val sharedTextHandoff = SharedTextHandoff()
 
     // An OS-share file payload already read off a worker thread, waiting for
     // the same page-ready gate as pendingNavigatePath above. NOT cleared on
@@ -334,6 +333,7 @@ class MainActivity : AppCompatActivity() {
                     notifications = notifications,
                     blobSaver = blobSaver,
                     onSharedFilesAcknowledged = ::onSharedFilesAcknowledged,
+                    onSharedTextAcknowledged = ::onSharedTextAcknowledged,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -729,21 +729,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleSharedText(text: String) {
-        pendingSharedTextValue = text
+        sharedTextHandoff.queue(text)
         if (pageLoaded) flushPendingSharedText()
     }
 
     private fun flushPendingSharedText() {
-        val text = pendingSharedTextValue ?: return
+        // Same reasoning as flushPendingSharedFiles: don't emit into a page
+        // that's off pinned-origin (mid re-login). Checked BEFORE asking for a
+        // delivery so a skipped attempt costs no retry.
+        if (!sharedTextHandoff.isPending) return
         if (originOf(webView.url) != pinnedOrigin) return
-        pendingSharedTextValue = null
-        emitSharedText(text)
+        val delivery = sharedTextHandoff.nextDelivery() ?: return
+        emitSharedText(delivery.text, delivery.id)
     }
 
-    private fun emitSharedText(text: String) {
+    private fun emitSharedText(
+        text: String,
+        deliveryId: String,
+    ) {
         webView.evaluateJavascript(
             "window.__omnigentNativeEmitSharedText && " +
-                "window.__omnigentNativeEmitSharedText(${jsString(text)});",
+                "window.__omnigentNativeEmitSharedText(" +
+                "${jsString(text)}, ${jsString(deliveryId)});",
             null,
         )
     }
@@ -783,6 +790,15 @@ class MainActivity : AppCompatActivity() {
     fun onSharedFilesAcknowledged() {
         pendingSharedFilesJson = null
         pendingSharedFilesRetries = 0
+    }
+
+    /**
+     * The web layer has durably taken ownership of the last [emitSharedText]
+     * delivery (see `shareIntake.ts`'s `receiveNativeSharedText`, dispatched
+     * here via [OmnigentBridgeListener]). Stop retrying it.
+     */
+    fun onSharedTextAcknowledged() {
+        sharedTextHandoff.acknowledge()
     }
 
     private fun emitInsets() {
