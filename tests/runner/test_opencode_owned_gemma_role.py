@@ -46,7 +46,9 @@ def test_generated_config_keeps_provider_and_native_ask_without_env_secrets(
         "permission": "ask",
         "plugin": ["policy.js"],
     }
-    projected, env = project_owned_gemma_tool_config(config, policy_plugin="policy.js")
+    projected, env = project_owned_gemma_tool_config(
+        config, bridge_dir=tmp_path, policy_plugin="policy.js"
+    )
     written = json.loads(write_opencode_provider_config(tmp_path, projected).read_text())
     assert written["provider"] == config["provider"]
     assert written["mcp"] == config["mcp"]
@@ -75,10 +77,10 @@ def test_generated_config_keeps_provider_and_native_ask_without_env_secrets(
         ("permission", {"bash": "allow"}),
     ],
 )
-def test_unknown_config_producers_fail_closed(field: str, value: object) -> None:
+def test_unknown_config_producers_fail_closed(tmp_path: Path, field: str, value: object) -> None:
     config = {"model": OPENCODE_OWNED_GEMMA_MODEL, "permission": "ask", field: value}
     with pytest.raises(ValueError):
-        project_owned_gemma_tool_config(config)
+        project_owned_gemma_tool_config(config, bridge_dir=tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -247,3 +249,76 @@ async def test_merged_unknown_plugin_preserves_cached_instance(
     cached.close.assert_not_awaited()
     cancel.assert_not_awaited()
     assert native._AUTO_OPENCODE_SERVERS["plugin-test"] is cached
+
+
+def test_inherited_permission_and_config_paths_cannot_override_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.opencode_native_app_server import filtered_server_env
+
+    monkeypatch.setenv("OPENCODE_PERMISSION", '{"*":"allow","bash":"allow"}')
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", "/ambient/config")
+    monkeypatch.setenv("OPENCODE_TEST_HOME", "/ambient/home")
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", "/ambient/managed")
+    config, extra = project_owned_gemma_tool_config(
+        {"model": OPENCODE_OWNED_GEMMA_MODEL, "permission": "ask"}, bridge_dir=tmp_path
+    )
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="fixture", extra_env=extra)
+    assert json.loads(env["OPENCODE_PERMISSION"]) == config["permission"]
+    assert env["OPENCODE_CONFIG_DIR"] == ""
+    assert env["HOME"] == env["OPENCODE_TEST_HOME"] == str(tmp_path / "owned-role-home")
+    assert env["OPENCODE_TEST_MANAGED_CONFIG_DIR"] == ""
+    assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
+    ordinary = filtered_server_env(bridge_dir=tmp_path, auth_secret="fixture")
+    assert ordinary["OPENCODE_CONFIG_DIR"] == "/ambient/config"
+    assert json.loads(ordinary["OPENCODE_PERMISSION"])["*"] == "allow"
+
+
+@pytest.mark.parametrize("field", ["agent", "default_agent", "tools", "mode"])
+def test_future_agent_or_tool_config_producers_fail_closed(tmp_path: Path, field: str) -> None:
+    with pytest.raises(ValueError, match="additional config producers"):
+        project_owned_gemma_tool_config(
+            {"model": OPENCODE_OWNED_GEMMA_MODEL, field: {}}, bridge_dir=tmp_path
+        )
+
+
+def test_existing_home_plugins_fail_closed(tmp_path: Path) -> None:
+    (tmp_path / "owned-role-home" / ".opencode").mkdir(parents=True)
+    with pytest.raises(ValueError, match="isolated config home"):
+        project_owned_gemma_tool_config({"model": OPENCODE_OWNED_GEMMA_MODEL}, bridge_dir=tmp_path)
+
+
+async def test_managed_config_context_preserves_cached_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_exists = Path.exists
+    monkeypatch.setattr(
+        Path, "exists", lambda path: str(path) == "/etc/opencode" or original_exists(path)
+    )
+    cached = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setitem(native._AUTO_OPENCODE_SERVERS, "managed-test", cached)
+    monkeypatch.setattr(
+        native, "_opencode_native_launch_config", AsyncMock(return_value=_launch(tmp_path))
+    )
+    with pytest.raises(ValueError, match="unmanaged Linux"):
+        await native._auto_create_opencode_terminal(
+            "managed-test", None, lambda *_: None, agent_spec=_spec()
+        )
+    cached.close.assert_not_awaited()
+    assert native._AUTO_OPENCODE_SERVERS["managed-test"] is cached
+
+
+def test_real_agent_spec_binds_explicit_role_and_model(tmp_path: Path) -> None:
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(
+            model=OPENCODE_OWNED_GEMMA_MODEL,
+            config={"harness": "opencode-native", "opencode_tool_role": OPENCODE_OWNED_GEMMA_ROLE},
+        ),
+    )
+    assert native._opencode_native_tool_role(spec, _launch(tmp_path)) == OPENCODE_OWNED_GEMMA_ROLE
+    spec.executor.model = None
+    with pytest.raises(ValueError, match="exact provider/model"):
+        native._opencode_native_tool_role(spec, _launch(tmp_path))

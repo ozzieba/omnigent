@@ -571,13 +571,22 @@ OPENCODE_OWNED_GEMMA_MODEL = "p16v/gemma4:e2b"
 
 
 def project_owned_gemma_tool_config(
-    config: dict[str, object], *, policy_plugin: str | None = None
+    config: dict[str, object], *, bridge_dir: Path, policy_plugin: str | None = None
 ) -> tuple[dict[str, object], dict[str, str]]:
     """Pin an explicitly selected owned role to native read/edit/shell tools.
 
     Unknown tools remain denied; native operations still use the policy ASK
     gate. Reject extra MCP/plugin producers rather than silently dropping them.
     """
+    if set(config) - {"$schema", "model", "provider", "mcp", "permission", "plugin"}:
+        raise ValueError("Owned Gemma role does not accept additional config producers")
+    role_home = bridge_dir / "owned-role-home"
+    if (
+        role_home.is_symlink()
+        or (role_home / ".opencode").exists()
+        or (role_home / ".opencode").is_symlink()
+    ):
+        raise ValueError("Owned Gemma role requires an isolated config home")
     if config.get("model") != OPENCODE_OWNED_GEMMA_MODEL:
         raise ValueError("Owned Gemma role requires its exact provider/model")
     mcp = config.get("mcp", {})
@@ -600,6 +609,11 @@ def project_owned_gemma_tool_config(
         "grep": "ask",
     }
     return projected, {
+        "HOME": str(role_home),
+        "OPENCODE_TEST_HOME": str(role_home),
+        "OPENCODE_CONFIG_DIR": "",
+        "OPENCODE_TEST_MANAGED_CONFIG_DIR": "",
+        "OPENCODE_PERMISSION": json.dumps(projected["permission"]),
         "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
         "OPENCODE_CONFIG_CONTENT": json.dumps(
             {"model": projected["model"], "permission": projected["permission"]}

@@ -1347,7 +1347,10 @@ async def _auto_create_opencode_terminal(
     if tool_role is not None:
         from omnigent.opencode_native_provider import project_owned_gemma_tool_config
 
-        config, role_env = project_owned_gemma_tool_config(config, policy_plugin=policy_plugin)
+        config, role_env = project_owned_gemma_tool_config(
+            config, bridge_dir=bridge_dir, policy_plugin=policy_plugin
+        )
+        (bridge_dir / "owned-role-home").mkdir(mode=0o700, exist_ok=True)
         policy_env.update(role_env)
 
     # Cancel any surviving forwarder first so its teardown closes the OLD
@@ -1967,6 +1970,8 @@ def _opencode_native_tool_role(
     role = spec.executor.config["opencode_tool_role"]
     if role != OPENCODE_OWNED_GEMMA_ROLE:
         raise ValueError("Unknown OpenCode tool role")
+    if sys.platform != "linux" or Path("/etc/opencode").exists():
+        raise ValueError("Owned Gemma role requires an unmanaged Linux config context")
     spec_model = _opencode_native_model_from_spec(agent_spec)
     if spec_model != OPENCODE_OWNED_GEMMA_MODEL or launch_config.model_override not in (
         None,

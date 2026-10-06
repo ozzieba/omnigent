@@ -12,7 +12,12 @@ remain available for policy transport. Provider definitions are preserved;
 provider credentials are not copied into the environment overlay.
 
 The role disables workspace OpenCode configuration and pins its model and
-permission overlay through `OPENCODE_CONFIG_CONTENT`. Additional declared MCP
+permission overlay through `OPENCODE_CONFIG_CONTENT` and `OPENCODE_PERMISSION`.
+It overrides inherited config-directory/home flags and gives this role a private
+process home, preventing home-discovered agents and plugins from widening tools.
+Provider definitions and authentication are seeded before changing the child
+environment. This role requires Linux without `/etc/opencode` managed config;
+managed policies are rejected rather than bypassed. Additional declared MCP
 servers, custom plugins, gateway profiles, conflicting model overrides, and
 terminal arguments are rejected rather than silently changed. It currently
 accepts only new sessions: existing native IDs and history-carrying forks fail
