@@ -15,6 +15,8 @@ The role disables workspace OpenCode configuration and pins its model and
 permission overlay through `OPENCODE_CONFIG_CONTENT` and `OPENCODE_PERMISSION`.
 It overrides inherited config-directory/home flags and gives this role a private
 process home, preventing home-discovered agents and plugins from widening tools.
+The database, cache, and state roots are pinned inside that session's bridge;
+an inherited `OPENCODE_DB` cannot select a prior native account database.
 Provider definitions and authentication are seeded before changing the child
 environment. This role requires Linux without `/etc/opencode` managed config;
 managed policies are rejected rather than bypassed. Additional declared MCP

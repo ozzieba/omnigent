@@ -585,6 +585,7 @@ def project_owned_gemma_tool_config(
         role_home.is_symlink()
         or (role_home / ".opencode").exists()
         or (role_home / ".opencode").is_symlink()
+        or (role_home.exists() and next(role_home.iterdir(), None))
     ):
         raise ValueError("Owned Gemma role requires an isolated config home")
     if config.get("model") != OPENCODE_OWNED_GEMMA_MODEL:
@@ -608,7 +609,14 @@ def project_owned_gemma_tool_config(
         "glob": "ask",
         "grep": "ask",
     }
+    from omnigent.opencode_native_bridge import xdg_data_home_for_bridge_dir
+
     return projected, {
+        "OPENCODE_DB": str(
+            xdg_data_home_for_bridge_dir(bridge_dir) / "opencode" / "owned-role.db"
+        ),
+        "XDG_CACHE_HOME": str(role_home / ".cache"),
+        "XDG_STATE_HOME": str(role_home / ".state"),
         "HOME": str(role_home),
         "OPENCODE_TEST_HOME": str(role_home),
         "OPENCODE_CONFIG_DIR": "",

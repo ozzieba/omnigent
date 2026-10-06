@@ -257,6 +257,10 @@ def test_inherited_permission_and_config_paths_cannot_override_role(
 ) -> None:
     from omnigent.opencode_native_app_server import filtered_server_env
 
+    monkeypatch.setenv("OPENCODE_DB", "/ambient/active-account.db")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "XDG_CACHE_HOME,XDG_STATE_HOME")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/ambient/cache")
+    monkeypatch.setenv("XDG_STATE_HOME", "/ambient/state")
     monkeypatch.setenv("OPENCODE_PERMISSION", '{"*":"allow","bash":"allow"}')
     monkeypatch.setenv("OPENCODE_CONFIG_DIR", "/ambient/config")
     monkeypatch.setenv("OPENCODE_TEST_HOME", "/ambient/home")
@@ -266,11 +270,16 @@ def test_inherited_permission_and_config_paths_cannot_override_role(
     )
     env = filtered_server_env(bridge_dir=tmp_path, auth_secret="fixture", extra_env=extra)
     assert json.loads(env["OPENCODE_PERMISSION"]) == config["permission"]
+    assert env["OPENCODE_DB"] == str(tmp_path / "xdg-data" / "opencode" / "owned-role.db")
+    assert env["XDG_CACHE_HOME"] == str(tmp_path / "owned-role-home" / ".cache")
+    assert env["XDG_STATE_HOME"] == str(tmp_path / "owned-role-home" / ".state")
     assert env["OPENCODE_CONFIG_DIR"] == ""
     assert env["HOME"] == env["OPENCODE_TEST_HOME"] == str(tmp_path / "owned-role-home")
     assert env["OPENCODE_TEST_MANAGED_CONFIG_DIR"] == ""
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
     ordinary = filtered_server_env(bridge_dir=tmp_path, auth_secret="fixture")
+    assert ordinary["OPENCODE_DB"] == "/ambient/active-account.db"
+    assert ordinary["XDG_STATE_HOME"] == "/ambient/state"
     assert ordinary["OPENCODE_CONFIG_DIR"] == "/ambient/config"
     assert json.loads(ordinary["OPENCODE_PERMISSION"])["*"] == "allow"
 
