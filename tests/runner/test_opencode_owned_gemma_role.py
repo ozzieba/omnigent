@@ -165,6 +165,7 @@ async def test_role_config_is_written_before_server_start(
     monkeypatch.setattr(server_module, "OpenCodeNativeServer", Server)
     monkeypatch.setattr(bridge_module, "prepare_bridge_dir", lambda _: tmp_path)
     monkeypatch.setattr(bridge_module, "seed_opencode_auth", lambda _: None)
+    monkeypatch.setattr(bridge_module, "read_owned_gemma_auth_snapshot", lambda _: None)
     monkeypatch.setattr(
         native, "_opencode_native_launch_config", AsyncMock(return_value=_launch(tmp_path))
     )
@@ -242,7 +243,7 @@ async def test_merged_unknown_plugin_preserves_cached_instance(
         "maybe_merge_user_provider_config",
         lambda config: {**config, "plugin": ["unknown.js"]},
     )
-    with pytest.raises(ValueError, match="additional plugins"):
+    with pytest.raises(ValueError, match="cached native instance"):
         await native._auto_create_opencode_terminal(
             "plugin-test", None, lambda *_: None, agent_spec=_spec()
         )
@@ -322,3 +323,95 @@ def test_real_agent_spec_binds_explicit_role_and_model(tmp_path: Path) -> None:
     spec.executor.model = None
     with pytest.raises(ValueError, match="exact provider/model"):
         native._opencode_native_tool_role(spec, _launch(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [{"server": {"type": "wellknown", "token": "fixture"}}, {"server": {"type": "unknown"}}, []],
+)
+def test_remote_or_unknown_auth_config_rejected_without_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth: object
+) -> None:
+    from omnigent import opencode_native_bridge as bridge_module
+
+    source = tmp_path / "source-auth.json"
+    source.write_text(json.dumps(auth))
+    monkeypatch.setattr(bridge_module, "user_opencode_auth_path", lambda: source)
+    with pytest.raises(ValueError, match="remote or unknown auth"):
+        bridge_module.read_owned_gemma_auth_snapshot(tmp_path / "bridge")
+    assert not (tmp_path / "bridge").exists()
+
+
+def test_auth_seed_uses_validated_snapshot_and_private_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent import opencode_native_bridge as bridge_module
+
+    source = tmp_path / "source-auth.json"
+    source.write_text('{"p16v":{"type":"api","key":"fixture"}}')
+    monkeypatch.setattr(bridge_module, "user_opencode_auth_path", lambda: source)
+    bridge = tmp_path / "bridge"
+    snapshot = bridge_module.read_owned_gemma_auth_snapshot(bridge)
+    source.write_text('{"remote":{"type":"wellknown","token":"new-fixture"}}')
+    seeded = bridge_module.seed_owned_gemma_auth(bridge, snapshot=snapshot)
+    assert seeded.read_bytes() == snapshot
+    assert seeded.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("directory", ["xdg-config", "xdg-data"])
+def test_existing_config_or_account_state_rejected(tmp_path: Path, directory: str) -> None:
+    from omnigent import opencode_native_bridge as bridge_module
+
+    state = tmp_path / directory
+    state.mkdir()
+    (state / "fixture.json").write_text("{}")
+    with pytest.raises(ValueError, match="fresh native config/account state"):
+        bridge_module.read_owned_gemma_auth_snapshot(tmp_path)
+
+
+async def test_valid_role_cannot_replace_cached_native_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cached = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setitem(native._AUTO_OPENCODE_SERVERS, "cached-role-test", cached)
+    monkeypatch.setattr(
+        native, "_opencode_native_launch_config", AsyncMock(return_value=_launch(tmp_path))
+    )
+    monkeypatch.setattr(
+        native, "_opencode_native_model_from_spec", lambda _: OPENCODE_OWNED_GEMMA_MODEL
+    )
+    with pytest.raises(ValueError, match="cached native instance"):
+        await native._auto_create_opencode_terminal(
+            "cached-role-test", None, lambda *_: None, agent_spec=_spec()
+        )
+    cached.close.assert_not_awaited()
+
+
+async def test_remote_auth_is_rejected_before_relay_or_server_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent import opencode_native_bridge as bridge_module
+
+    source = tmp_path / "source-auth.json"
+    source.write_text('{"remote":{"type":"wellknown","token":"fixture"}}')
+    monkeypatch.setattr(bridge_module, "user_opencode_auth_path", lambda: source)
+    monkeypatch.setattr(bridge_module, "prepare_bridge_dir", lambda _: tmp_path / "bridge")
+    relay_config = []
+    monkeypatch.setattr(
+        bridge_module, "write_relay_bridge_config", lambda _: relay_config.append(True)
+    )
+    cancel = AsyncMock()
+    monkeypatch.setattr(native, "_cancel_auto_forwarder_task", cancel)
+    monkeypatch.setattr(
+        native, "_opencode_native_launch_config", AsyncMock(return_value=_launch(tmp_path))
+    )
+    monkeypatch.setattr(
+        native, "_opencode_native_model_from_spec", lambda _: OPENCODE_OWNED_GEMMA_MODEL
+    )
+    with pytest.raises(ValueError, match="remote or unknown auth"):
+        await native._auto_create_opencode_terminal(
+            "remote-auth-test", None, lambda *_: None, agent_spec=_spec()
+        )
+    cancel.assert_not_awaited()
+    assert not relay_config
+    assert not (tmp_path / "bridge").exists()

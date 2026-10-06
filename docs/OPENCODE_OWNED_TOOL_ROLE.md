@@ -20,8 +20,10 @@ environment. This role requires Linux without `/etc/opencode` managed config;
 managed policies are rejected rather than bypassed. Additional declared MCP
 servers, custom plugins, gateway profiles, conflicting model overrides, and
 terminal arguments are rejected rather than silently changed. It currently
-accepts only new sessions: existing native IDs and history-carrying forks fail
-before cached-server teardown. Adoption must account for this limitation; this
+accepts only fresh new sessions: cached instances, existing native IDs,
+history-carrying forks, and existing XDG config/account state fail before
+cached-server teardown. Auth seeding uses a validated snapshot; remote
+`wellknown` auth/config producers and unknown auth types are rejected. Adoption must account for this limitation; this
 change does not migrate running sessions or enable a lane.
 
 Other OpenCode sessions keep their existing MCP and permission configuration.

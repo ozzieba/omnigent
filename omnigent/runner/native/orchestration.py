@@ -1228,7 +1228,9 @@ async def _auto_create_opencode_terminal(
         OpenCodeNativeBridgeState,
         clear_bridge_state,
         prepare_bridge_dir,
+        read_owned_gemma_auth_snapshot,
         seed_opencode_auth,
+        seed_owned_gemma_auth,
         write_bridge_state,
         write_opencode_policy_plugin,
         write_relay_bridge_config,
@@ -1240,8 +1242,13 @@ async def _auto_create_opencode_terminal(
         server_client=server_client,
     )
     tool_role = _opencode_native_tool_role(agent_spec, launch_config)
+    if tool_role is not None and session_id in _AUTO_OPENCODE_SERVERS:
+        raise ValueError("Owned Gemma role cannot replace a cached native instance")
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
+    role_auth_snapshot = (
+        read_owned_gemma_auth_snapshot(bridge_dir) if tool_role is not None else None
+    )
     # Seed the token the shared ``serve-mcp`` reads at boot (idempotent) so the
     # Omnigent builtin-tool relay (wired below) can start. Safe to call before
     # the relay; ``start_tool_relay`` mints its own relay token in
@@ -1370,7 +1377,10 @@ async def _auto_create_opencode_terminal(
     # `opencode auth login` credentials in — otherwise it can't authenticate
     # their providers and falls back to the no-auth default model. No-op on a
     # remote runner (no local auth.json) / Databricks-gateway path.
-    seed_opencode_auth(bridge_dir)
+    if tool_role is not None:
+        seed_owned_gemma_auth(bridge_dir, snapshot=role_auth_snapshot)
+    else:
+        seed_opencode_auth(bridge_dir)
 
     # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
     # ``tool_relay.json`` exists when opencode launches the ``serve-mcp`` MCP
