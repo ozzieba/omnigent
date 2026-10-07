@@ -122,6 +122,7 @@ describe("createSession", () => {
       codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,
+      environmentProfile: null,
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,
