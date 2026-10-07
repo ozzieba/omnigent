@@ -40,12 +40,14 @@ export function writeSubmitWithModEnter(value: boolean): void {
 export function isComposerSendKey(
   event: ComposerSendKeyEvent,
   submitWithModEnter: boolean,
-  isMobile: boolean,
+  isTouchPrimary: boolean,
 ): boolean {
-  if (isMobile || event.key !== "Enter" || event.isComposing || event.shiftKey || event.altKey) {
+  if (event.key !== "Enter" || event.isComposing || event.shiftKey || event.altKey) {
     return false;
   }
 
   const hasMod = event.metaKey === true || event.ctrlKey === true;
-  return submitWithModEnter ? hasMod : true;
+  // Touch-primary devices keep plain Enter as their newline key; only a hardware
+  // keyboard can type Command/Ctrl+Enter, so that chord still sends there.
+  return submitWithModEnter || isTouchPrimary ? hasMod : true;
 }

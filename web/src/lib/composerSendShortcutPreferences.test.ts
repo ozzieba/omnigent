@@ -57,13 +57,38 @@ describe("isComposerSendKey", () => {
     expect(isComposerSendKey({ key: "Enter", ctrlKey: true }, true, false)).toBe(true);
   });
 
-  it("never submits from composition, modified chords, or mobile Enter", () => {
+  it("never submits from composition or modified chords", () => {
     expect(isComposerSendKey({ key: "Enter", metaKey: true, isComposing: true }, true, false)).toBe(
       false,
     );
     expect(isComposerSendKey({ key: "Enter", metaKey: true, shiftKey: true }, true, false)).toBe(
       false,
     );
-    expect(isComposerSendKey({ key: "Enter", metaKey: true }, true, true)).toBe(false);
+  });
+
+  it("keeps plain Enter a newline on touch-primary devices but sends on Command/Ctrl+Enter", () => {
+    for (const submitWithModEnter of [false, true]) {
+      expect(isComposerSendKey({ key: "Enter" }, submitWithModEnter, true)).toBe(false);
+      expect(isComposerSendKey({ key: "Enter", metaKey: true }, submitWithModEnter, true)).toBe(
+        true,
+      );
+      expect(isComposerSendKey({ key: "Enter", ctrlKey: true }, submitWithModEnter, true)).toBe(
+        true,
+      );
+      expect(
+        isComposerSendKey(
+          { key: "Enter", ctrlKey: true, shiftKey: true },
+          submitWithModEnter,
+          true,
+        ),
+      ).toBe(false);
+      expect(
+        isComposerSendKey(
+          { key: "Enter", ctrlKey: true, isComposing: true },
+          submitWithModEnter,
+          true,
+        ),
+      ).toBe(false);
+    }
   });
 });

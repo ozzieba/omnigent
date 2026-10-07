@@ -1900,4 +1900,38 @@ describe("create-session input on touch-primary devices", () => {
       matchMediaSpy.mockRestore();
     }
   });
+
+  it("Ctrl+Enter from a hardware keyboard still starts the session when the pointer is coarse", async () => {
+    const matchMediaSpy = vi.spyOn(window, "matchMedia").mockImplementation(
+      (query: string) =>
+        ({
+          matches: query.includes("pointer: coarse"),
+          media: query,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => false,
+        }) as MediaQueryList,
+    );
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    try {
+      renderLanding();
+      await waitForWorkspaceSeed();
+      const input = screen.getByTestId("new-chat-landing-input");
+      fireEvent.change(input, { target: { value: "start from the headset keyboard" } });
+
+      fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+    } finally {
+      matchMediaSpy.mockRestore();
+    }
+  });
 });
