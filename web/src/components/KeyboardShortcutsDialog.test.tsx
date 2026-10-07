@@ -55,7 +55,7 @@ describe("KeyboardShortcutsList composer rows", () => {
     expect(keysFor("New line in message")).toEqual(["↵"]);
   });
 
-  it("does not advertise inactive composer chords on touch-primary devices", () => {
+  it("advertises the hardware-keyboard send chord on touch-primary devices", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
@@ -63,8 +63,9 @@ describe("KeyboardShortcutsList composer rows", () => {
     }));
     render(<KeyboardShortcutsList />);
 
-    expect(screen.queryByText("Send message")).toBeNull();
-    expect(screen.queryByText("New line in message")).toBeNull();
+    // Plain Enter stays the newline key there, whatever the send preference.
+    expect(keysFor("Send message")).toEqual(["Ctrl", "↵"]);
+    expect(keysFor("New line in message")).toEqual(["↵"]);
   });
 });
 

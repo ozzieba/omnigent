@@ -3019,13 +3019,13 @@ function ConversationMenuItems({
 
   return (
     <>
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
+      {/* Pin/Unpin — hidden only where the hover-revealed quick-pin button
+          exists (md+ with a hover-capable pointer). Archived rows omit it
+          (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
-          className="md:hidden"
+          className="[@media((hover:hover)_and_(pointer:fine))]:md:hidden"
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -3861,12 +3861,12 @@ function ConversationRow({
               aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
               data-testid="quick-pin-conversation"
               className={cn(
-                // Desktop-only quick affordance: hidden on mobile (the kebab's
-                // Pin item below covers that), hover/focus-revealed from `md`
-                // up. Pinned rows no longer keep a persistent pin marker, since
-                // the "Pinned" section header (and pinned-first ordering inside
-                // a project) already conveys the pinned state. Revealed glyph:
-                // unpin if pinned, pin otherwise.
+                // Desktop-only quick affordance, hover/focus-revealed from `md`
+                // up on a pointer that can hover. Elsewhere (mobile, touch) it
+                // isn't rendered and the row menu's Pin item covers it: an
+                // invisible button there would still take taps. Pinned rows
+                // keep no pin marker; the "Pinned" section conveys that state.
+                // Revealed glyph: unpin if pinned, pin otherwise.
                 //
                 // `md:inline-flex` (not `md:block`): the Button base is
                 // `inline-flex` and relies on it for `items-center
@@ -3875,7 +3875,7 @@ function ConversationRow({
                 // pinned to the top-left of the button — so keep the flex
                 // display when revealing it.
                 "text-muted-foreground transition-opacity",
-                "hidden md:inline-flex",
+                "hidden [@media((hover:hover)_and_(pointer:fine))]:md:inline-flex",
                 "md:opacity-0 md:group-hover:opacity-100",
                 "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
               )}
@@ -3911,7 +3911,7 @@ function ConversationRow({
                   data-testid="quick-archive-conversation"
                   className={cn(
                     "text-muted-foreground transition-opacity",
-                    "hidden md:inline-flex",
+                    "hidden [@media((hover:hover)_and_(pointer:fine))]:md:inline-flex",
                     "md:opacity-0 md:group-hover:opacity-100",
                     "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
                   )}
@@ -3944,14 +3944,14 @@ function ConversationRow({
                 size="icon-xs"
                 aria-label="Conversation actions"
                 data-testid="conversation-actions"
-                // Desktop-only: the chat page's own header menu covers these
-                // per-session actions on mobile, so the row kebab is dropped
-                // there. From `md` up it stays hidden until hover / keyboard
+                // Hover-capable desktop only: on mobile and touch the row's
+                // long-press menu and the chat header's menu cover these
+                // actions. From `md` up it stays hidden until hover / keyboard
                 // focus, with `aria-expanded` keeping it surfaced while the menu
                 // is open so the trigger doesn't vanish under the cursor.
                 className={cn(
                   "text-muted-foreground transition-opacity",
-                  "hidden md:inline-flex",
+                  "hidden [@media((hover:hover)_and_(pointer:fine))]:md:inline-flex",
                   "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                   "md:aria-expanded:opacity-100",
                 )}

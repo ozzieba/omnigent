@@ -2057,7 +2057,7 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const isTouchPrimary = isMobileViewport || isCoarsePointer;
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never
@@ -4785,8 +4785,9 @@ export function NewChatLandingScreen() {
                   }
 
                   // Touch-primary newline behavior outranks autocomplete and
-                  // desktop submit preferences. The textarea owns line insertion.
-                  if (preventsKeyboardSubmit && e.key === "Enter") {
+                  // desktop submit preferences. The textarea owns line insertion;
+                  // only a hardware keyboard's Mod+Enter goes on to submit.
+                  if (isTouchPrimary && e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
                     return;
                   }
 
@@ -4800,10 +4801,10 @@ export function NewChatLandingScreen() {
                       isComposing: e.nativeEvent.isComposing,
                     },
                     submitWithModEnter,
-                    preventsKeyboardSubmit,
+                    isTouchPrimary,
                   );
                   const shouldPreferSendOverCompletion =
-                    submitWithModEnter && shouldSubmitFromKeyboard;
+                    (submitWithModEnter || isTouchPrimary) && shouldSubmitFromKeyboard;
 
                   // "@"-mention menu navigation (shared useMentionBrowser) —
                   // mutually exclusive with the slash menu (a token can't be both)
@@ -5213,7 +5214,7 @@ export function NewChatLandingScreen() {
                     </TooltipTrigger>
                     {submitDisabledReason != null ? (
                       <TooltipContent>{submitDisabledReason}</TooltipContent>
-                    ) : !creating && !preventsKeyboardSubmit ? (
+                    ) : !creating && !isTouchPrimary ? (
                       <KeyboardShortcutTooltipContent
                         label="Start session"
                         keys={composerSendShortcutKeys(submitWithModEnter)}
