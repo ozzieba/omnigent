@@ -24,6 +24,7 @@ import base64
 import dataclasses
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -4796,11 +4797,14 @@ async def _execute_session_query_tool(
 
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
+        sort_by = args.get("sort_by", "created_at")
+        if not isinstance(sort_by, str) or sort_by not in ("created_at", "updated_at"):
+            return json.dumps({"error": "sys_session_list: invalid sort_by"})
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+            _session_list_filters(agent_name, sort_by),
         )
         if isinstance(window, str):
             return window
@@ -4809,6 +4813,7 @@ async def _execute_session_query_tool(
             conversation_id,
             server_client,
             agent_name,
+            sort_by=sort_by,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -5680,11 +5685,33 @@ def _project_agent_list(
     }
 
 
+def _session_list_filters(agent_name: object, sort_by: str) -> _JsonObject:
+    """Bind activity ordering to cursors while preserving legacy default cursors."""
+    filters: _JsonObject = {
+        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+    }
+    if sort_by != "created_at":
+        filters["sort_by"] = sort_by
+    return filters
+
+
+def _activity_timestamp(value: object) -> int | float | None:
+    """Project valid persisted activity; missing or malformed values stay unknown."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if math.isfinite(value) and value >= 0:
+                return value
+        except OverflowError:
+            return None
+    return None
+
+
 async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
     *,
+    sort_by: str = "created_at",
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -5705,6 +5732,8 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
+    :param sort_by: Creation ordering by default; ``updated_at`` lists persisted
+        activity newest-first. Continuations must keep the same ordering.
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -5718,6 +5747,7 @@ async def _session_list_via_rest(
         else await _collect_global_sessions(
             server_client,
             agent_name,
+            sort_by=sort_by,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
         )
@@ -5728,7 +5758,7 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        filters=_session_list_filters(agent_name, sort_by),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -5921,6 +5951,7 @@ async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
     *,
+    sort_by: str = "created_at",
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
@@ -5928,7 +5959,7 @@ async def _collect_global_sessions(
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
     Projects each accessible session to ``{session_id, agent_name, title,
-    status, runner_id, runner_online, parent_session_id}``.
+    status, last_activity_at, runner_id, runner_online, parent_session_id}``.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
@@ -5938,11 +5969,14 @@ async def _collect_global_sessions(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
+    :param sort_by: Creation or persisted activity ordering, newest-first.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
     params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+    if sort_by != "created_at":
+        params["sort_by"] = sort_by
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:
@@ -5973,6 +6007,7 @@ async def _collect_global_sessions(
                 "agent_name": public_agent_name(_optional_string(r.get("agent_name"))),
                 "title": r.get("title"),
                 "status": r.get("status"),
+                "last_activity_at": _activity_timestamp(r.get("updated_at")),
                 "runner_id": r.get("runner_id"),
                 "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
                 "parent_session_id": r.get("parent_session_id"),
