@@ -1051,7 +1051,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         hook_payload_to_evaluation_request,
         policy_hook_reauth,
         post_evaluate_with_retry,
-        read_relay_policy_config,
+        read_live_relay_policy_config,
         relay_policy_evaluate_url,
     )
 
@@ -1089,8 +1089,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             sys.stdout.write(json.dumps(out))
         return 0
 
-    # Prefer the relay; fall back to direct server call when relay not yet up.
-    relay = read_relay_policy_config(bridge_dir)
+    # Prefer the relay; fall back to direct server call when relay not yet up
+    # or its advertised port no longer listens (stale tool_relay.json).
+    relay, stale_relay = read_live_relay_policy_config(bridge_dir)
     if relay:
         relay_url, relay_token, _sid = relay
         url = relay_policy_evaluate_url(relay_url)
@@ -1103,7 +1104,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         config = read_permission_hook_config(bridge_dir)
         ap_server_url = config.get("ap_server_url")
         if not isinstance(ap_server_url, str) or not ap_server_url:
-            return 0
+            return _fail_closed(stale_relay) if stale_relay else 0
         headers = {}
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):

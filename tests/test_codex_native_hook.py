@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -480,16 +482,49 @@ def test_post_tool_use_fails_open_on_error(
     assert captured.out == ""
 
 
+@pytest.fixture
+def live_relay_url() -> Iterator[str]:
+    """
+    Yield the URL of a loopback port that accepts TCP connections.
+
+    Stands in for a running tool relay so the hook's liveness probe passes;
+    the hook's HTTP POST itself is stubbed per test.
+
+    :returns: Relay base URL, e.g. ``"http://127.0.0.1:41234"``.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+
+
+@pytest.fixture
+def dead_relay_url() -> Iterator[str]:
+    """
+    Yield the URL of a loopback port that refuses TCP connections.
+
+    Models the ``tool_relay.json`` an earlier runner left behind: the port is
+    bound (so nothing else can grab it during the test) but not listening, so
+    a connect is refused exactly as for an exited runner.
+
+    :returns: Relay base URL, e.g. ``"http://127.0.0.1:41235"``.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+
+
 def test_pre_tool_use_uses_relay_when_tool_relay_json_has_session_id(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    live_relay_url: str,
 ) -> None:
     """Hook POSTs to relay /policies/evaluate when tool_relay.json has session_id."""
     from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
 
     relay_token = "relay-tok-abc"
-    relay_url = "http://127.0.0.1:19999"
+    relay_url = live_relay_url
     (bridge_dir / _TOOL_RELAY_FILE).write_text(
         json.dumps({"url": relay_url, "token": relay_token, "session_id": "conv_active"})
     )
@@ -546,6 +581,85 @@ def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_i
         "http://127.0.0.1:8787/v1/sessions/conv_active/policies/evaluate"
     )
     assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}
+
+
+def test_pre_tool_use_skips_stale_relay_and_uses_policy_hook_json(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dead_relay_url: str,
+) -> None:
+    """
+    A tool_relay.json left by an earlier runner must not block every tool call.
+
+    Regression for r820 2026-10-07: a runner relaunch could not start its
+    relay, so tool_relay.json kept the previous runner's port. Each hook spent
+    the whole retry budget on ``Connection refused`` and then denied the
+    call. The hook must instead take the direct-server path and apply the
+    server's verdict.
+    """
+    from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+
+    (bridge_dir / _TOOL_RELAY_FILE).write_text(
+        json.dumps({"url": dead_relay_url, "token": "old-tok", "session_id": "conv_active"})
+    )
+    write_policy_hook_config(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer direct-token"},
+    )
+    _DenyHttpxClient.captured = {}
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _DenyHttpxClient)
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    assert exit_code == 0
+    assert _DenyHttpxClient.captured["url"] == (
+        "http://127.0.0.1:8787/v1/sessions/conv_active/policies/evaluate"
+    )
+    assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}
+    captured = capsys.readouterr()
+    # The server's verdict (not a fail-closed deny) is what reaches Codex.
+    out = json.loads(captured.out)
+    assert out["hookSpecificOutput"]["permissionDecisionReason"] == "rm blocked by admin policy"
+    assert f"tool relay at {dead_relay_url} is not listening" in captured.err
+
+
+def test_pre_tool_use_fails_closed_on_stale_relay_without_direct_config(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dead_relay_url: str,
+) -> None:
+    """
+    A dead relay with no direct path still fails closed, without a network call.
+
+    The relay advertisement proves the session is governed, so dropping it
+    must not turn into "no opinion" (fail open). The deny names the stale
+    relay so the cause is visible in the TUI.
+    """
+    from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+
+    (bridge_dir / _TOOL_RELAY_FILE).write_text(
+        json.dumps({"url": dead_relay_url, "token": "old-tok", "session_id": "conv_active"})
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    assert exit_code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert f"tool relay at {dead_relay_url} is not listening" in reason
 
 
 # ── route-turn (first-message model routing) ────────────────────────
