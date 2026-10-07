@@ -368,6 +368,12 @@ export interface Session {
    * `"on"` at create, so `null` means Default rather than "inherit".
    */
   subagentRoutingOverride?: "on" | "off" | null;
+  /**
+   * Per-session Turbo switch: with it on, this session's Codex turns may pass
+   * llmq's credit-safety margin and run on paid credits. Off by default; a
+   * convenience toggle next to the model selector, not a security control.
+   */
+  turbo?: boolean;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
   /**

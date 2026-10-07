@@ -48,6 +48,7 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionTurboEvent,
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
@@ -671,6 +672,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const model = data.model;
     if (typeof model !== "string" || !model) return null;
     return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
+  }
+  if (eventType === "session.turbo") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const turbo = data.turbo;
+    if (typeof turbo !== "boolean") return null;
+    return { type: "session_turbo", conversationId, turbo } satisfies SessionTurboEvent;
   }
   if (eventType === "session.title") {
     const conversationId = data.conversation_id;

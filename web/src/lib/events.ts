@@ -545,6 +545,16 @@ export interface SessionModelEvent {
 }
 
 /**
+ * `session.turbo` — the per-session Turbo switch changed (a PATCH from any
+ * surface), so every open client re-renders the Turbo control and chip.
+ */
+export interface SessionTurboEvent {
+  type: "session_turbo";
+  conversationId: string;
+  turbo: boolean;
+}
+
+/**
  * `session.title` — session rename from a claude-native session.
  *
  * Emitted by the Omnigent server when the claude-native forwarder observes a
@@ -954,6 +964,7 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionTurboEvent
   | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent

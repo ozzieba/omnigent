@@ -45,6 +45,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -262,6 +263,9 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // Agents whose bundled skills render as always-visible pills under the
 // landing composer. Deliberately an allowlist while the pattern proves
 // out — other agents keep the "/" menu as the only skill surface.
+/** Shown beside the Turbo switch: what it allows, in one line. */
+const TURBO_DESCRIPTION =
+  "Let this session's Codex turns use paid credits past the subscription margin";
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 
 function createdHarnessOptions({
@@ -1439,6 +1443,7 @@ function HarnessConfigModal({
   pickedEffort,
   pickedHarness,
   costControlMode,
+  turbo,
   setPermissionMode,
   setApprovalMode,
   setCursorExecMode,
@@ -1448,6 +1453,7 @@ function HarnessConfigModal({
   setPickedEffort,
   setPickedHarness,
   setCostControlMode,
+  setTurbo,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -1456,6 +1462,8 @@ function HarnessConfigModal({
   host: Host | undefined | null;
   hideUnconfigured: boolean;
   smartRoutingEligible: boolean;
+  turbo: boolean;
+  setTurbo: (on: boolean) => void;
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
@@ -1506,6 +1514,7 @@ function HarnessConfigModal({
   const [draftModel, setDraftModel] = useState(pickedModel);
   const [draftEffort, setDraftEffort] = useState(pickedEffort);
   const [draftPermission, setDraftPermission] = useState(permissionMode);
+  const [draftTurbo, setDraftTurbo] = useState(turbo);
   const [draftApproval, setDraftApproval] = useState(approvalMode);
   const [draftCursor, setDraftCursor] = useState(cursorExecMode);
   const [draftAgySkip, setDraftAgySkip] = useState(agySkipMode);
@@ -1607,6 +1616,7 @@ function HarnessConfigModal({
         writeHarnessOption(entryHarness, { model: draftModel, effort: draftEffort });
     } else if (hasApproval) {
       if (isCodex) setPickedModel(draftModel);
+      if (isCodex) setTurbo(draftTurbo);
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
       if (entryHarness) {
@@ -1830,6 +1840,20 @@ function HarnessConfigModal({
                     </div>
                   )}
                 </RoutingModelSelect>
+              </ConfigRow>
+              <ConfigRow label="Turbo" description={TURBO_DESCRIPTION}>
+                <div className="flex items-center gap-2">
+                  <Switch
+                    checked={draftTurbo}
+                    onCheckedChange={setDraftTurbo}
+                    aria-label="Turbo"
+                    data-testid="new-chat-landing-config-turbo"
+                    componentId="new_chat.config.turbo"
+                  />
+                  <span className="text-sm text-muted-foreground">
+                    {draftTurbo ? "On: paid credits allowed" : "Off"}
+                  </span>
+                </div>
               </ConfigRow>
               <ConfigRow label="Approval" description="What the agent can do without asking">
                 <DescribedSelect
@@ -2523,6 +2547,9 @@ export function NewChatLandingScreen() {
   // Permission mode for Claude Code (claude --permission-mode). Only
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
+  // Per-session Turbo for the session being created (Codex only); a plain
+  // flag on the create call, off by default.
+  const [pickedTurbo, setPickedTurbo] = useState<boolean>(false);
   const [permissionMode, setPermissionMode] = useState<string>(
     () => restoredDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   );
@@ -4467,6 +4494,7 @@ export function NewChatLandingScreen() {
                 ? pickedEffort
                 : undefined,
             cost_control_mode_override: costControlOverride,
+            turbo: pickedTurbo || undefined,
             // Top-level Smart Routing sends the same "auto" sentinel the bundle
             // path does; the server tells them apart by the bound agent being a
             // native wrapper, and routes at create time (the terminal launches
@@ -5134,6 +5162,7 @@ export function NewChatLandingScreen() {
                     hideUnconfigured={hideUnconfiguredHarnesses}
                     smartRoutingEligible={smartRoutingEligible}
                     permissionMode={permissionMode}
+                    turbo={pickedTurbo}
                     approvalMode={approvalMode}
                     cursorExecMode={cursorExecMode}
                     agySkipMode={agySkipMode}
@@ -5165,6 +5194,7 @@ export function NewChatLandingScreen() {
                     pickedHarness={pickedHarness}
                     costControlMode={costControlMode}
                     setPermissionMode={setPermissionMode}
+                    setTurbo={setPickedTurbo}
                     setApprovalMode={setApprovalMode}
                     setCursorExecMode={setCursorExecMode}
                     setAgySkipMode={setAgySkipMode}

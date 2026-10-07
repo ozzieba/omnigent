@@ -1,4 +1,5 @@
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
@@ -26,6 +27,16 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
+// The Turbo switch PATCHes through the store's `updateSession`; spy on it so
+// the tests below assert the wire call without a network.
+const updateSessionMock = vi.fn(async (_id: string, updates: Record<string, unknown>) => ({
+  id: _id,
+  turbo: updates.turbo === true,
+}));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  updateSession: (...args: Parameters<typeof updateSessionMock>) => updateSessionMock(...args),
+}));
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
 }));
@@ -2915,5 +2926,54 @@ describe("shouldQueueSend", () => {
     // The ordering guard outranks always-steer: draining must stay in order, so
     // a direct send can't overtake a still-queued earlier one.
     expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
+  });
+});
+
+describe("Turbo (per-session paid-credits switch, oz 2026-10-06)", () => {
+  beforeEach(() => {
+    updateSessionMock.mockClear();
+  });
+
+  it("shows the Turbo row beside the Model row for a Codex session and PATCHes the flag", async () => {
+    useChatStore.setState({ conversationId: "conv_turbo", turbo: false });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-model")).toBeTruthy();
+    const toggle = screen.getByTestId("composer-config-turbo");
+    expect(screen.getByTestId("composer-config-turbo-state").textContent).toBe("Off");
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(updateSessionMock).toHaveBeenCalledWith("conv_turbo", { turbo: true }),
+    );
+  });
+
+  it("does not offer Turbo on a non-Codex session", async () => {
+    useChatStore.setState({ conversationId: "conv_claude", turbo: false });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-turbo")).toBeNull();
+    expect(updateSessionMock).not.toHaveBeenCalled();
   });
 });

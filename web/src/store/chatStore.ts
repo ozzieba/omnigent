@@ -367,6 +367,8 @@ export interface ConversationState {
    * snapshot on bind and written through `setCostControlMode`.
    */
   costControlModeOverride: "on" | "off" | null;
+  /** Per-session Turbo switch (Codex turns may use paid credits past llmq's margin). */
+  turbo: boolean;
   /**
    * Routing switch for the sub-agents the active session spawns: ``"on"``
    * routes them, and ``"off"`` runs them on the default model. ``null``
@@ -770,6 +772,8 @@ export interface ChatActions {
    * default. No-ops when there is no active conversation.
    */
   setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
+  /** Flip this session's Turbo switch: optimistic, PATCHes, rolls back on error. */
+  setTurbo: (on: boolean) => Promise<void>;
   /**
    * Set the active session's sub-agent routing switch — optimistic local
    * write, then PATCH; the server's canonical value (or a rollback on
@@ -1354,6 +1358,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionModelOverride: null,
   sessionReasoningEffort: null,
   costControlModeOverride: null,
+  turbo: false,
   subagentRoutingOverride: null,
   codexPlanMode: false,
   claudePermissionMode: "",
@@ -2291,6 +2296,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  setTurbo: async (on) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().turbo;
+    // Pin the target like the routing switch does: the PATCH can outlive a
+    // switch away, and the rollback must land on the conversation it belongs to.
+    const patchSet = setterFor(conversationId);
+    patchSet({ turbo: on });
+    try {
+      const session = await updateSession(conversationId, { turbo: on });
+      patchSet({ turbo: session.turbo ?? false });
+    } catch (err) {
+      patchSet({ turbo: previous });
+      throw err;
+    }
+  },
+
   setCostControlMode: async (mode) => {
     const { conversationId } = get();
     if (!conversationId) return;
@@ -2322,6 +2344,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       });
       patchSet({
         costControlModeOverride: session.costControlModeOverride ?? null,
+        turbo: session.turbo ?? false,
         ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
       });
     } catch (err) {
@@ -2375,6 +2398,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (get().conversationId !== conversationId) return;
     setActive({
       costControlModeOverride: session.costControlModeOverride ?? null,
+      turbo: session.turbo ?? false,
       subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     });
   },
@@ -3031,6 +3055,7 @@ function sessionBindingPatch(
   | "sessionHarness"
   | "subAgentName"
   | "costControlModeOverride"
+  | "turbo"
   | "subagentRoutingOverride"
   | "codexPlanMode"
   | "claudePermissionMode"
@@ -3057,6 +3082,7 @@ function sessionBindingPatch(
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
+    turbo: session.turbo ?? false,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     codexPlanMode: codexPlanModeFromSession(session),
     claudePermissionMode: isNativeTerminalSessionFn(session)
@@ -5334,6 +5360,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       return;
     }
+    case "session_turbo":
+      // Another surface flipped this session's Turbo switch; mirror it.
+      applyToNamedConversation(event.conversationId, { turbo: event.turbo });
+      return;
     case "session_model":
       // The harness's model report — the launch's own model, or a switch
       // made inside the pane. The value is VERBATIM (the harness's own

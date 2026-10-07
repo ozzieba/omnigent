@@ -67,6 +67,7 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { useAppName } from "@/lib/branding";
@@ -6532,6 +6533,11 @@ function SessionConfigModal({
               />
             </ConfigRow>
           )}
+          {showModels && modelPickerKind === "codex" && (
+            <ConfigRow label="Turbo" description={TURBO_DESCRIPTION}>
+              <TurboSwitch testId="composer-config-turbo" componentId="chat.composer.turbo" />
+            </ConfigRow>
+          )}
           {showEffort && (
             <ConfigRow label="Effort" description="Reasoning depth vs. speed">
               <Select
@@ -6671,6 +6677,39 @@ function SessionConfigModal({
  *   requests re-open (bare ``/model`` submits route here now that the composer
  *   trigger is a read-only label). ``0`` / omitted means never requested.
  */
+/** Shown beside the Turbo controls: what the switch allows, in one line. */
+export const TURBO_DESCRIPTION =
+  "Let this session's Codex turns use paid credits past the subscription margin";
+
+/**
+ * The per-session Turbo switch (oz, 2026-10-06), right next to the model
+ * selector. Writes through the store immediately (optimistic, rolled back on a
+ * failed PATCH) rather than through the modal's Save: it is a plain session
+ * flag, not part of the launch config.
+ */
+function TurboSwitch({ testId, componentId }: { testId: string; componentId: string }) {
+  const turbo = useChatStore((s) => s.turbo);
+  const setTurbo = useChatStore((s) => s.setTurbo);
+  return (
+    <div className="flex items-center gap-2">
+      <Switch
+        checked={turbo}
+        onCheckedChange={(checked) => {
+          void setTurbo(checked).catch(() => {
+            // The store already rolled the switch back; nothing to surface here.
+          });
+        }}
+        aria-label="Turbo"
+        data-testid={testId}
+        componentId={componentId}
+      />
+      <span className="text-sm text-muted-foreground" data-testid={`${testId}-state`}>
+        {turbo ? "On: paid credits allowed" : "Off"}
+      </span>
+    </div>
+  );
+}
+
 function ComposerConfigGear({
   harnessLabel,
   showModels,
@@ -6813,6 +6852,7 @@ function useSessionConfigSummary({
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const turbo = useChatStore((s) => s.turbo);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
   const rows: { label: string; value: string }[] = [];
@@ -6822,6 +6862,11 @@ function useSessionConfigSummary({
       label: "Model",
       value: routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default"),
     });
+  }
+  // Turbo is a Codex session's paid-credits allowance; surface it whenever it
+  // is on so the gear summary says so before the user opens the modal.
+  if (showModels && modelPickerKind === "codex" && turbo) {
+    rows.push({ label: "Turbo", value: "On (paid credits allowed)" });
   }
   // Suppress Effort while routing is on: the router picks the model and its
   // effort per turn, so a pinned effort doesn't apply and would mislead.
