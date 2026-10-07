@@ -29,7 +29,7 @@ from omnigent.native_policy_hook import (
     hook_payload_to_evaluation_request,
     policy_hook_reauth,
     post_evaluate_with_retry,
-    read_relay_policy_config,
+    read_live_relay_policy_config,
     relay_policy_evaluate_url,
 )
 
@@ -95,8 +95,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     bridge state, no ``ap_server_url``, an unparseable payload, or an
     ``mcp__omnigent__*`` tool already gated on the relay path — still
     return exit 0 with no output ("no opinion") so non-Omnigent tool calls
-    are never blocked. The complementary fail-loud guard — asserting the
-    hook is actually registered and trusted — lives at session startup in
+    are never blocked. A relay advertised in ``tool_relay.json`` whose
+    loopback port refuses connections (left behind by an earlier runner) is
+    skipped for the direct-server path; with no direct path configured the
+    call fails CLOSED, because the session is governed. The complementary
+    fail-loud guard — asserting the hook is actually registered and
+    trusted — lives at session startup in
     :mod:`omnigent.codex_native_app_server`, not here, because a
     silently-skipped hook cannot report its own absence.
 
@@ -143,8 +147,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         return 0
 
     # Prefer the relay (non-expiring local token); fall back to direct server
-    # call when the relay isn't up yet (first-call race) or not configured.
-    relay = read_relay_policy_config(bridge_dir)
+    # call when the relay isn't up yet (first-call race), not configured, or
+    # advertised by an earlier runner whose port no longer listens. A governed
+    # session with a dead relay and no direct config still fails closed.
+    relay, stale_relay = read_live_relay_policy_config(bridge_dir)
     if relay:
         relay_url, relay_token, _sid = relay
         url = relay_policy_evaluate_url(relay_url)
@@ -156,10 +162,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     else:
         config = read_policy_hook_config(bridge_dir)
         if config is None:
-            return 0
+            return _fail_closed(stale_relay) if stale_relay else 0
         ap_server_url = config.get("ap_server_url")
         if not isinstance(ap_server_url, str) or not ap_server_url:
-            return 0
+            return _fail_closed(stale_relay) if stale_relay else 0
         raw_headers = config.get("ap_auth_headers")
         headers = {}
         if isinstance(raw_headers, dict):

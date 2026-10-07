@@ -41,6 +41,9 @@ _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 # Fast connect budget so an unreachable server fails into the retry
 # loop quickly rather than blocking on the day-long read timeout.
 _EVALUATE_POLICY_CONNECT_TIMEOUT_S = 5.0
+# Loopback liveness probe for the relay advertised in ``tool_relay.json``.
+# A dead loopback port refuses immediately; this only bounds a wedged one.
+_RELAY_PROBE_TIMEOUT_S = 1.0
 
 # Hook event names that gate tool execution and therefore carry policy
 # meaning. ``PreToolUse`` fires before the tool runs (can block);
@@ -120,6 +123,76 @@ def read_relay_policy_config(
 def relay_policy_evaluate_url(relay_url: str) -> str:
     """Return the relay's ``/policies/evaluate`` endpoint URL."""
     return f"{relay_url.rstrip('/')}/policies/evaluate"
+
+
+def relay_refuses_connections(relay_url: str) -> bool:
+    """Return whether nothing is listening at the relay advertised in ``tool_relay.json``.
+
+    ``tool_relay.json`` outlives the runner that wrote it. When a session's
+    runner is replaced and the new runner cannot start its relay (for example
+    because the bridge dir fails the secure-dir check), the file keeps
+    pointing at the previous runner's loopback port. Without this check every
+    hook spends the whole :data:`_EVALUATE_POLICY_RETRY_BUDGET_S` retrying a
+    dead port and then fails closed, so all tool calls stay blocked until
+    the session is restarted.
+
+    Only a refused TCP connect counts as stale: on loopback it means that no
+    process holds the port. Timeouts, unparseable URLs and other errors return
+    ``False`` so the caller keeps its normal relay-plus-retry behavior.
+
+    :param relay_url: Relay base URL from ``tool_relay.json``, e.g.
+        ``"http://127.0.0.1:37949"``.
+    :returns: ``True`` when the relay port actively refuses connections.
+    """
+    import socket
+    import urllib.parse
+
+    try:
+        parsed = urllib.parse.urlsplit(relay_url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if not host or port is None:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=_RELAY_PROBE_TIMEOUT_S):
+            return False
+    except ConnectionRefusedError:
+        return True
+    except OSError:
+        return False
+
+
+def read_live_relay_policy_config(
+    bridge_dir: os.PathLike[str],
+) -> tuple[tuple[str, str, str] | None, str | None]:
+    """Return the usable relay config, or the reason an advertised relay was skipped.
+
+    Wraps :func:`read_relay_policy_config` with :func:`relay_refuses_connections`.
+    A stale advertisement is reported back instead of being silently dropped:
+    the session *is* governed, so when the caller has no direct-server
+    fallback it must fail closed (with this detail) rather than return "no
+    opinion".
+
+    :param bridge_dir: Session bridge directory holding ``tool_relay.json``.
+    :returns: ``(relay, None)`` when the relay is usable or absent (``relay``
+        is ``None`` when absent), or ``(None, detail)`` when the advertised
+        relay refuses connections, e.g. ``(None, "tool relay at
+        http://127.0.0.1:37949 is not listening ...")``.
+    """
+    relay = read_relay_policy_config(bridge_dir)
+    if relay is None or not relay_refuses_connections(relay[0]):
+        return relay, None
+    detail = (
+        f"tool relay at {relay[0]} is not listening (stale {_TOOL_RELAY_FILE} from an "
+        "earlier runner; the current runner did not start its relay)"
+    )
+    print(
+        f"omnigent policy hook: {detail}; using the direct Omnigent server path",
+        file=sys.stderr,
+    )
+    return None, detail
 
 
 def policy_hook_request_headers() -> dict[str, str]:
