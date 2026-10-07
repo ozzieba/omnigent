@@ -103,12 +103,16 @@ Only sessions whose launch carries `OMNIGENT_QUOTA_ROUTE=personal-llmq` are gate
 
 ### Omnigent
 
-- `conversations.turbo BOOLEAN NOT NULL DEFAULT false` (alembic revision after `zc1d2e3f4a5b`, batched for SQLite).
-- `Conversation.turbo: bool = False`; `SessionResponse.turbo`; `UpdateSessionRequest.turbo: bool | None`.
+- `Conversation.turbo: bool = False`, stored as `"turbo": "on"` in the packed `conversations.session_overrides`
+  JSON blob with the other per-session switches (`model_override`, `cost_control_mode_override`, ...), so no
+  migration is needed and the flag survives every other override write. (Implemented this way in the first PR
+  instead of the column first proposed here.)
+- `SessionResponse.turbo`; `UpdateSessionRequest.turbo: bool | None`; create accepts `turbo`.
 - `PATCH /v1/sessions/{id} {"turbo": true|false}` at `LEVEL_EDIT`, the same level as `model_override`. The handler
-  writes one log line (`turbo session=<id> user=<id> <old>-><new>`) and appends a visible system item to the session
-  transcript ("Turbo enabled by <user>: this session may use paid Codex credits past the subscription margin").
-- Session creation accepts `turbo` so the New Chat dialog can start a session with it on.
+  writes one log line (`turbo session=<id> user=<id> <old>-><new>`) and publishes a `session.turbo` SSE event so
+  every open surface re-renders the control and chip. The persistent "Turbo" chip in the composer's config summary
+  is the visible state; the transcript note first proposed here is left to the runner (phase 3), which already
+  posts quota status into the session.
 - Session status carries a `quota` object on the session's external status:
   `{"state": "verified" | "unverified" | "blocked", "reason": str, "resets_at": float | None, "turbo": bool}`.
   The web client renders it next to the model selector.
