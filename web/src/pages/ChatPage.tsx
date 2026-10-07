@@ -113,7 +113,7 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
-import type { QuotaWaitInfo } from "@/lib/events";
+import type { QuotaGateInfo, QuotaWaitInfo } from "@/lib/events";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   composerAttachmentKey,
@@ -3130,6 +3130,24 @@ function useAgentTurnActive(): boolean {
  * `WORKING_MESSAGES` by wall-clock `tick`. Background-task counts belong to
  * `BackgroundTaskPill`, not this shimmer.
  */
+/**
+ * The config-summary row for the llmq gate's state, or `null` when there is
+ * nothing to show (no gate, or the last check was verified).
+ */
+export function quotaGateSummaryRow(
+  gate: QuotaGateInfo | null | undefined,
+): { label: string; value: string } | null {
+  if (!gate || gate.state === "verified") return null;
+  if (gate.state === "blocked") {
+    return {
+      label: "Quota",
+      value: gate.message ?? "Held: Codex quota at the credit-safety margin",
+    };
+  }
+  const reason = (gate.reason ?? "llmq unavailable").replace(/_/g, " ");
+  return { label: "Quota", value: `Unverified (${reason})` };
+}
+
 export function quotaWaitLabel(quota: QuotaWaitInfo): string {
   const parts = [
     quota.admissionDelaySeconds !== undefined
@@ -6856,6 +6874,7 @@ function useSessionConfigSummary({
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const turbo = useChatStore((s) => s.turbo);
+  const quotaGate = useChatStore((s) => s.quotaGate);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
   const rows: { label: string; value: string }[] = [];
@@ -6871,6 +6890,10 @@ function useSessionConfigSummary({
   if (showModels && modelPickerKind === "codex" && turbo) {
     rows.push({ label: "Turbo", value: "On (paid credits allowed)" });
   }
+  // The llmq gate's indicator (oz 2026-10-07, "fail open but with an indicator"):
+  // a held turn or an unverified one is named next to the Turbo state.
+  const gateRow = quotaGateSummaryRow(modelPickerKind === "codex" ? quotaGate : null);
+  if (showModels && gateRow) rows.push(gateRow);
   // Suppress Effort while routing is on: the router picks the model and its
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {

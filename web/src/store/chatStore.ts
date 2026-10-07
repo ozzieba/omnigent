@@ -297,6 +297,8 @@ export interface ConversationState {
   blockedOn: string | null;
   /** Quota admission telemetry for the current delay; absent on every other edge. */
   quotaWait: SessionStatusEvent["quotaWait"] | null;
+  /** Sticky: only a status edge that carries `quota_gate` changes it. */
+  quotaGate: SessionStatusEvent["quotaGate"] | null;
   /**
    * Whether the active session is a native-terminal wrapper
    * (claude-native / codex-native), derived from the `omnigent.wrapper`
@@ -1347,6 +1349,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   backgroundTasks: [],
   blockedOn: null,
   quotaWait: null,
+  quotaGate: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
   boundAgentId: null,
@@ -1677,6 +1680,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // not parked on a dialog.
       blockedOn: null,
       quotaWait: null,
+      quotaGate: null,
     }));
 
     // Pin the destination before joining the send chain: a stalled prior
@@ -1981,6 +1985,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         backgroundTasks: [],
         blockedOn: null,
         quotaWait: null,
+        quotaGate: null,
       };
       if (s.activeResponse?.state === "streaming") {
         patch.activeResponse = {
@@ -3448,6 +3453,7 @@ async function bindStream(
         backgroundTasks: session.backgroundTasks ?? [],
         blockedOn: null,
         quotaWait: null,
+        quotaGate: null,
         // `selectedEffort` / `selectedModel` are app-global sticky picks, not
         // conversation state, so they are applied below — and only while this
         // conversation is still on screen. A cold bind that finishes after the
@@ -5537,6 +5543,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // so an absent one means "no longer parked".
           blockedOn: event.blockedOn ?? null,
           quotaWait: event.quotaWait ?? null,
+          ...(event.quotaGate !== undefined ? { quotaGate: event.quotaGate } : {}),
         };
         // The background-shell tally is STICKY. Only the Stop-hook-derived
         // status carries an authoritative count (the forwarder relabels its

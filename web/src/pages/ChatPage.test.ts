@@ -41,6 +41,7 @@ import {
   subAgentComposerLabel,
   unboundSessionResumableInApp,
   WORKING_MESSAGES,
+  quotaGateSummaryRow,
   workingIndicatorLabel,
 } from "./ChatPage";
 
@@ -1808,5 +1809,45 @@ describe("routing eligibility gates", () => {
     const child = { ...sdkSession, parentSessionId: "conv_parent" } as unknown as Session;
     expect(isCostRoutingEligible(info(true), child)).toBe(false);
     expect(isSubagentRoutingEligible(info(true), child)).toBe(false);
+  });
+});
+
+// ── quotaGateSummaryRow ─────────────────────────────────────────────────────
+
+describe("quotaGateSummaryRow — the llmq gate's indicator next to Turbo", () => {
+  it("shows nothing without a gate or after a verified check", () => {
+    expect(quotaGateSummaryRow(null)).toBeNull();
+    expect(quotaGateSummaryRow(undefined)).toBeNull();
+    expect(
+      quotaGateSummaryRow({ state: "verified", turbo: false, creditBearing: false }),
+    ).toBeNull();
+  });
+
+  it("names the fault when the turn ran unverified", () => {
+    expect(
+      quotaGateSummaryRow({
+        state: "unverified",
+        reason: "llmq_unreachable",
+        turbo: false,
+        creditBearing: false,
+      }),
+    ).toEqual({ label: "Quota", value: "Unverified (llmq unreachable)" });
+  });
+
+  it("carries the gate's sentence while a turn is held", () => {
+    expect(
+      quotaGateSummaryRow({
+        state: "blocked",
+        reason: "credit_safety_margin",
+        message:
+          "Codex subscription quota is at the credit-safety margin (90%); resets at 14:00 UTC (in 3 h). Enable Turbo on this session to use paid credits.",
+        turbo: false,
+        creditBearing: false,
+      }),
+    ).toEqual({
+      label: "Quota",
+      value:
+        "Codex subscription quota is at the credit-safety margin (90%); resets at 14:00 UTC (in 3 h). Enable Turbo on this session to use paid credits.",
+    });
   });
 });

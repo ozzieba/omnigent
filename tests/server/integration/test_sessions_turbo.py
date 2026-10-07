@@ -107,3 +107,25 @@ async def test_turbo_rides_in_the_runner_session_init_envelope(client: httpx.Asy
         )
     )
     assert plain is not None and plain.snapshot.turbo is False
+
+
+async def test_quota_gate_rides_on_the_status_event_and_bad_shapes_are_dropped() -> None:
+    """The runner's gate outcome travels as ``quota_gate`` on ``session.status``."""
+    from omnigent.server.schemas import QuotaGateInfo, SessionStatusEvent
+
+    event = SessionStatusEvent(
+        type="session.status",
+        conversation_id="conv_a",
+        status="running",
+        blocked_on="Codex subscription quota is at the credit-safety margin (90%).",
+        quota_gate=QuotaGateInfo(
+            state="blocked", reason="credit_safety_margin", resets_at=1700000000.0, turbo=False
+        ),
+    )
+    payload = event.model_dump()
+    assert payload["quota_gate"]["state"] == "blocked"
+    assert payload["quota_gate"]["credit_bearing"] is False
+    with pytest.raises(ValueError):
+        QuotaGateInfo.model_validate({"state": "bogus"})
+    bare = SessionStatusEvent(type="session.status", conversation_id="conv_a", status="idle")
+    assert bare.quota_gate is None

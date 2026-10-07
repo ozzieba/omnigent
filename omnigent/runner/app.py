@@ -96,6 +96,14 @@ from omnigent.runner.background_titles import (
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.llmq_gate import (
+    CODEX_HARNESSES,
+    GateConfig,
+    GateDecision,
+    gate_codex_turn,
+    normalize_model,
+    settle_codex_turn,
+)
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
     _COST_POPUP_REPOP_TASKS,
@@ -7108,6 +7116,102 @@ def create_runner_app(
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
+    # Codex turns ask llmq before dispatch (oz 2026-10-06/07): fail open with an
+    # indicator, hold only on llmq's fresh refusal, honour the session's Turbo.
+    _llmq_gate_config = GateConfig.from_env()
+    _llmq_gate_http: httpx.AsyncClient | None = None
+
+    def _llmq_gate_client() -> httpx.AsyncClient:
+        nonlocal _llmq_gate_http
+        if _llmq_gate_http is None:
+            _llmq_gate_http = httpx.AsyncClient(trust_env=False, follow_redirects=False)
+        return _llmq_gate_http
+
+    async def _read_session_turbo(conv: str) -> bool:
+        """The session's current Turbo flag, fresh from the server when reachable."""
+        try:
+            resp = await server_client.get(f"/v1/sessions/{conv}")
+            if resp.status_code == 200:
+                return resp.json().get("turbo") is True
+        except (httpx.HTTPError, ValueError):
+            pass
+        envelope = _fresh_session_init_envelope(conv)
+        return bool(envelope.snapshot.turbo) if envelope is not None else False
+
+    async def _gate_codex_turn_for_session(
+        conv: str, harness_body: _JsonObject
+    ) -> tuple[GateDecision, str] | None:
+        config = _llmq_gate_config
+        if config is None:
+            return None
+        from omnigent._native_post_delivery import post_external_session_status
+
+        model = normalize_model(
+            cast(str | None, harness_body.get("model_override"))
+            or cast(str | None, harness_body.get("model")),
+            config.default_model,
+        )
+
+        async def _on_status(decision: GateDecision, turbo: bool) -> None:
+            _logger.log(
+                logging.INFO if decision.allow and decision.verified else logging.WARNING,
+                "llmq gate session=%s state=%s reason=%s turbo=%s",
+                conv,
+                decision.state,
+                decision.reason,
+                turbo,
+                extra={"session_id": conv},
+            )
+            try:
+                await post_external_session_status(
+                    server_client,
+                    session_id=conv,
+                    status="running",
+                    blocked_on=decision.message(turbo=turbo) if not decision.allow else None,
+                    quota_gate=decision.status_payload(turbo=turbo),
+                )
+            except (httpx.HTTPError, RuntimeError):
+                _logger.debug(
+                    "llmq gate: status post failed for session=%s",
+                    conv,
+                    exc_info=True,
+                    extra={"session_id": conv},
+                )
+
+        try:
+            return await gate_codex_turn(
+                _llmq_gate_client(),
+                config,
+                session_id=conv,
+                turn_salt=str(time.time_ns()),
+                model=model,
+                read_turbo=lambda: _read_session_turbo(conv),
+                on_status=_on_status,
+                sleep=asyncio.sleep,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the gate never blocks a turn on its own faults
+            _logger.warning(
+                "llmq gate failed open for session=%s",
+                conv,
+                exc_info=True,
+                extra={"session_id": conv},
+            )
+            return None
+
+    def _schedule_llmq_settlement(conv: str, gate: tuple[GateDecision, str]) -> None:
+        decision, key = gate
+        config = _llmq_gate_config
+        if config is None or decision.reservation_id is None:
+            return
+        task = asyncio.create_task(
+            settle_codex_turn(_llmq_gate_client(), config, decision, turn_key=key),
+            name=f"llmq-settle-{conv}",
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
     async def _run_turn_bg(
         msg_body: _JsonObject,
         conv: str,
@@ -7554,6 +7658,9 @@ def create_runner_app(
                 await_notify=False,
             )
 
+        _llmq_gate: tuple[GateDecision, str] | None = None
+        if harness_name in CODEX_HARNESSES:
+            _llmq_gate = await _gate_codex_turn_for_session(conv, harness_body)
         try:
             response = await _stream_message_to_harness(
                 harness_body,
@@ -7564,6 +7671,8 @@ def create_runner_app(
             _session_init_envelopes.pop(conv, None)
         if isinstance(response, StreamingResponse):
             await _drain_streaming_response(response, conv)
+            if _llmq_gate is not None:
+                _schedule_llmq_settlement(conv, _llmq_gate)
         else:
             err_detail = "harness returned error response"
             if hasattr(response, "body"):

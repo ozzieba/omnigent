@@ -595,6 +595,26 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ...(linearScheduleDeltaPpm !== undefined ? { linearScheduleDeltaPpm } : {}),
         };
       }
+      const rawQuotaGate = data.quota_gate;
+      let quotaGate: SessionStatusEvent["quotaGate"];
+      if (rawQuotaGate != null && typeof rawQuotaGate === "object") {
+        const gate = rawQuotaGate as Record<string, unknown>;
+        const state = gate.state;
+        if (state === "verified" || state === "unverified" || state === "blocked") {
+          const resetsAt =
+            typeof gate.resets_at === "number" && Number.isFinite(gate.resets_at)
+              ? gate.resets_at
+              : undefined;
+          quotaGate = {
+            state,
+            ...(typeof gate.reason === "string" && gate.reason ? { reason: gate.reason } : {}),
+            ...(typeof gate.message === "string" && gate.message ? { message: gate.message } : {}),
+            ...(resetsAt !== undefined ? { resetsAt } : {}),
+            turbo: gate.turbo === true,
+            creditBearing: gate.credit_bearing === true,
+          };
+        }
+      }
       return {
         type: "session_status",
         conversationId,
@@ -604,6 +624,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(quotaWait !== undefined ? { quotaWait } : {}),
+        ...(quotaGate !== undefined ? { quotaGate } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
     }

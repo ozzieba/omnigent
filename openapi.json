@@ -3456,6 +3456,80 @@
         "title": "QuotaConfigUpdate",
         "type": "object"
       },
+      "QuotaGateInfo": {
+        "description": "Outcome of the runner's llmq admission check for a Codex turn.\n\nAttached to a `session.status` edge by the runner's pre-turn gate\n(`omnigent.runner.llmq_gate`). `blocked` means llmq refused on\nfresh evidence and the turn is held (the session's `blocked_on` carries\nthe sentence); `unverified` means the turn ran without a usable check\n(llmq unreachable, stale receipt, ...), which the UI shows as a badge;\n`verified` clears both.",
+        "properties": {
+          "credit_bearing": {
+            "default": false,
+            "description": "The turn runs on paid credits (Turbo past the margin).",
+            "title": "Credit Bearing",
+            "type": "boolean"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "maxLength": 600,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The sentence shown to the user, when there is one.",
+            "title": "Message"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "llmq's reason slug or the gate's fault, e.g. `\"credit_safety_margin\"`, `\"receipt_stale\"`, `\"llmq_unreachable\"`.",
+            "title": "Reason"
+          },
+          "resets_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Earliest quota reset reported with a refusal (epoch s).",
+            "title": "Resets At"
+          },
+          "state": {
+            "description": "`\"verified\"`, `\"unverified\"` or `\"blocked\"`.",
+            "enum": [
+              "verified",
+              "unverified",
+              "blocked"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "turbo": {
+            "default": false,
+            "description": "The session's Turbo flag at the time of the check.",
+            "title": "Turbo",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "QuotaGateInfo",
+        "type": "object"
+      },
       "QuotaStatus": {
         "description": "Everything the LLMQ panel renders.",
         "properties": {
@@ -6919,6 +6993,17 @@
             ],
             "default": null,
             "description": "Machine-readable failure detail, present only when `status == \"failed\"`. Carries the message the runner attached when a turn died \u2014 most importantly a SETUP-phase failure (spec resolution, spawn-env build) that ends the turn before any `response.failed` event is emitted. `None` for every non-failed transition. Clients render `error.message` as the terminal error line; without it a setup failure shows as a silent end."
+          },
+          "quota_gate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuotaGateInfo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "quota_wait": {
             "anyOf": [
