@@ -36,6 +36,7 @@ from omnigent.server.auth import (
     SharingMode,
     workspace_sharing_blocked,
 )
+from omnigent.server.routes._agent_model_selection import project_agent_model_selection
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
 )
@@ -54,6 +55,7 @@ from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
 )
 from omnigent.server.schemas import (
+    AgentModelSelection,
     AgentObject,
     GrantPermissionRequest,
     MCPServerSummary,
@@ -393,6 +395,7 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
     terminals: list[str] = []
     # Harness/kind for the UI; None until the spec loads (mirrors the
     # GET /v1/agents catalog so both endpoints report it consistently).
+    model_selection = AgentModelSelection()
     harness: str | None = None
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
@@ -405,6 +408,7 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
                 agent.id, agent.bundle_location, expand_env=agent.session_id is None
             )
             harness = loaded.spec.executor.harness_kind
+            model_selection = project_agent_model_selection(loaded.spec)
             if description is None:
                 description = loaded.spec.description
             # Declared terminal names, in spec order — the Web UI
@@ -456,6 +460,7 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,
+        model_selection=model_selection,
         mcp_servers=mcp_servers,
         mcp_servers_editable=(
             agent.session_id is not None and not (harness or "").endswith("-native")

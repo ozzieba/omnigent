@@ -225,6 +225,22 @@ class PolicySummary(BaseModel):
     description: str | None = None
 
 
+class AgentModelSelection(BaseModel):
+    """Parsed configuration intent; never an observed or served model."""
+
+    declared_model: str | None = None
+    source_field: Literal["parsed_agent_spec.executor.model"] = "parsed_agent_spec.executor.model"
+    selection_authority: Literal["DECLARED_ONLY"] = "DECLARED_ONLY"
+    resolution: Literal[
+        "EXPLICIT_DECLARED",
+        "UNKNOWN_DEFAULT",
+        "UNKNOWN_OPAQUE_ROUTE",
+        "UNKNOWN_DYNAMIC_OR_PRIVATE_VALUE",
+        "UNKNOWN_UNREADABLE_SPEC",
+    ] = "UNKNOWN_UNREADABLE_SPEC"
+    served_model: None = None
+
+
 class AgentObject(BaseModel):
     """
     API representation of a registered agent.
@@ -294,6 +310,7 @@ class AgentObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     harness: str | None = None
+    model_selection: AgentModelSelection = Field(default_factory=AgentModelSelection)
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
