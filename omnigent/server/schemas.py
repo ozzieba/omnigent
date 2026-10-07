@@ -1495,6 +1495,9 @@ class _SessionCreateRequestBase(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+    # Per-session Turbo (oz 2026-10-06): Codex turns may run on paid credits
+    # past llmq's credit-safety margin. ``None`` / ``False`` start it off.
+    turbo: bool | None = None
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> Self:
@@ -2126,6 +2129,7 @@ class SessionResponse(BaseModel):
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    turbo: bool = False
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -2269,6 +2273,8 @@ class UpdateSessionRequest(BaseModel):
     permission_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    # Per-session Turbo. ``True`` / ``False`` set it; omitted leaves it.
+    turbo: bool | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
@@ -3031,6 +3037,25 @@ class SessionModelEvent(_SSEEventBase):
     type: Literal["session.model"]
     conversation_id: str
     model: str
+
+
+class SessionTurboEvent(_SSEEventBase):
+    """
+    Per-session Turbo switch changed (``PATCH /v1/sessions/{id}`` with
+    ``turbo``), so every open surface re-renders the Turbo control and chip.
+
+    :param type: Always ``"session.turbo"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param turbo: The switch's new state.
+
+    Category: **transient** (SSE-only). The server also writes ``turbo``
+    on the conversation (served on the snapshot), so on reconnect clients
+    restore the state from the snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.turbo"]
+    conversation_id: str
+    turbo: bool
 
 
 class SessionTitleEvent(_SSEEventBase):
@@ -4528,6 +4553,7 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionTurboEvent
     | SessionTitleEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent

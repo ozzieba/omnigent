@@ -4620,6 +4620,7 @@
             "session.terminal_pending": "#/components/schemas/SessionTerminalPendingEvent",
             "session.title": "#/components/schemas/SessionTitleEvent",
             "session.todos": "#/components/schemas/SessionTodosEvent",
+            "session.turbo": "#/components/schemas/SessionTurboEvent",
             "session.usage": "#/components/schemas/SessionUsageEvent",
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
             "turn.completed": "#/components/schemas/TurnCompletedEvent",
@@ -4637,6 +4638,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionModelEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionTurboEvent"
           },
           {
             "$ref": "#/components/schemas/SessionTitleEvent"
@@ -6696,6 +6700,11 @@
             "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
             "title": "Total Cost Usd"
           },
+          "turbo": {
+            "default": false,
+            "title": "Turbo",
+            "type": "boolean"
+          },
           "updated_at": {
             "anyOf": [
               {
@@ -7200,6 +7209,47 @@
           "todos"
         ],
         "title": "SessionTodosEvent",
+        "type": "object"
+      },
+      "SessionTurboEvent": {
+        "description": "Per-session Turbo switch changed (`PATCH /v1/sessions/{id}` with\n`turbo`), so every open surface re-renders the Turbo control and chip.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "turbo": {
+            "description": "The switch's new state. Category: **transient** (SSE-only). The server also writes `turbo` on the conversation (served on the snapshot), so on reconnect clients restore the state from the snapshot rather than from a replayed event.",
+            "title": "Turbo",
+            "type": "boolean"
+          },
+          "type": {
+            "const": "session.turbo",
+            "description": "Always `\"session.turbo\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "turbo"
+        ],
+        "title": "SessionTurboEvent",
         "type": "object"
       },
       "SessionUsage": {
@@ -8224,6 +8274,17 @@
             ],
             "description": "New title, e.g. `\"debugging auth flow\"`. `None` leaves unchanged.",
             "title": "Title"
+          },
+          "turbo": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turbo"
           }
         },
         "title": "UpdateSessionRequest",

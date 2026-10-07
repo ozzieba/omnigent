@@ -1113,6 +1113,7 @@ def _build_session_response(
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
+        turbo=conv.turbo,
         context_window=context_window,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
@@ -8565,6 +8566,7 @@ async def _create_session_from_existing_agent(
         or cost_control_mode_override is not None
         or subagent_routing_override is not None
         or harness_override is not None
+        or body.turbo is not None
     ):
         # ``create_conversation`` has no override params; reuse the
         # PATCH path's store write before the runner reads the snapshot
@@ -8578,6 +8580,7 @@ async def _create_session_from_existing_agent(
             cost_control_mode_override=cost_control_mode_override,
             subagent_routing_override=subagent_routing_override,
             harness_override=harness_override,
+            turbo=body.turbo,
         )
         if updated_conv is None:
             raise OmnigentError(

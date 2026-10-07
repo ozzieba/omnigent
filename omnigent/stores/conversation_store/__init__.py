@@ -820,6 +820,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        turbo: bool | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -858,6 +859,8 @@ class ConversationStore(ABC):
             ``subagent_routing_override`` to ``None`` regardless of the
             ``subagent_routing_override`` param value. Unset reads as
             Default (the switch is two-state; nothing is inherited).
+        :param turbo: Per-session Turbo switch; ``True`` stores it on,
+            ``False`` clears it, ``None`` leaves unchanged.
         :param harness_override: Per-session brain-harness override,
             e.g. ``"pi"``. ``None`` leaves unchanged. No ``_unset``
             variant — the override is set once at session create and

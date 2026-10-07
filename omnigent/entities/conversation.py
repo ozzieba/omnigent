@@ -131,6 +131,12 @@ class Conversation:
         ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
+    :param turbo: Per-session Turbo switch (oz, 2026-10-06): when ``True``
+        this session's Codex turns may pass llmq's credit-safety margin and
+        run on paid credits. Off by default, toggled from the web UI next to
+        the model selector, persisted with the other session overrides and
+        passed to llmq by the runner as a plain flag. A convenience toggle,
+        not a security boundary.
     :param subagent_routing_override: Per-session subagent-routing
         switch, two-state: ``"on"`` routes native/SDK subagent spawns,
         and ``"off"`` or ``None`` (unset) both leave them on the parent's
@@ -236,6 +242,7 @@ class Conversation:
     reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    turbo: bool = False
     harness_override: str | None = None
     sub_agent_name: str | None = None
     task_summary: str | None = None
