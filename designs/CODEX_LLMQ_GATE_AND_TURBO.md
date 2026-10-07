@@ -225,6 +225,20 @@ Omnigent:
    on lets the next prompt through.
 6. Rollback: llmq `host_release.py rollback`; Omnigent wheels re-pin; the UI degrades to no toggle.
 
+## Implementation notes (phase 3, 2026-10-07)
+
+- The runner gate (oz/omnigent#80) lives in the runner process, in the turn function right before the turn is
+  handed to the harness: harnesses run as subprocesses, so the executor cannot reach the runner's server client.
+- The indicator rides as `quota_gate` on the session's external status and `session.status`; while a turn is
+  held, `blocked_on` carries the sentence so the existing working indicator shows it, and the composer's config
+  summary shows "Quota: …" next to Turbo. There is no transcript item.
+- Verified admissions are settled with zero usage at turn end (llmq keeps its estimate); passing the app-server's
+  per-turn token usage is a follow-up.
+- Re-checks while held bump llmq's `attempt`, so each is a new admission (llmq audits refusals rather than
+  persisting them as decisions).
+- The gate is inert until the runner's environment carries `LLMQ_CONTROLLER_URL`, `LLMQ_TOKEN_FILE` and
+  `LLMQ_AGENT_ID`; the terminal-UI hook (3b) is a separate PR.
+
 ## Phases and PRs
 
 1. llmq: turbo, controller evidence, fail-open classification, tests. chatgpt-playground PR against the controller
