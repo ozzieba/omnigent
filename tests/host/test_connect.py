@@ -281,6 +281,69 @@ async def test_handle_model_options_codex_probe_failure_is_an_honest_empty(
     _cleanup_host(host)
 
 
+async def test_handle_model_options_serves_the_agy_cli_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """antigravity-native answers from ``agy models``, every id routable.
+
+    Before this branch existed the host answered ``status="failed"`` and the
+    server turned that into HTTP 502 for every Antigravity picker request.
+    """
+    from omnigent import antigravity_native_models
+
+    rows = [
+        {
+            "id": "gemini-3.8-flash-high",
+            "model": "gemini-3.8-flash-high",
+            "displayName": "Gemini 3.8 Flash (High)",
+        },
+        {
+            "id": "claude-opus-5-5-high",
+            "model": "claude-opus-5-5-high",
+            "displayName": "Claude Opus 5.5 (High)",
+        },
+    ]
+    monkeypatch.setattr(antigravity_native_models, "list_agy_model_options", lambda: rows)
+    host = _make_host_process()
+
+    for harness in ("antigravity-native", "native-antigravity", "agy-native"):
+        result = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="req_agy", harness=harness),
+        )
+        assert result == HostModelOptionsResultFrame(
+            request_id="req_agy",
+            status="ok",
+            models=rows,
+            routable_models=["gemini-3.8-flash-high", "claude-opus-5-5-high"],
+        ), harness
+    _cleanup_host(host)
+
+
+async def test_handle_model_options_agy_listing_failure_is_an_honest_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed ``agy models`` is an empty answer with the reason, never a 502."""
+    from omnigent import antigravity_native_models
+
+    def _boom() -> list[dict[str, object]]:
+        raise RuntimeError("agy CLI not found")
+
+    monkeypatch.setattr(antigravity_native_models, "list_agy_model_options", _boom)
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_agy", harness="antigravity-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_agy",
+        status="ok",
+        models=[],
+        error="the agy model listing failed — see the host log",
+    )
+    _cleanup_host(host)
+
+
 async def test_handle_model_options_rejects_unsupported_harness() -> None:
     """Only launch paths with host-resolved model catalogs are accepted."""
     host = _make_host_process()

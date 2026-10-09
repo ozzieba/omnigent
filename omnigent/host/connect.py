@@ -2828,6 +2828,31 @@ class HostProcess:
                 models=[{"id": model.id, "displayName": model.id} for model in listing.models],
                 routable_models=[model.id for model in listing.models],
             )
+        if harness == "antigravity-native":
+            # ``agy models`` lists the account's offered ids without a turn.
+            # agy silently runs its default on an unknown ``--model``, so
+            # these exact ids are the only safe pins.
+            try:
+                from omnigent import antigravity_native_models
+
+                agy_models = await asyncio.to_thread(
+                    antigravity_native_models.list_agy_model_options
+                )
+            except Exception:  # noqa: BLE001 — no catalog, never a crash
+                _logger.warning("agy model catalog unavailable", exc_info=True)
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    models=[],
+                    error="the agy model listing failed — see the host log",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=agy_models,
+                routable_models=[str(row["id"]) for row in agy_models],
+            )
+
         if harness in ("opencode-native", "opencode"):
             # Pre-launch preview: the ambient `opencode models` CLI catalog,
             # enriched with the llmq-routed opencode-go models and their
