@@ -15,6 +15,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from omnigent._native_failure_codes import native_failure_code
 from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
@@ -1280,6 +1281,15 @@ def register_events_routes(
                         )
                     ),
                     message=output.strip(),
+                )
+            # Structured native provider codes survive without copying error text.
+            code = native_failure_code(data.get("native_failure_code"))
+            if status == "failed" and code is not None:
+                status_error = ErrorDetail(
+                    code="native_" + code,
+                    message=status_error.message
+                    if status_error is not None
+                    else "Native turn failed.",
                 )
             if status_error is not None:
                 await _persist_session_status_error_labels(

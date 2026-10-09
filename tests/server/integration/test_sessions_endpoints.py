@@ -10251,3 +10251,134 @@ async def test_create_session_notifies_runner_with_init_envelope(
         "runner seeds it into the first spawn; got "
         f"{envelope.snapshot.model_override!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "failure_code,expected_code",
+    [
+        ("rate_limit", "native_rate_limit"),
+        ("authentication_failed", "native_authentication_failed"),
+        ("unknown", "native_turn_error"),
+        (True, "native_turn_error"),
+        ("private-error-text", "native_turn_error"),
+    ],
+)
+async def test_native_failure_code_preserves_real_route_failure_status(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: object,
+    expected_code: str,
+) -> None:
+    """
+    A ``failed`` edge with no wire ``output`` carries the persisted error text.
+
+    claude-native's ``StopFailure`` edge posts no ``output``, but the
+    harness's own explanation (its last assistant message, e.g. "There's an
+    issue with the selected model (…)") is already persisted. The handler
+    must attach it so the parent inbox shows it instead of the generic
+    "Error: native sub-agent turn failed", and surface it as the session's
+    typed error under the harness-neutral ``native_turn_error`` code.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    detail = (
+        "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
+        "It may not exist or you may not have access to it."
+    )
+    forwarded: list[dict[str, Any]] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Capture forwarded runner events.
+
+        :param request: Request sent to the fake runner.
+        :returns: Accepted response.
+        """
+        forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        """
+        Resolve the session to the fake runner client.
+
+        :param session_id: Session id being routed.
+        :param runner_router: Real app runner router, unused here.
+        :returns: The fake runner client.
+        """
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    try:
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child = child_resp.json()
+
+        item_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "response_id": "resp_native_failed",
+                    "source_id": "src_native_failed",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": "claude-native-ui",
+                        "content": [{"type": "output_text", "text": detail}],
+                    },
+                },
+            },
+        )
+        assert item_resp.status_code == 202, item_resp.text
+
+        forwarded.clear()
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "native_failure_code": failure_code},
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert forwarded, "the failed edge was never forwarded to the runner"
+    assert forwarded[0]["body"]["data"] == {
+        "status": "failed",
+        "output": detail,
+        "native_failure_code": failure_code,
+    }
+    failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
+    assert failed_events, f"no failed status was published: {published}"
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == expected_code
+    assert "selected model" in error["message"]
+    snapshot = (await client.get(f"/v1/sessions/{child['id']}")).json()
+    assert snapshot["last_task_error"]["code"] == expected_code
+    assert snapshot["labels"]["omnigent.last_task_error_code"] == expected_code

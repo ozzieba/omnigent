@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.llms.context_window import ModelPricing
 
+from omnigent._native_failure_codes import native_failure_code
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
@@ -506,6 +507,8 @@ class ClaudeHookRecord:
         through this record, e.g. ``3``.
     :param byte_offset: Byte offset immediately after this complete
         record, e.g. ``512``.
+    :param failure_code: Closed StopFailure provider code, without textual detail.
+        None for other hook events or unrecognized codes.
     :param recorded_at: Unix timestamp for when the hook was recorded,
         e.g. ``1779922393.222``. ``None`` when the envelope did not
         carry a numeric timestamp.
@@ -584,6 +587,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2956,6 +2960,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
         event_name=event_name,
+        failure_code=(
+            native_failure_code(payload.get("error"))
+            if event_name == "StopFailure" and isinstance(payload, dict)
+            else None
+        ),
         recorded_at=raw_recorded_at
         if isinstance(raw_recorded_at, (int, float)) and not isinstance(raw_recorded_at, bool)
         else None,

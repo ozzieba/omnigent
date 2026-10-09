@@ -2996,6 +2996,7 @@ async def _forward_available_status_events(
                 session_id=session_id,
                 status=status,
                 response_id=response_id,
+                failure_code=record.failure_code if status == "failed" else None,
                 # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
                 # This is the one thing the status file cannot report: its
