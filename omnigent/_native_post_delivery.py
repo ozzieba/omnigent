@@ -29,6 +29,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_failure_codes import native_failure_code
 from omnigent._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -179,6 +180,7 @@ async def post_external_session_status(
     background_task_count: int | None = None,
     background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
+    failure_code: str | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -201,6 +203,8 @@ async def post_external_session_status(
         UI can name the individual shells. ``None`` omits the field — the default
         for edges with no detail; sent alongside a positive count by the
         claude-native ``Stop`` hook.
+    :param failure_code: Closed provider code from a native failure hook.
+        Only failed edges carry it; unknown values preserve the generic fallback.
     :param response_id: Optional id of the assistant turn this status edge
         belongs to. When set, the server attaches it to the ``session.status``
         SSE event so ap-web can drive the bubble's streaming lifecycle — that's
@@ -211,6 +215,8 @@ async def post_external_session_status(
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
+    if status == "failed" and (code := native_failure_code(failure_code)) is not None:
+        data["native_failure_code"] = code
     if output:
         data["output"] = output
     if background_task_count is not None:
