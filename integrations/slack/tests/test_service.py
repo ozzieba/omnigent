@@ -1041,7 +1041,7 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_posts(slack, 1)
+    await asyncio.wait_for(asyncio.gather(*service._turn_tasks), timeout=1.0)
     await service.shutdown()
 
     # Both deltas streamed live (across the reopened stream); nothing was lost.
