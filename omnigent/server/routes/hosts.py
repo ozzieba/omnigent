@@ -55,6 +55,7 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._host_admission import dispatch_authorized_host_operation
 from omnigent.server.routes._host_launch import resolve_host_launch
 from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
@@ -779,6 +780,19 @@ def create_hosts_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+
+        async def invoke_authorized():
+            return await _launch_runner_authorized(host_id, body, target)
+
+        return await dispatch_authorized_host_operation(
+            request, target.host.host_id, "launch", invoke_authorized
+        )
+
+    async def _launch_runner_authorized(
+        host_id: str,
+        body: LaunchRunnerRequest,
+        target: Any,
+    ) -> dict[str, Any]:
         conn = target.conn
 
         # W6: validate the requested workspace against the agent's
