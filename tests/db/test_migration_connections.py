@@ -34,7 +34,7 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["zc1d2e3f4a5b"], f"expected a single head, got {heads!r}"
+    assert len(heads) == 1, f"expected a single head, got {heads!r}"
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
