@@ -11,7 +11,9 @@ host_admission:
 
 Start with `omnigent server -c server.yaml`. The only supported option is the
 strict boolean `enabled`; strings, numeric values and readiness options fail
-startup. The adapter uses two workers and a five-second database deadline.
+startup. The adapter uses two workers and limits caller waiting to five seconds.
+Database work and inherited owner lookup can continue beyond that wait; this
+setting does not impose a database transaction or whole-request deadline.
 Application shutdown retains unfinished worker custody through the existing
 adapter lifespan.
 
