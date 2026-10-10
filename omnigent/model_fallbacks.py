@@ -45,15 +45,12 @@ def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback |
     return _STATIC_MODEL_FALLBACKS.get((provider_kind, cli))
 
 
-#: Codex's launch default when nothing else names a model. The bundled
-#: OpenAI catalog's newest row is a bare family alias (``gpt-5.6``) that
-#: codex rejects, so a codex launch defaults to a concrete variant from
-#: codex's own catalog — dotted spelling, since the Databricks hyphenated
-#: form 400s against codex's own backend.
+#: Codex's launch default when nothing else names a model. Use the current
+#: balanced coding tier in Codex's own concrete catalog spelling.
 _CODEX_LAUNCH_DEFAULT = StaticModelFallback(
-    model_ids=("gpt-5.6-sol",),
+    model_ids=("gpt-6.1-sol",),
     owner="Codex native launch (omnigent.inner.codex_executor)",
-    provenance="codex's own catalog slug for the cheapest current arm",
+    provenance="codex's own catalog slug for the current balanced coding tier",
     discovery_gap=(
         "the launch default is resolved before any app-server probe can "
         "answer, and codex rejects the bundled catalog's newest row (a bare "
@@ -217,7 +214,7 @@ _BACKGROUND_TITLE_FALLBACKS: dict[str, StaticModelFallback] = {
         ),
     ),
     "codex": StaticModelFallback(
-        model_ids=("gpt-5.6-luna",),
+        model_ids=("gpt-6-luna",),
         owner="Background session titles (omnigent.runner.background_titles.service)",
         provenance=(
             "codex's own dotted catalog slug for its cheapest current arm — the "
