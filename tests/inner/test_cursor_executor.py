@@ -4,7 +4,7 @@ The cursor harness drives the Cursor Python SDK (``cursor-sdk``). The SDK is
 replaced with an injected fake module (so no real bridge subprocess, API key, or
 network is needed), letting us exercise the ``SDKMessage`` → ExecutorEvent
 mapping, the ``custom_tools`` tool bridge into ``_tool_executor``,
-persistent-agent reuse across turns, the ``databricks-*`` model fallback, and
+persistent-agent reuse across turns, explicit model refusal and Router discovery, and
 the failure/lifecycle paths. Live end-to-end coverage (a real cursor model
 invoking a bridged tool) lives in the gated e2e test.
 """
@@ -125,6 +125,27 @@ def _install_fake_sdk(
             state["agent_closed"] += 1
 
     class _FakeClient:
+        async def list_models(self, *, api_key: str | None = None) -> list[Any]:
+            return state.get(
+                "catalog",
+                [
+                    SimpleNamespace(id="gpt-5", parameters=[]),
+                    SimpleNamespace(id="auto", parameters=[]),
+                    SimpleNamespace(
+                        id="auto-smart",
+                        parameters=[
+                            SimpleNamespace(
+                                id="optimize_for",
+                                values=[
+                                    SimpleNamespace(value=v)
+                                    for v in ("cost", "balanced", "intelligence")
+                                ],
+                            )
+                        ],
+                    ),
+                ],
+            )
+
         @classmethod
         async def launch_bridge(cls, **kwargs: Any) -> _FakeClient:
             state["launch_kwargs"].append(kwargs)
@@ -147,7 +168,8 @@ def _install_fake_sdk(
         async def create(
             cls, *, client: Any, model: Any, api_key: Any, name: Any, local: Any
         ) -> _FakeAgent:
-            state["create_models"].append(model)
+            state["create_models"].append(getattr(model, "id", model))
+            state.setdefault("create_selections", []).append(model)
             state["create_api_keys"].append(api_key)
             state["custom_tools"].append(dict(local.custom_tools or {}))
             if create_exc is not None:
@@ -176,6 +198,8 @@ def _install_fake_sdk(
             self.on_delta = on_delta
 
     fake = types.ModuleType("cursor_sdk")
+    fake.ModelSelection = lambda **kw: SimpleNamespace(**kw)  # type: ignore[attr-defined]
+    fake.ModelParameterValue = lambda **kw: SimpleNamespace(**kw)  # type: ignore[attr-defined]
     fake.AsyncClient = _FakeClient  # type: ignore[attr-defined]
     fake.AsyncAgent = _FakeAsyncAgent  # type: ignore[attr-defined]
     fake.CustomTool = _FakeCustomTool  # type: ignore[attr-defined]
@@ -209,32 +233,20 @@ def _tool(
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_model_drops_databricks_and_defaults_to_auto_smart() -> None:
+@pytest.mark.parametrize(
+    "model", [None, "", "default", "databricks-claude-sonnet-4-6", "databricks/kimi", "auto-smart"]
+)
+def test_resolve_model_refuses_unqualified_selection(model: str | None) -> None:
+    with pytest.raises(ValueError):
+        _resolve_model(model)
+
+
+def test_resolve_model_preserves_explicit_ids_and_requires_router_mode() -> None:
     assert _resolve_model("gpt-5") == "gpt-5"
-    assert _resolve_model("databricks-claude-sonnet-4-6") == "auto-smart"
-    assert _resolve_model("databricks/kimi") == "auto-smart"
-    assert _resolve_model(None) == "auto-smart"
-    assert _resolve_model("auto") == "auto-smart"
-
-
-def test_resolve_model_warns_when_dropping_a_pinned_model(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Dropping an explicit (non-cursor) model must warn, not whisper at debug —
-    otherwise a user who pinned a non-Cursor model has no idea it was ignored."""
-    import logging
-
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.cursor_executor"):
-        assert _resolve_model("databricks-claude-opus-4-8") == "auto-smart"
-    assert any(
-        r.levelno == logging.WARNING and "not a Cursor model" in r.getMessage()
-        for r in caplog.records
-    )
-    # No warning when there was no explicit model to honor.
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.cursor_executor"):
-        assert _resolve_model(None) == "auto-smart"
-    assert not caplog.records
+    assert _resolve_model("auto") == "auto"
+    assert _resolve_model(None, "balanced") == "auto-smart"
+    with pytest.raises(ValueError):
+        _resolve_model("auto-smart", "default")
 
 
 def test_sdk_message_to_events_maps_text_thinking_and_tools() -> None:
@@ -323,7 +335,7 @@ def test_build_cursor_prompt_prepends_system_then_drops_it() -> None:
 
 
 def test_capabilities() -> None:
-    executor = CursorExecutor()
+    executor = CursorExecutor(router_mode="balanced")
     assert executor.supports_streaming() is True
     assert executor.supports_tool_calling() is True
     # Tools execute in-band via the SDK custom_tools callback, so the adapter
@@ -344,7 +356,7 @@ async def test_run_turn_streams_and_completes(monkeypatch: pytest.MonkeyPatch) -
         "result": "Hello world",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
@@ -374,7 +386,7 @@ async def test_run_turn_separates_text_across_a_tool_call(
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
@@ -413,7 +425,7 @@ async def test_run_turn_separator_guarantees_blank_line_boundary(
         },
     ]
     _install_fake_sdk(monkeypatch, scripts)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         ev_space = [e async for e in executor.run_turn([_user("a", "s1")], [], "SYS")]
         ev_newline = [e async for e in executor.run_turn([_user("b", "s2")], [], "SYS")]
@@ -441,7 +453,7 @@ async def test_run_turn_final_response_prefers_separated_streamed_text(
         "result": "Pre.Post.",  # the SDK's glued aggregate, with no separator
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
@@ -456,7 +468,7 @@ async def test_session_reused_across_turns(monkeypatch: pytest.MonkeyPatch) -> N
         {"messages": [_assistant("two")], "result": "two"},
     ]
     state = _install_fake_sdk(monkeypatch, scripts)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         _ = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
         _ = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
@@ -473,7 +485,7 @@ async def test_session_restart_on_system_prompt_change(monkeypatch: pytest.Monke
         {"messages": [_assistant("two")], "result": "two"},
     ]
     state = _install_fake_sdk(monkeypatch, scripts)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         _ = [e async for e in executor.run_turn([_user("first")], [], "SYS-A")]
         _ = [e async for e in executor.run_turn([_user("second")], [], "SYS-B")]
@@ -484,19 +496,21 @@ async def test_session_restart_on_system_prompt_change(monkeypatch: pytest.Monke
     assert state["closed"] >= 1
 
 
-async def test_databricks_model_resolved_to_auto_smart(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_databricks_pin_refused_before_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
     executor = CursorExecutor(model="databricks-claude-sonnet-4-6", api_key="crsr_x")
     try:
-        _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
         await executor.close()
-    assert state["create_models"] == ["auto-smart"]
+    assert state["create_models"] == []
+    assert state["launch_kwargs"] == []
+    assert any(isinstance(e, ExecutorError) for e in events)
 
 
 async def test_api_key_threaded_to_create(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
-    executor = CursorExecutor(api_key="crsr_secret")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_secret")
     try:
         _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
@@ -510,7 +524,7 @@ async def test_custom_tools_built_from_tool_specs(monkeypatch: pytest.MonkeyPatc
         {"name": "sys_session_send", "description": "dispatch", "parameters": {"type": "object"}},
         {"description": "no name — skipped"},
     ]
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         _ = [e async for e in executor.run_turn([_user("hi")], tools, "SYS")]
     finally:
@@ -523,7 +537,7 @@ async def test_custom_tools_built_from_tool_specs(monkeypatch: pytest.MonkeyPatc
 async def test_custom_tool_execute_bridges_to_tool_executor() -> None:
     """The SDK callback (a sync ``execute`` on a worker thread) must hop back to
     the main loop and resolve Omnigent's async ``_tool_executor``."""
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     seen: dict[str, Any] = {}
 
     async def fake_tool_executor(name: str, args: dict[str, Any]) -> Any:
@@ -543,7 +557,7 @@ async def test_custom_tool_execute_bridges_to_tool_executor() -> None:
 
 def _bridged_execute(tool_executor: Any) -> Any:
     """Wire *tool_executor* onto a CursorExecutor and return its sync ``execute``."""
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._tool_executor = tool_executor
     return executor._make_execute("sys_session_send", asyncio.get_running_loop())
 
@@ -625,7 +639,7 @@ async def test_run_turn_custom_tool_callback_flags_classifier_failures_as_iserro
         assert args == {"message": "go"}
         return tool_result
 
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._tool_executor = fake_tool_executor
     try:
         events = [e async for e in executor.run_turn([_user("hi")], tools, "SYS")]
@@ -733,7 +747,7 @@ async def test_setup_failure_closes_client_and_drops_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = _install_fake_sdk(monkeypatch, [], create_exc=RuntimeError("bad CURSOR_API_KEY"))
-    executor = CursorExecutor(api_key="crsr_bad")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_bad")
     events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
 
     errors = [e for e in events if isinstance(e, ExecutorError)]
@@ -752,7 +766,7 @@ async def test_close_session_tears_down_bridge_client_via_aclose(
     daemon tool-callback thread). The real SDK client has no ``close()``, so
     closing via ``close()`` silently leaks; this pins the client to aclose()."""
     state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     assert state["client_closed"] == 0  # still live mid-conversation
     await executor.close()
@@ -767,7 +781,7 @@ async def test_mid_turn_error_status_drops_session(monkeypatch: pytest.MonkeyPat
         {"messages": [_assistant("recovered")], "result": "recovered"},
     ]
     state = _install_fake_sdk(monkeypatch, scripts)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
         turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
@@ -793,7 +807,7 @@ async def test_mid_turn_expired_status_is_retryable_and_drops_session(
         {"messages": [_assistant("recovered")], "result": "recovered"},
     ]
     state = _install_fake_sdk(monkeypatch, scripts)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
         turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
@@ -821,7 +835,7 @@ async def test_mid_turn_cancelled_status_emits_turn_cancelled_and_drops_session(
         {"messages": [_assistant("recovered")], "result": "recovered"},
     ]
     state = _install_fake_sdk(monkeypatch, scripts)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
         turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
@@ -849,7 +863,7 @@ async def test_mid_turn_unknown_non_finished_status_is_retryable_and_drops_sessi
         {"messages": [_assistant("recovered")], "result": "recovered"},
     ]
     state = _install_fake_sdk(monkeypatch, scripts)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         turn1 = [e async for e in executor.run_turn([_user("first")], [], "SYS")]
         turn2 = [e async for e in executor.run_turn([_user("second")], [], "SYS")]
@@ -866,7 +880,7 @@ async def test_mid_turn_unknown_non_finished_status_is_retryable_and_drops_sessi
 
 async def test_empty_prompt_completes_without_sending(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _install_fake_sdk(monkeypatch, [])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         events = [
             e
@@ -884,7 +898,7 @@ async def test_empty_prompt_completes_without_sending(monkeypatch: pytest.Monkey
 async def test_missing_sdk_surfaces_executor_error(monkeypatch: pytest.MonkeyPatch) -> None:
     # Simulate cursor-sdk not installed: importing it raises ImportError.
     monkeypatch.setitem(sys.modules, "cursor_sdk", None)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert len(errors) == 1 and "cursor-sdk" in errors[0].message
@@ -907,7 +921,7 @@ def _policy(deny_phase: str | None) -> Any:
 
 async def test_policy_request_deny_blocks_before_send(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("hi")], "result": "hi"}])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._policy_evaluator = _policy("PHASE_LLM_REQUEST")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
@@ -921,7 +935,7 @@ async def test_policy_request_deny_blocks_before_send(monkeypatch: pytest.Monkey
 
 async def test_policy_response_deny_blocks_turn_complete(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("hi")], "result": "hi"}])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._policy_evaluator = _policy("PHASE_LLM_RESPONSE")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
@@ -935,7 +949,7 @@ async def test_policy_response_deny_blocks_turn_complete(monkeypatch: pytest.Mon
 
 async def test_policy_allow_completes_normally(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_sdk(monkeypatch, [{"messages": [_assistant("hi")], "result": "hi"}])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._policy_evaluator = _policy(None)  # never denies
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
@@ -956,7 +970,7 @@ async def test_changed_tool_set_rebuilds_agent(monkeypatch: pytest.MonkeyPatch) 
         {"messages": [_assistant("two")], "result": "two"},
     ]
     state = _install_fake_sdk(monkeypatch, scripts)
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     tools_a = [{"name": "alpha", "parameters": {"type": "object"}}]
     tools_b = [{"name": "beta", "parameters": {"type": "object"}}]
     try:
@@ -1084,7 +1098,7 @@ async def test_run_turn_captures_usage_from_turn_ended_update(
         lambda *, model, usage: notified.append({"model": model, "usage": usage}),
     )
 
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
@@ -1122,7 +1136,7 @@ async def test_run_turn_usage_none_when_no_turn_ended_update(
         lambda *, model, usage: notified.append({"model": model, "usage": usage}),
     )
 
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
@@ -1217,7 +1231,7 @@ async def test_run_turn_native_tool_denied_by_policy(monkeypatch: pytest.MonkeyP
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._policy_evaluator = _policy("PHASE_TOOL_CALL")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
@@ -1283,7 +1297,7 @@ async def test_run_turn_bridged_tool_skips_tool_call_policy(
     _install_fake_sdk(monkeypatch, [script])
 
     # Wire a policy that denies PHASE_TOOL_CALL — if it fires, the turn would abort.
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._policy_evaluator = _policy("PHASE_TOOL_CALL")
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
@@ -1312,7 +1326,7 @@ async def test_run_turn_native_tool_allowed_by_policy(monkeypatch: pytest.Monkey
         "result": "Done.",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._policy_evaluator = _policy(None)  # never denies
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
@@ -1351,7 +1365,7 @@ async def test_run_turn_native_tool_no_handler_and_no_deny_allows(
         "result": "Done.",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
     executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
     # No _elicitation_handler → falls through to allow.
     try:
@@ -1379,7 +1393,7 @@ async def test_run_turn_native_tool_handler_approves(
     }
     _install_fake_sdk(monkeypatch, [script])
     # Interactive mode keeps per-tool elicitation; auto (default) would skip it.
-    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x", permission_mode="default")
     # No policy evaluator — handler alone is sufficient to show the card.
 
     async def _approve(_name: str, _args: dict[str, Any]) -> bool:
@@ -1408,7 +1422,7 @@ async def test_run_turn_native_tool_handler_denies(
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x", permission_mode="default")
 
     async def _deny(_name: str, _args: dict[str, Any]) -> bool:
         return False
@@ -1438,7 +1452,7 @@ async def test_run_turn_native_tool_policy_deny_skips_handler(
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x")
 
     async def _deny_policy(phase: str, _data: dict[str, Any]) -> Any:
         # Only deny TOOL_CALL; allow LLM phases so the turn reaches the tool.
@@ -1481,7 +1495,7 @@ async def test_run_turn_native_tool_ask_user_approves(
         "result": "Done.",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x", permission_mode="default")
     executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
 
     async def _approve(_name: str, _args: dict[str, Any]) -> bool:
@@ -1510,7 +1524,7 @@ async def test_run_turn_native_tool_ask_user_denies(
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x", permission_mode="default")
     executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
 
     async def _deny(_name: str, _args: dict[str, Any]) -> bool:
@@ -1542,7 +1556,9 @@ async def test_run_turn_native_tool_auto_mode_skips_elicitation(
         "result": "Done.",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")  # default permission_mode=auto
+    executor = CursorExecutor(
+        router_mode="balanced", api_key="crsr_x"
+    )  # default permission_mode=auto
     handler_called = False
 
     async def _deny(_name: str, _args: dict[str, Any]) -> bool:
@@ -1576,7 +1592,7 @@ async def test_ensure_session_writes_hooks_json(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
     monkeypatch.setattr("sys.argv", ["runner", "--conversation-id", "conv_test123"])
     cwd = str(tmp_path)
-    executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x", cwd=cwd)
     events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     assert events  # ensure _ensure_session ran
 
@@ -1639,7 +1655,7 @@ async def test_bridge_spawns_in_workspace_cwd(
     monkeypatch.chdir(daemon_cwd)
     original_cwd = os.getcwd()
 
-    executor = CursorExecutor(api_key="crsr_x", cwd=str(workspace))
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x", cwd=str(workspace))
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
         assert events  # _ensure_session ran
@@ -1661,7 +1677,7 @@ async def test_hooks_json_not_written_without_server_url(
     _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
     monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
     cwd = str(tmp_path)
-    executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x", cwd=cwd)
     try:
         _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
@@ -1683,7 +1699,7 @@ async def test_hooks_json_cleaned_up_on_close(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
     monkeypatch.setattr("sys.argv", ["runner", "--conversation-id", "conv_cleanup"])
     cwd = str(tmp_path)
-    executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
+    executor = CursorExecutor(router_mode="balanced", api_key="crsr_x", cwd=cwd)
     _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
 
     hooks_file = tmp_path / ".cursor" / "hooks.json"
@@ -1905,3 +1921,62 @@ def test_cursor_policy_hook_uses_long_read_timeout(monkeypatch: pytest.MonkeyPat
     _call_kwargs = mock_fn.call_args
     read_timeout = _call_kwargs.kwargs.get("read_timeout") or _call_kwargs.args[3]
     assert read_timeout == 86400.0
+
+
+@pytest.mark.parametrize("mode", ["cost", "balanced", "intelligence"])
+async def test_router_catalog_mode_is_sent_explicitly(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    executor = CursorExecutor(router_mode=mode, api_key="fixture")
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+        assert any(isinstance(e, TurnComplete) for e in events)
+        selection = state["create_selections"][0]
+        assert selection.id == "auto-smart"
+        assert [(p.id, p.value) for p in selection.params] == [("optimize_for", mode)]
+    finally:
+        await executor.close()
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [
+        [],
+        [SimpleNamespace(id="auto-smart", parameters=[])],
+        [
+            SimpleNamespace(
+                id="auto-smart",
+                parameters=[
+                    SimpleNamespace(id="optimize_for", values=[SimpleNamespace(value="cost")])
+                ],
+            )
+        ],
+    ],
+)
+async def test_router_unavailable_or_mode_disallowed_never_creates_or_sends(
+    monkeypatch: pytest.MonkeyPatch, catalog: list[Any]
+) -> None:
+    state = _install_fake_sdk(monkeypatch)
+    state["catalog"] = catalog
+    executor = CursorExecutor(router_mode="balanced", api_key="fixture")
+    events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    assert any(isinstance(e, ExecutorError) for e in events)
+    assert state["create_models"] == [] and state["sent"] == []
+    assert state["client_closed"] == 1
+
+
+async def test_explicit_fixed_model_preserved_and_unknown_pin_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    executor = CursorExecutor(model="gpt-5", api_key="fixture")
+    try:
+        _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+        assert state["create_selections"] == ["gpt-5"]
+    finally:
+        await executor.close()
+    executor = CursorExecutor(model="not-in-catalog", api_key="fixture")
+    events = [e async for e in executor.run_turn([_user("other")], [], "SYS")]
+    assert any(isinstance(e, ExecutorError) for e in events)
+    assert len(state["create_models"]) == 1

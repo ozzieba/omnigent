@@ -18,8 +18,10 @@ route through the Databricks AI gateway.
 Env vars read at startup:
 
 - ``HARNESS_CURSOR_MODEL``: Cursor model id, e.g. ``"gpt-5"`` or ``"auto-smart"``.
-  ``None`` resolves to cursor's ``auto-smart`` select. A ``databricks-*`` id (from a
-  spec authored for another harness) is dropped by the executor.
+  Explicit fixed IDs are checked against the selected account catalog; foreign
+  model IDs refuse. An omitted ID requires an explicit Router mode.
+- ``HARNESS_CURSOR_ROUTER_MODE``: explicit ``cost``, ``balanced`` or ``intelligence``.
+  Required for ``auto-smart``; the selected account must advertise that mode.
 - ``HARNESS_CURSOR_CWD``: working directory the session operates in.
   ``None`` falls back to ``os_env.cwd`` then the process cwd.
 - ``HARNESS_CURSOR_API_KEY``: Cursor API key, used as the SDK ``api_key``.
@@ -138,6 +140,7 @@ def _build_cursor_executor() -> Executor:
         cwd=os.environ.get(_ENV_CWD) or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL) or None,
+        router_mode=os.environ.get("HARNESS_CURSOR_ROUTER_MODE") or None,
         api_key=os.environ.get(_ENV_API_KEY) or None,
         bundle_dir=bundle_dir,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
