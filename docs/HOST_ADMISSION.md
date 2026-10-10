@@ -21,3 +21,14 @@ This configuration does not enroll hosts or enable maintenance. Enrollment and
 drain continue to return 503 until a trusted server bootstrap qualifies complete
 ingress and replica coverage. YAML keys cannot grant that readiness. Existing
 pending and UNKNOWN operations retain their original custody.
+
+## Verify admission changes on a ready pull request
+
+Check CI and Lint run timestamps against the transition out of draft. A passing
+status can belong to an earlier draft run whose tests or lint were skipped.
+On the personal Forge, PR86's title-prefix transition produced follow-up target
+workflows but no fresh CI or Lint run in the observed set. Verify execution on
+the current nondraft head before treating those statuses as test evidence.
+A normal branch update can request new pull-request CI; confirm its actual runs
+and results. Source integration does not establish host enrollment, runtime
+readiness, or successful admission of a live workload.
