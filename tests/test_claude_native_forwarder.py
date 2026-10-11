@@ -8645,6 +8645,11 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
 
     monkeypatch.setattr("omnigent.cli_auth.open_server_client", _open_client)
 
+    # Keep the real warning and traceback in caplog without rendering the
+    # unrelated Rich console traceback synchronously in the poll task.
+    monkeypatch.setattr(forwarder._logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(forwarder._logger, "propagate", False)
+
     with caplog.at_level(logging.WARNING, logger="omnigent.claude_native_forwarder"):
         task = asyncio.create_task(
             forward_claude_transcript_to_session(
