@@ -20,7 +20,8 @@
 #                                                          cannot self-waive.
 #
 # Case 2 sends the PR's web/** + tests/e2e_ui/** diff to the LLM gateway
-# (OpenAI-compatible: OPENAI_BASE_URL + OPENAI_API_KEY, model E2E_UI_JUDGE_MODEL).
+# (OpenAI-compatible: E2E_UI_JUDGE_BASE_URL + E2E_UI_JUDGE_API_KEY, falling back
+# to OPENAI_BASE_URL + OPENAI_API_KEY; model E2E_UI_JUDGE_MODEL).
 # It is the only non-deterministic step. SECURITY: under pull_request_target the
 # diff is attacker-controlled text. We never execute PR code; we only pass diff
 # *text* to the judge (same accepted-risk profile as fork e2e running with the
@@ -39,7 +40,7 @@
 #
 # Env in:  GH_TOKEN, REPO, PR, MAINTAINERS (space-separated, from
 #          merge-ready/load-maintainers.sh), OPENAI_BASE_URL, OPENAI_API_KEY,
-#          E2E_UI_JUDGE_MODEL.
+#          E2E_UI_JUDGE_MODEL, optional E2E_UI_JUDGE_BASE_URL + E2E_UI_JUDGE_API_KEY.
 # Exit:    0 = gate satisfied; 1 = blocked.
 
 set -euo pipefail
@@ -64,6 +65,19 @@ if [[ "$touches_ui" != "true" ]]; then
 fi
 
 : "${E2E_UI_JUDGE_MODEL:?Set OMNIGENT_CI_E2E_JUDGE_MODEL repository variable}"
+
+# Never send a shared key to a dedicated URL, or a dedicated key to the gateway.
+if [[ -n "${E2E_UI_JUDGE_BASE_URL:-}" || -n "${E2E_UI_JUDGE_API_KEY:-}" ]]; then
+  : "${E2E_UI_JUDGE_BASE_URL:?Set both OMNIGENT_UI_JUDGE_BASE_URL and OMNIGENT_UI_JUDGE_API_KEY repository secrets}"
+  : "${E2E_UI_JUDGE_API_KEY:?Set both OMNIGENT_UI_JUDGE_BASE_URL and OMNIGENT_UI_JUDGE_API_KEY repository secrets}"
+  JUDGE_BASE_URL=$E2E_UI_JUDGE_BASE_URL
+  JUDGE_API_KEY=$E2E_UI_JUDGE_API_KEY
+else
+  : "${OPENAI_BASE_URL:?Set GATEWAY_BASE_URL repository secret or the dedicated judge pair}"
+  : "${OPENAI_API_KEY:?Set LLM_API_KEY repository secret or the dedicated judge pair}"
+  JUDGE_BASE_URL=$OPENAI_BASE_URL
+  JUDGE_API_KEY=$OPENAI_API_KEY
+fi
 
 # --- 2. LLM judge: behavior change without adequate e2e_ui coverage? ------
 # Build a bounded diff blob: only web/** and tests/e2e_ui/** patches. Each
@@ -144,9 +158,9 @@ REQ_BODY=$(jq -n \
 
 set +e
 RESP=$(curl -sS --fail-with-body --max-time 90 \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Authorization: Bearer $JUDGE_API_KEY" \
   -H "Content-Type: application/json" \
-  -X POST "${OPENAI_BASE_URL%/}/chat/completions" \
+  -X POST "${JUDGE_BASE_URL%/}/chat/completions" \
   -d "$REQ_BODY")
 CURL_RC=$?
 set -e

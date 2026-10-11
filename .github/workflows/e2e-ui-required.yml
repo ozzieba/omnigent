@@ -69,7 +69,9 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           MAINTAINERS: ${{ steps.maintainers.outputs.list }}
-          # OpenAI-compatible gateway (same secrets the e2e suites use).
+          # Dedicated judge credentials override the shared gateway as a pair.
+          E2E_UI_JUDGE_BASE_URL: ${{ secrets.OMNIGENT_UI_JUDGE_BASE_URL }}
+          E2E_UI_JUDGE_API_KEY: ${{ secrets.OMNIGENT_UI_JUDGE_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.LLM_API_KEY }}
           E2E_UI_JUDGE_MODEL: ${{ vars.OMNIGENT_CI_E2E_JUDGE_MODEL }}

@@ -48,8 +48,11 @@ FAKE_CURL = """#!/usr/bin/python3
 import json, os, pathlib, sys
 p=pathlib.Path(os.environ['GATE_FIXTURE_DIR'])
 c=json.loads((p/'case.json').read_text()); a=sys.argv[1:]
-assert a[a.index('-X')+1]=='POST' and 'https://hermetic.invalid/chat/completions' in a
+assert a[a.index('-X')+1]=='POST'
+assert c['expected_base'].rstrip('/')+'/chat/completions' in a
+assert 'Authorization: Bearer '+c['expected_key'] in a
 body=json.loads(a[a.index('-d')+1])
+assert body['max_tokens']==200 and body['temperature']==0
 with (p/'curl.jsonl').open('a') as f:
  f.write(json.dumps({'model':body['model'],'messages':len(body['messages'])})+'\\n')
 if c['curl_error']: raise SystemExit(22)
@@ -69,6 +72,9 @@ def run_fixture(
     author="contributor",
     reviews=(),
     curl_error=False,
+    judge_base=None,
+    judge_key=None,
+    legacy_credentials=True,
     source_root=ROOT,
 ):
     parent = os.environ.get("E2E_GATE_FIXTURE_ROOT")
@@ -102,6 +108,8 @@ def run_fixture(
                 "author": author,
                 "reviews": list(reviews),
                 "curl_error": curl_error,
+                "expected_base": judge_base or "https://hermetic.invalid",
+                "expected_key": judge_key or "synthetic",
             }
         )
     )
@@ -113,9 +121,14 @@ def run_fixture(
         "PR": "86",
         "GH_TOKEN": "synthetic-not-a-credential",
         "MAINTAINERS": "oz",
-        "OPENAI_BASE_URL": "https://hermetic.invalid",
-        "OPENAI_API_KEY": "synthetic",
     }
+    if legacy_credentials:
+        env["OPENAI_BASE_URL"] = "https://hermetic.invalid"
+        env["OPENAI_API_KEY"] = "synthetic"
+    if judge_base is not None:
+        env["E2E_UI_JUDGE_BASE_URL"] = judge_base
+    if judge_key is not None:
+        env["E2E_UI_JUDGE_API_KEY"] = judge_key
     if model is not None:
         env["E2E_UI_JUDGE_MODEL"] = model
     if workflow:
@@ -236,6 +249,81 @@ class GateTests(unittest.TestCase):
     def test_gateway_error_remains_closed(self):
         cp = self.configured("gateway-failure", success=False, curl_error=True)
         self.assertIn(b"gateway error, exit 22", cp.stdout)
+
+    def test_dedicated_pair_overrides_shared_credentials(self):
+        for workflow in (False, True):
+            with self.subTest(workflow=workflow):
+                cp = self.configured(
+                    "dedicated-pair",
+                    success=True,
+                    workflow=workflow,
+                    judge_base="https://judge.hermetic.invalid/v1/",
+                    judge_key="synthetic-dedicated",
+                )
+                self.assertNotIn(b"synthetic-dedicated", cp.stdout + cp.stderr)
+
+    def test_dedicated_pair_without_shared_credentials(self):
+        self.configured(
+            "dedicated-only",
+            success=True,
+            judge_base="https://judge.hermetic.invalid/v1",
+            judge_key="synthetic-dedicated",
+            legacy_credentials=False,
+        )
+
+    def test_partial_pair_refuses_before_diff_or_http(self):
+        for judge_base, judge_key in (
+            ("https://judge.hermetic.invalid/v1", None),
+            ("https://judge.hermetic.invalid/v1", ""),
+            (None, "synthetic-dedicated"),
+            ("", "synthetic-dedicated"),
+        ):
+            for workflow in (False, True):
+                with self.subTest(judge_base=judge_base, judge_key=judge_key, workflow=workflow):
+                    cp, gh, curl, _ = run_fixture(
+                        "partial-pair",
+                        web=True,
+                        model="fixture-judge-model",
+                        judge_base=judge_base,
+                        judge_key=judge_key,
+                        workflow=workflow,
+                    )
+                    self.assertNotEqual(cp.returncode, 0)
+                    self.assertIn(b"Set both OMNIGENT_UI_JUDGE", cp.stderr)
+                    self.assertEqual(len(gh), 1)
+                    self.assertEqual(curl, [])
+                    self.assertNotIn(b"synthetic-dedicated", cp.stdout + cp.stderr)
+
+    def test_no_ui_partial_pair_still_skips(self):
+        for judge_base, judge_key in (
+            ("https://judge.hermetic.invalid/v1", None),
+            (None, "synthetic-dedicated"),
+        ):
+            for workflow in (False, True):
+                with self.subTest(judge_base=judge_base, judge_key=judge_key, workflow=workflow):
+                    cp, gh, curl, _ = run_fixture(
+                        "backend-partial-pair",
+                        judge_base=judge_base,
+                        judge_key=judge_key,
+                        workflow=workflow,
+                        legacy_credentials=False,
+                    )
+                    self.assertEqual(cp.returncode, 0, cp.stderr.decode())
+                    self.assertIn(b"PR touches no web/**", cp.stdout)
+                    self.assertEqual(len(gh), 1)
+                    self.assertEqual(curl, [])
+
+    def test_empty_pair_uses_shared_credentials(self):
+        self.configured("empty-pair", success=True, judge_base="", judge_key="")
+
+    def test_web_without_any_credentials_refuses_before_http(self):
+        cp, gh, curl, _ = run_fixture(
+            "web-no-credentials", web=True, model="fixture-judge-model", legacy_credentials=False
+        )
+        self.assertNotEqual(cp.returncode, 0)
+        self.assertIn(b"GATEWAY_BASE_URL", cp.stderr)
+        self.assertEqual(len(gh), 1)
+        self.assertEqual(curl, [])
 
 
 if __name__ == "__main__":
