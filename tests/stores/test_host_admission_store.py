@@ -231,7 +231,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         task = asyncio.create_task(guarded_operation(self.adapter, B, "input", action))
-        await asyncio.wait_for(entered.wait(), 0.3)
+        # Admission may use its full deadline before invoking the action.
+        # The precondition wait must not cancel the test while admission is valid.
+        await asyncio.wait_for(entered.wait(), self.adapter.timeout + 0.3)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
