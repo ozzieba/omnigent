@@ -76,6 +76,24 @@ describe("createProject", () => {
       config: { host_id: "h1", agent_id: "ag_1" },
     });
   });
+
+  it("omits server routing when creating from an existing project's config", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "p_2", name: "Copy" }));
+    const config = {
+      quota_route: "personal-llmq",
+      project_enum: "planar-jacobian",
+      host_id: "h1",
+      icon: "🔥",
+    };
+    await createProject("Copy", config);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      name: "Copy",
+      config: { host_id: "h1", icon: "🔥" },
+    });
+    expect(config.quota_route).toBe("personal-llmq");
+    expect(config.project_enum).toBe("planar-jacobian");
+  });
 });
 
 describe("getProject", () => {
@@ -106,6 +124,23 @@ describe("updateProjectConfig", () => {
     await updateProjectConfig("p_1", {});
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ config: {} });
+  });
+
+  it("allows settings edits on a project whose read config includes server routing", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "p_1", name: "A" }));
+    const config = {
+      quota_route: "personal-llmq",
+      project_enum: "planar-jacobian",
+      workspace: "/work/repo",
+      icon: "🌱",
+    };
+    await updateProjectConfig("p_1", config);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      config: { workspace: "/work/repo", icon: "🌱" },
+    });
+    expect(config.quota_route).toBe("personal-llmq");
+    expect(config.project_enum).toBe("planar-jacobian");
   });
 });
 

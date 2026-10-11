@@ -262,6 +262,42 @@ def test_update_same_config_is_noop(store: SqlAlchemyProjectStore) -> None:
     assert updated.updated_at is None
 
 
+def test_update_preserves_current_server_routing_without_mutating_input(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """Internal stale config cannot replace the current authoritative fields."""
+    routing = {"quota_route": "personal-llmq", "project_enum": "planar-jacobian"}
+    store.create(_uid("p1"), "P", "alice@example.com", {**routing, "host_id": "old"})
+    stale = {"quota_route": "work-vertex", "project_enum": "planar-jc-codex", "host_id": "new"}
+    updated = store.update(_uid("p1"), user_id="alice@example.com", config=stale)
+    assert updated is not None
+    assert updated.config == {**routing, "host_id": "new"}
+    assert stale == {
+        "quota_route": "work-vertex",
+        "project_enum": "planar-jc-codex",
+        "host_id": "new",
+    }
+
+
+@pytest.mark.parametrize("existing", [{}, {"quota_route": None}])
+def test_update_cannot_insert_missing_server_routing(
+    store: SqlAlchemyProjectStore, existing: dict[str, str | None]
+) -> None:
+    """An ordinary update preserves absence and existing null values."""
+    store.create(_uid("p1"), "P", "alice@example.com", existing)
+    updated = store.update(
+        _uid("p1"),
+        user_id="alice@example.com",
+        config={
+            "quota_route": "personal-llmq",
+            "project_enum": "planar-jacobian",
+            "host_id": "new",
+        },
+    )
+    assert updated is not None
+    assert updated.config == {**existing, "host_id": "new"}
+
+
 def test_create_rejects_oversized_config(store: SqlAlchemyProjectStore) -> None:
     """A config whose serialized form exceeds the cap is rejected on create.
 
