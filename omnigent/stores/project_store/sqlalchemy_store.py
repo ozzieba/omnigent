@@ -107,6 +107,11 @@ class SqlAlchemyProjectStore(ProjectStore):
             self._engine,
             query_name_prefix="omnigent.project_store",
         )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.project_store",
+            immediate=True,
+        )
 
     def _name_taken(
         self,
@@ -214,7 +219,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         only uniqueness guard, so concurrent renames to the same name can both
         land.
         """
-        with self._session("update_project") as session:
+        with self._session_immediate("update_project") as session:
             row = session.execute(
                 select(SqlProject)
                 .where(

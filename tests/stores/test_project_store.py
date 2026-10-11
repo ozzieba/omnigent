@@ -6,11 +6,16 @@ real SQLite database, covering owner scoping and per-owner name uniqueness.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import event, update
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session
 
+from omnigent.db.db_models import SqlProject, current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
@@ -44,6 +49,59 @@ def test_create_returns_project(store: SqlAlchemyProjectStore) -> None:
     assert project.user_id == "alice@example.com"
     assert project.created_at > 0
     assert project.updated_at is None
+
+
+@pytest.mark.parametrize(
+    ("initial_routing", "admin_routing"),
+    [
+        ({}, {"quota_route": "personal-llmq", "project_enum": "planar-jacobian"}),
+        ({"quota_route": "personal-llmq", "project_enum": "planar-jacobian"}, {}),
+    ],
+)
+def test_admin_routing_write_cannot_land_between_ordinary_read_and_flush(
+    store: SqlAlchemyProjectStore,
+    initial_routing: dict[str, str],
+    admin_routing: dict[str, str],
+) -> None:
+    project = store.create(_uid("routing-race"), "Routing race", "alice", initial_routing)
+    workspace_id = current_workspace_id()
+    observed: list[str] = []
+    statement = update(SqlProject).where(
+        SqlProject.workspace_id == workspace_id, SqlProject.id == project.id
+    )
+
+    def interleave(session: Session, _context: object, _instances: object) -> None:
+        if not any(isinstance(row, SqlProject) for row in session.dirty):
+            return
+        with store._engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA busy_timeout = 0")
+            try:
+                connection.execute(
+                    statement.values(config=json.dumps(admin_routing) if admin_routing else None)
+                )
+                connection.commit()
+                observed.append("committed")
+            except OperationalError as error:
+                assert isinstance(error.orig, sqlite3.OperationalError)
+                assert error.orig.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                observed.append("blocked")
+
+    event.listen(Session, "before_flush", interleave)
+    try:
+        store.update(project.id, user_id="alice", config={"icon": "new"})
+    finally:
+        event.remove(Session, "before_flush", interleave)
+
+    assert observed == ["blocked"]
+    ordinary = store.get(project.id, user_id="alice")
+    assert ordinary is not None
+    assert ordinary.config == {"icon": "new", **initial_routing}
+
+    with store._engine.begin() as connection:
+        connection.execute(statement.values(config=json.dumps({"icon": "new", **admin_routing})))
+    after_admin = store.get(project.id, user_id="alice")
+    assert after_admin is not None
+    assert after_admin.config == {"icon": "new", **admin_routing}
 
 
 def test_get_returns_created_project(store: SqlAlchemyProjectStore) -> None:
