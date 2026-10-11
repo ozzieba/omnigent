@@ -26,8 +26,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FILE_COUNT = 80
 
 
-def _seed_file(base_url: str, session_id: str, path: str) -> None:
-    resp = httpx.put(
+def _seed_file(client: httpx.Client, base_url: str, session_id: str, path: str) -> None:
+    resp = client.put(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
         json={"content": f"contents of {path}\n", "encoding": "utf-8"},
         timeout=10.0,
@@ -40,9 +40,10 @@ def seeded_scroll_sessions(
     seeded_session_pair: tuple[str, str, str],
 ) -> Iterator[tuple[str, str, str]]:
     base_url, session_a, session_b = seeded_session_pair
-    for i in range(_FILE_COUNT):
-        _seed_file(base_url, session_a, f"scroll_file_{i:03d}.txt")
-    _seed_file(base_url, session_b, "other_session_file.txt")
+    with httpx.Client() as client:
+        for i in range(_FILE_COUNT):
+            _seed_file(client, base_url, session_a, f"scroll_file_{i:03d}.txt")
+        _seed_file(client, base_url, session_b, "other_session_file.txt")
     try:
         yield (base_url, session_a, session_b)
     finally:
