@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import re
 import sys
@@ -123,3 +124,36 @@ class UIProgress:
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_runtest_teardown(self, item, nextitem):
         return (yield from self._phase(item, "teardown"))
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_runtest_makereport(self, item, call):
+        report = yield
+        bound = self._items.get(item)
+        if bound is None or not report.failed or call.excinfo is None:
+            return report
+        canonical, ordinal, count = bound
+        error_type = call.excinfo.type
+        known = {AssertionError: "AssertionError", TimeoutError: "TimeoutError"}
+        category = known.get(error_type, "OTHER")
+        if (error_type.__module__, error_type.__name__) == (
+            "playwright._impl._errors",
+            "TimeoutError",
+        ):
+            category = "PLAYWRIGHT_TIMEOUT"
+        elif (error_type.__module__, error_type.__name__) == ("_pytest.outcomes", "Failed"):
+            category = "PYTEST_FAILED"
+        record = {
+            "event": "FAILURE",
+            "timestamp": time.time(),
+            "canonical": canonical,
+            "ordinal": ordinal,
+            "selected_count": count,
+            "phase": report.when,
+            "error_class": category,
+        }
+        for entry in call.excinfo.traceback[-64:]:
+            if entry.path == item.path and entry.name == item.originalname:
+                record["test_line"] = entry.lineno + 1
+        with contextlib.suppress(OSError, ValueError):
+            self._write(record)
+        return report
