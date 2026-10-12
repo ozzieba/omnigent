@@ -1041,6 +1041,36 @@ class SqlConversationItem(ConversationBase):
 LABEL_VALUE_MAX_LEN = 256
 
 
+class SqlSessionGoal(ConversationBase):
+    """One goal per session, isolated by tenant and independent of turn history."""
+
+    __tablename__ = "session_goals"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    objective: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    completion_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'paused', 'blocked', 'completed', 'cancelled')",
+            name="ck_session_goals_status",
+        ),
+        CheckConstraint("revision > 0", name="ck_session_goals_revision"),
+    )
+
+
 class SqlConversationLabel(ConversationBase):
     """
     SQLAlchemy model for the ``conversation_labels`` table.

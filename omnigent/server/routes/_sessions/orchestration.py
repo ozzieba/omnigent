@@ -93,6 +93,7 @@ from omnigent.runtime.policies.builder import (
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.prompt import append_session_goal_context
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
@@ -5700,6 +5701,23 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    routing_body = body
+    if (
+        body.type == "message"
+        and body.data.get("role") == "user"
+        and conv.labels.get("omnigent.wrapper") in {"claude-code-native-ui", "opencode-native-ui"}
+        and isinstance(body.data.get("content"), list)
+    ):
+        goal = await asyncio.to_thread(conversation_store.get_session_goal, session_id)
+        if goal is not None:
+            body = body.model_copy(
+                update={
+                    "data": {
+                        **body.data,
+                        "content": append_session_goal_context(body.data["content"], goal),
+                    }
+                }
+            )
     if body.type == "message" and _is_native_terminal_session(conv):
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
@@ -5781,7 +5799,7 @@ async def _dispatch_session_event_to_runner_impl(
             from omnigent.server.smart_routing import route_turn_or_decline
 
             _harness = _native_pane_harness(conv)
-            _user_text = _extract_user_text_for_routing(body)
+            _user_text = _extract_user_text_for_routing(routing_body)
             # Cross-family spawns belong to auto-harness sessions: a pinned
             # session's children stay in its family (the rule the in-harness
             # spawn gate applies via ``candidate_models(cross_harness=False)``).

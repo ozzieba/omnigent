@@ -888,10 +888,18 @@ def create_sessions_router(
     from omnigent.server.routes.sessions.routes_core import register_core_routes
     from omnigent.server.routes.sessions.routes_elicitations import register_elicitations_routes
     from omnigent.server.routes.sessions.routes_events import register_events_routes
+    from omnigent.server.routes.sessions.routes_goals import register_goal_routes
     from omnigent.server.routes.sessions.routes_hooks import register_hooks_routes
     from omnigent.server.routes.sessions.routes_items import register_items_routes
     from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
     from omnigent.server.routes.sessions.routes_resources import register_resources_routes
+
+    register_goal_routes(
+        router,
+        conversation_store=conversation_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+    )
 
     register_core_routes(
         router,
