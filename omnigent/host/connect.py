@@ -3086,7 +3086,13 @@ class HostProcess:
     ) -> dict[str, HarnessAvailability] | None:
         """Collect harness readiness without letting a probe break the channel."""
         try:
-            return await asyncio.to_thread(configured_harness_map)
+            latest = await asyncio.to_thread(configured_harness_map)
+            now = time.monotonic()
+            for harness, availability in latest.items():
+                if availability is False or availability == HARNESS_BINARY_MISSING:
+                    _quick_probe_cache[harness] = now
+                    _quick_probe_cached[harness] = False
+            return latest
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")
             if startup:
