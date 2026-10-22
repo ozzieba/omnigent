@@ -31,6 +31,19 @@ from omnigent.runtime.harnesses._harness_zygote_client import (
 pytestmark = [pytest.mark.posix_only, pytest.mark.asyncio]
 
 
+@pytest.fixture(autouse=True)
+def _patient_zygote_start(monkeypatch):
+    """Give the zygote's first ping time to survive a cold, loaded CI box.
+
+    The zygote answers ``start()``'s ping only after importing the whole runner
+    graph, which can take 25+ s on a cold CPU-starved runner — close to the 30 s
+    production ``_CONTROL_TIMEOUT_S`` wedge guard. Widen it for these tests.
+
+    :param monkeypatch: Fixture used to widen the control timeout.
+    """
+    monkeypatch.setattr("omnigent.host.runner_zygote._CONTROL_TIMEOUT_S", 180.0)
+
+
 @pytest.fixture
 def zygote(tmp_path):
     """A started zygote subprocess (via ZygoteManager), stopped on teardown.

@@ -1532,8 +1532,14 @@ async def test_managed_session_deleted_during_provision_terminates_sandbox(
     gate.set()
     # The launch completes (sandbox provisioned, fake host registers),
     # then hits the deleted session at the bind step and tears down.
+    # Teardown is two thread hops: ``launcher.terminate`` (which the fake
+    # records) and then ``host_store.delete_host``. Wait for BOTH to land so a
+    # loaded runner that observes the gap between them doesn't read the
+    # half-finished teardown as a leaked host row.
     deadline = loop.time() + 15.0
-    while loop.time() < deadline and not fake.terminated:
+    while loop.time() < deadline and not (
+        fake.terminated and not env.host_store.list_hosts(RESERVED_USER_LOCAL)
+    ):
         await asyncio.sleep(0.05)
     # Terminated exactly the sandbox it provisioned — a regression here
     # leaks a running sandbox (and a live launch token) for a session
