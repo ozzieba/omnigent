@@ -107,6 +107,11 @@ class SqlAlchemyProjectStore(ProjectStore):
             self._engine,
             query_name_prefix="omnigent.project_store",
         )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.project_store",
+            immediate=True,
+        )
 
     def _name_taken(
         self,
@@ -214,8 +219,15 @@ class SqlAlchemyProjectStore(ProjectStore):
         only uniqueness guard, so concurrent renames to the same name can both
         land.
         """
-        with self._session("update_project") as session:
-            row = session.get(SqlProject, (current_workspace_id(), project_id))
+        with self._session_immediate("update_project") as session:
+            row = session.execute(
+                select(SqlProject)
+                .where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id == project_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
             if row is None or row.user_id != user_id:
                 return None
             changed = False
@@ -228,6 +240,13 @@ class SqlAlchemyProjectStore(ProjectStore):
                 row.name = name
                 changed = True
             if config is not None:
+                # Preserve server routing under the same row lock as the write.
+                current_config = _decode_config(row.config)
+                config = dict(config)
+                for key in ("quota_route", "project_enum"):
+                    config.pop(key, None)
+                    if key in current_config:
+                        config[key] = current_config[key]
                 encoded = _encode_config(config)
                 if row.config != encoded:
                     row.config = encoded

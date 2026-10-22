@@ -30,7 +30,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.stores.project_store import ProjectStore
 
-_SERVER_OWNED_CONFIG_KEYS = frozenset({"quota_route"})
+_SERVER_OWNED_CONFIG_KEYS = frozenset({"quota_route", "project_enum"})
 
 
 def _reject_server_owned_config(config: dict[str, Any]) -> None:
