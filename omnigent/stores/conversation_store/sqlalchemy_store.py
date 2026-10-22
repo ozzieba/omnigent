@@ -672,9 +672,11 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         created_at=row.created_at,
         data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
-        native_thread_id=row.native_thread_id,
-        native_turn_id=row.native_turn_id,
-        native_item_id=row.native_item_id,
+        # The latest-message preview projection (``_ranked_latest_message_items``)
+        # deliberately omits these columns, so read them tolerantly.
+        native_thread_id=getattr(row, "native_thread_id", None),
+        native_turn_id=getattr(row, "native_turn_id", None),
+        native_item_id=getattr(row, "native_item_id", None),
     )
 
 
