@@ -912,8 +912,14 @@ class ConversationStore(ABC):
         ...
 
     def get_session_goal(self, conversation_id: str) -> SessionGoal | None:
-        """Read a durable goal without consulting or waking the runner."""
-        raise NotImplementedError("This store does not support durable session goals")
+        """Read a durable goal without consulting or waking the runner.
+
+        Stores without goal support hold no goals, so message dispatch (which
+        reads the goal for every native Claude/OpenCode user message) keeps
+        working on them; :meth:`set_session_goal` still refuses.
+        """
+        del conversation_id
+        return None
 
     def set_session_goal(
         self, conversation_id: str, request: SetSessionGoalRequest, updated_by: str | None

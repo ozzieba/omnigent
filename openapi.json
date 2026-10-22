@@ -5171,6 +5171,95 @@
         "title": "SessionGitOptions",
         "type": "object"
       },
+      "SessionGoal": {
+        "properties": {
+          "completion_evidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Evidence"
+          },
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "objective": {
+            "title": "Objective",
+            "type": "string"
+          },
+          "revision": {
+            "format": "int64",
+            "title": "Revision",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "active",
+              "paused",
+              "blocked",
+              "completed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated By"
+          }
+        },
+        "required": [
+          "session_id",
+          "objective",
+          "status",
+          "revision",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "SessionGoal",
+        "type": "object"
+      },
+      "SessionGoalResponse": {
+        "properties": {
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionGoal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "goal"
+        ],
+        "title": "SessionGoalResponse",
+        "type": "object"
+      },
       "SessionHeartbeatEvent": {
         "description": "Idle-stream keepalive on `GET /v1/sessions/{id}/stream`.\n\nEmitted by the session-stream route on a fixed cadence whenever\nthe underlying publish queue has been quiet (no turn in flight,\nno resource events). Distinct from `HeartbeatEvent`\n(`response.heartbeat`), which is per-turn and is driven by\nthe runtime workflow while a response is producing output.\n\nWhy this exists: the session stream stays open across many turns\nand through idle periods (waiting for the user to type). Without\na periodic emit, intermediate proxies, OS-level sockets, and the\nclient's SSE read-timeout can leave a half-open stream\nundetected for minutes after a network event (laptop sleep,\nWi-Fi handoff). The heartbeat puts a regular byte on the wire\nso the client's read-timeout and the server's\n`request.is_disconnected()` check both fire promptly.\n\nConsumers MAY ignore the payload entirely (the bytes crossing\nthe wire are sufficient). The optional `server_time` mirrors\n`HeartbeatEvent` for symmetry and debugging.",
         "properties": {
@@ -7450,6 +7539,59 @@
           "objective"
         ],
         "title": "SetCodexGoalRequest",
+        "type": "object"
+      },
+      "SetSessionGoalRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "completion_evidence": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Evidence"
+          },
+          "expected_revision": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "objective": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Objective",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "active",
+                  "paused",
+                  "blocked",
+                  "completed",
+                  "cancelled"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          }
+        },
+        "required": [
+          "objective",
+          "expected_revision"
+        ],
+        "title": "SetSessionGoalRequest",
         "type": "object"
       },
       "SetSharingRequest": {
@@ -11806,6 +11948,98 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/goals": {
+      "get": {
+        "operationId": "get_goal_v1_sessions__session_id__goals_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Goal",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "put": {
+        "operationId": "set_goal_v1_sessions__session_id__goals_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionGoalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGoalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Goal",
+        "tags": [
+          "sessions"
         ]
       }
     },
