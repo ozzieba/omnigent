@@ -48,6 +48,16 @@ pyte = pytest.importorskip("pyte")
 
 _DRIVER = Path(__file__).parent / "_double_render_driver.py"
 
+# Hang guard, not a pacing knob. The drain loop below returns as soon as the
+# child exits (EOF / EIO on the PTY), so a healthy run takes ~2s. The driver is
+# a cold ``python`` that imports omnigent_ui_sdk + prompt_toolkit + rich
+# before writing a single byte; on a CPU-saturated CI host (load avg ~28 on 24
+# cores) that start-up alone exceeded the previous 8s deadline, so the loop
+# gave up on a still-running child and the test asserted on a truncated (or
+# empty: ``raw == ''``) capture. Keep the deadline far above any plausible
+# loaded start-up.
+_DRAIN_TIMEOUT_S = 90.0
+
 
 def _spawn_driver_in_pty(cols: int, rows: int) -> tuple[int, int]:
     """
@@ -76,10 +86,10 @@ def _spawn_driver_in_pty(cols: int, rows: int) -> tuple[int, int]:
     return pid, parent_fd
 
 
-def _drain_pty(parent_fd: int, pid: int, timeout_s: float = 8.0) -> str:
+def _drain_pty(parent_fd: int, pid: int, timeout_s: float = _DRAIN_TIMEOUT_S) -> str:
     """
-    Read from the PTY parent fd until the child exits or the deadline
-    expires. Decodes the captured bytes as UTF-8.
+    Read from the PTY parent fd until the child exits (EOF), failing the
+    test if the hang-guard deadline expires first. Decodes the captured bytes as UTF-8.
 
     :param parent_fd: The parent side of the PTY.
     :param pid: The child's pid (used to detect termination).
@@ -87,6 +97,7 @@ def _drain_pty(parent_fd: int, pid: int, timeout_s: float = 8.0) -> str:
     :returns: Decoded captured stream.
     """
     captured: list[bytes] = []
+    timed_out = False
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         ready, _, _ = select.select([parent_fd], [], [], 0.5)
@@ -105,11 +116,21 @@ def _drain_pty(parent_fd: int, pid: int, timeout_s: float = 8.0) -> str:
             captured.append(data)
         except OSError:
             break
+    else:
+        timed_out = True
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, 9)
     with contextlib.suppress(ChildProcessError):
         os.waitpid(pid, 0)
     os.close(parent_fd)
+    if timed_out:
+        # Fail loudly instead of asserting on a truncated capture, which reads
+        # as a (misleading) product regression.
+        pytest.fail(
+            f"driver did not finish within {timeout_s:.0f}s "
+            f"(captured {sum(len(c) for c in captured)} bytes); "
+            f"host is likely starved of CPU"
+        )
     return b"".join(captured).decode("utf-8", errors="replace")
 
 
