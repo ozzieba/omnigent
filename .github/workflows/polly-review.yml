@@ -57,8 +57,10 @@ jobs:
     # Fire on non-draft PRs (after gate passes), `/review` comments by
     # write-access users, or workflow_dispatch. The `!cancelled()` ensures
     # the job runs when gate is skipped (non-PR events) but not when it fails.
+    # GitHub-only: Forge runners lack the gh CLI and gateway secrets, so every Forge run
+    # failed with PERSONAL_GATE_DEPENDENCY_UNAVAILABLE (exit 127).
     if: >-
-      !cancelled() && (
+      !cancelled() && github.server_url == 'https://github.com' && (
         (
           github.event_name == 'pull_request' &&
           !github.event.pull_request.draft &&
