@@ -18,16 +18,24 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
+import httpx
+
 from omnigent_slack.oauth import (
     AuthorizationDeniedError,
     AuthorizationExpiredError,
     DeviceFlowClient,
     OAuthError,
     PendingLogin,
+    RefreshServerError,
     start_login,
 )
 from omnigent_slack.omnigent import ClientAuth, TokenRefreshTransientError
 from omnigent_slack.tokens import TokenStore
+
+# Pauses between prompt retries of a transiently failed refresh. A rotation
+# whose response was lost is only replayable inside the server's short reuse
+# grace window, so retry now rather than on some later turn.
+_TRANSIENT_REFRESH_RETRY_DELAYS: tuple[float, ...] = (1.0, 3.0, 9.0)
 
 _logger = logging.getLogger(__name__)
 
@@ -203,7 +211,7 @@ class AuthManager:
                 await tokens.delete(team, user, server_url)
                 return None
             try:
-                pair = await self._rotate(server_url, current.refresh_token)
+                pair = await self._rotate_with_retry(server_url, current.refresh_token)
             except _GrantDeadError:
                 # Grant permanently revoked/expired — drop the dead token so the
                 # next turn prompts a fresh login instead of looping on 401s.
@@ -233,6 +241,17 @@ class AuthManager:
 
         return ClientAuth(record.access_token, _refresh)
 
+    async def _rotate_with_retry(self, server_url: str, refresh_token: str) -> RotatedToken:
+        """:meth:`_rotate`, retrying transient failures promptly with backoff."""
+        for delay in (*_TRANSIENT_REFRESH_RETRY_DELAYS, None):
+            try:
+                return await self._rotate(server_url, refresh_token)
+            except _RefreshTransientError:
+                if delay is None:
+                    raise
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
     async def _rotate(self, server_url: str, refresh_token: str) -> RotatedToken:
         """Rotate a refresh token via the external rotator or device-grant client.
 
@@ -253,6 +272,9 @@ class AuthManager:
         client = self._new_client(server_url)
         try:
             return await client.refresh(refresh_token)
+        except (RefreshServerError, httpx.HTTPError) as exc:
+            # 5xx / 429 / network: says nothing about the grant — keep it.
+            raise _RefreshTransientError(str(exc)) from exc
         except OAuthError as exc:
             # Device-grant client raises OAuthError on any non-200; treat as a
             # dead grant (its historical behaviour, preserved).

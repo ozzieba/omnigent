@@ -408,15 +408,26 @@ def test_full_device_flow(app: TestClient) -> None:
     assert r.status_code == 200, r.text
     new_refresh = r.json()["refresh_token"]
     assert new_refresh != refresh_token
-    # Old refresh token is now dead (rotation) → revokes on reuse.
+    # A retry of the old token inside the reuse-grace window (lost response)
+    # is idempotent: same successor, grant intact.
+    r = app.post(
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh_token}
+    )
+    assert r.status_code == 200 and r.json()["refresh_token"] == new_refresh
+    r = app.post(
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": new_refresh}
+    )
+    assert r.status_code == 200, r.text
+    newest_refresh = r.json()["refresh_token"]
+    # The original token is now older than the previous one → reuse revokes.
     r = app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh_token}
     )
     assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
 
-    # 7. After reuse-triggered revocation, the new refresh token is dead too.
+    # 7. After reuse-triggered revocation, the newest refresh token is dead too.
     r = app.post(
-        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": new_refresh}
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": newest_refresh}
     )
     assert r.status_code == 400
 
