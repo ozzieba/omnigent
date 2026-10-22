@@ -34,7 +34,7 @@ class MigrationTests(unittest.TestCase):
         cls.base_path = Path(cls.base_dir.name) / "full-chain.db"
         engine = sa.create_engine(f"sqlite:///{cls.base_path}")
         try:
-            migrate(engine, "head")
+            migrate(engine, HEAD)
             with engine.connect() as conn:
                 assert (
                     conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
@@ -109,7 +109,7 @@ class MigrationTests(unittest.TestCase):
                 conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one(),
                 PARENT,
             )
-        migrate(self.engine, "head")
+        migrate(self.engine, HEAD)
         with self.engine.connect() as conn:
             self.assertEqual(conn.execute(sa.select(SqlHost.__table__)).mappings().all(), before)
             self.assertEqual(
@@ -201,7 +201,7 @@ class MigrationTests(unittest.TestCase):
     def test_empty_downgrade_and_reupgrade(self):
         migrate(self.engine, PARENT, downgrade=True)
         self.assertNotIn(hosts.name, sa.inspect(self.engine).get_table_names())
-        migrate(self.engine, "head")
+        migrate(self.engine, HEAD)
         self.store.enroll(B)
         self.store.complete(self.store.admit(B, "launch"))
 
