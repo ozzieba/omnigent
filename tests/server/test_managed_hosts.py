@@ -3783,7 +3783,9 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         host_registry=None,
         tunnel_registry=None,
     )
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    conv = SimpleNamespace(
+        labels={}, environment_runtime_ref=None, host_id="host_1", agent_id=builtin.id
+    )
 
     engaged = await asyncio.gather(
         *(
