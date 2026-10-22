@@ -35,8 +35,8 @@ from omnigent.server.smart_routing import (
 from tests.e2e.routing._mock_router import MockRouter, serve_mock_router
 from tests.server.helpers import FakeCaps, FakeRoutingClient
 
-OPUS = "databricks-claude-opus-4-8"
-SONNET = "databricks-claude-sonnet-5"
+OPUS = "databricks-claude-opus-5-5"
+SONNET = "databricks-claude-sonnet-5-5"
 #: A claude-sdk pane's own catalog: both task_v1 claude arms are servable, so
 #: the mock's ``cc`` menu is complete and its pick maps back to a catalog id.
 CLAUDE_CATALOG = [OPUS, SONNET]
@@ -200,15 +200,15 @@ async def test_polly_smart_routing_gets_a_judge_decision(router: MockRouter) -> 
 
 async def test_the_judge_may_move_a_session_to_another_harness() -> None:
     """Judge-only is still harness + model: it is offered the whole menu."""
-    judge = _judge(model="databricks-gpt-5-5", harness="codex")
+    judge = _judge(model="databricks-gpt-6-1-sol", harness="codex")
     with _deployment(local=judge):
         harness, model, verdict, error = await route_session_harness(
             TRIVIAL,
             session_id="conv_polly",
-            catalog={"claude-sdk": CLAUDE_CATALOG, "codex": ["databricks-gpt-5-5"]},
+            catalog={"claude-sdk": CLAUDE_CATALOG, "codex": ["databricks-gpt-6-1-sol"]},
         )
     assert error is None
-    assert (harness, model) == ("codex", "databricks-gpt-5-5")
+    assert (harness, model) == ("codex", "databricks-gpt-6-1-sol")
     assert verdict is not None
     assert verdict["router_source"] == "oss-llm"
     # Every candidate harness reached the judge, not just the session's own.

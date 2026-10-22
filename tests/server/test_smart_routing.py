@@ -19,6 +19,7 @@ import pytest
 from omnigent.server.routing_backend import RoutingBackends
 from omnigent.server.smart_routing import (
     _AUTO_ROUTING_HARNESSES,
+    ExternalRoutingClient,
     LLMRoutingClient,
     RoutingResult,
     _build_rubric,
@@ -29,6 +30,8 @@ from omnigent.server.smart_routing import (
     route_turn,
 )
 from tests.server.helpers import FakeCaps, FakeRoutingClient
+
+_REAL_AMBIENT_AUTH = ExternalRoutingClient._ambient_auth
 
 # ── Stubs ───────────────────────────────────────────────────────────
 
@@ -81,19 +84,19 @@ class _LastError:
 
 _TEST_MODELS = {
     "claude-sdk": [
-        "databricks-claude-haiku-4-5",
-        "databricks-claude-sonnet-4-6",
-        "databricks-claude-opus-4-8",
+        "databricks-claude-haiku-5-5",
+        "databricks-claude-sonnet-5-5",
+        "databricks-claude-opus-5-5",
     ],
-    "claude-native": ["databricks-claude-haiku-4-5"],
-    "codex": ["databricks-gpt-5-4-nano", "databricks-gpt-5-5"],
-    "codex-native": ["databricks-gpt-5-4-nano"],
-    "openai-agents": ["databricks-gpt-5-4-nano"],
+    "claude-native": ["databricks-claude-haiku-5-5"],
+    "codex": ["databricks-gpt-5-nano", "databricks-gpt-6-1-sol"],
+    "codex-native": ["databricks-gpt-5-nano"],
+    "openai-agents": ["databricks-gpt-5-nano"],
     "pi": [
-        "databricks-claude-haiku-4-5",
-        "databricks-claude-sonnet-4-6",
-        "databricks-gpt-5-4-nano",
-        "databricks-gpt-5-5",
+        "databricks-claude-haiku-5-5",
+        "databricks-claude-sonnet-5-5",
+        "databricks-gpt-5-nano",
+        "databricks-gpt-6-1-sol",
     ],
 }
 
@@ -168,19 +171,21 @@ def test_models_fixture_claude_ordered_cheapest_first() -> None:
     assert haiku_idx < opus_idx
 
 
-def test_model_lists_cover_current_claude_generations() -> None:
-    """A stale list turns a live model into an unservable arm (sonnet-5 → haiku)."""
+def test_static_model_lists_preserve_labels_without_serving_superseded_targets() -> None:
+    from omnigent.server.smart_routing import current_routing_candidate
+
     models = infer_models("claude-sdk")
     assert models is not None
     assert "databricks-claude-sonnet-5" in models
+    assert current_routing_candidate("claude-sonnet-5", models, aliases={}) is None
 
 
 def test_substitute_model_applies_the_pick_when_the_catalog_serves_it() -> None:
     from omnigent.server.smart_routing import substitute_model
 
-    catalog = ["databricks-claude-opus-4-8", "databricks-claude-sonnet-5"]
-    assert substitute_model("claude-opus-4-8", catalog, prefixes=("databricks-",)) == (
-        "databricks-claude-opus-4-8"
+    catalog = ["databricks-claude-opus-5-5", "databricks-claude-sonnet-5-5"]
+    assert substitute_model("claude-opus-5-5", catalog, prefixes=("databricks-",)) == (
+        "databricks-claude-opus-5-5"
     )
 
 
@@ -189,18 +194,16 @@ def test_substitute_model_falls_back_within_family() -> None:
 
     prefixes = ("databricks-",)
     # claude pick the workspace does not serve → the sonnet fallback arm.
-    claude_catalog = ["databricks-claude-sonnet-5", "databricks-claude-haiku-4-5"]
+    claude_catalog = ["databricks-claude-sonnet-5-5", "databricks-claude-haiku-5-5"]
     assert substitute_model("claude-opus-4-8", claude_catalog, prefixes=prefixes) == (
-        "databricks-claude-sonnet-5"
+        "databricks-claude-sonnet-5-5"
     )
     # gpt and glm both fall back to luna (glm reads as the gpt family).
-    gpt_catalog = ["databricks-gpt-5-6-luna", "databricks-gpt-5-6-sol"]
+    gpt_catalog = ["databricks-gpt-6-luna", "databricks-gpt-6-1-sol"]
     assert substitute_model("gpt-5-6-terra", gpt_catalog, prefixes=prefixes) == (
-        "databricks-gpt-5-6-luna"
+        "databricks-gpt-6-1-sol"
     )
-    assert substitute_model("glm-5-2", gpt_catalog, prefixes=prefixes) == (
-        "databricks-gpt-5-6-luna"
-    )
+    assert substitute_model("glm-5-2", gpt_catalog, prefixes=prefixes) == ("databricks-gpt-6-luna")
 
 
 def test_substitute_model_honors_the_tier_over_the_family_fallback() -> None:
@@ -212,27 +215,27 @@ def test_substitute_model_honors_the_tier_over_the_family_fallback() -> None:
     # the servable opus wins over the sonnet family fallback (the reported bug:
     # an escalate pick was collapsed to sonnet-5).
     catalog = [
-        "databricks-claude-opus-5",
-        "databricks-claude-sonnet-5",
-        "databricks-claude-haiku-4-5",
+        "databricks-claude-opus-5-5",
+        "databricks-claude-sonnet-5-5",
+        "databricks-claude-haiku-5-5",
     ]
     assert substitute_model("claude-opus-4-8", catalog, prefixes=prefixes) == (
-        "databricks-claude-opus-5"
+        "databricks-claude-opus-5-5"
     )
     # The newest model of the tier wins when several are servable.
-    two_opus = ["databricks-claude-opus-4-7", "databricks-claude-opus-5"]
+    two_opus = ["databricks-claude-opus-4-7", "databricks-claude-opus-5-5"]
     assert substitute_model("claude-opus-4-8", two_opus, prefixes=prefixes) == (
-        "databricks-claude-opus-5"
+        "databricks-claude-opus-5-5"
     )
     # A same-tier match never crosses the tier down: only when no opus is
     # servable does it fall to the sonnet family default.
     assert (
         substitute_model(
             "claude-opus-4-8",
-            ["databricks-claude-sonnet-5", "databricks-claude-haiku-4-5"],
+            ["databricks-claude-sonnet-5-5", "databricks-claude-haiku-5-5"],
             prefixes=prefixes,
         )
-        == "databricks-claude-sonnet-5"
+        == "databricks-claude-sonnet-5-5"
     )
 
 
@@ -241,14 +244,14 @@ def test_substitute_model_declines_when_no_fallback_is_servable() -> None:
 
     prefixes = ("databricks-",)
     # The family fallback (luna) is absent from the catalog → honest decline.
-    assert substitute_model("gpt-5-6-terra", ["databricks-gpt-5-6-sol"], prefixes=prefixes) is None
+    assert substitute_model("gpt-5-6-terra", ["databricks-gpt-6-astra"], prefixes=prefixes) is None
     # A barred fallback is skipped, not applied.
     assert (
         substitute_model(
             "claude-opus-4-8",
-            ["databricks-claude-sonnet-5"],
+            ["databricks-claude-sonnet-5-5"],
             prefixes=prefixes,
-            barred=("databricks-claude-sonnet-5",),
+            barred=("databricks-claude-sonnet-5-5",),
         )
         is None
     )
@@ -257,8 +260,8 @@ def test_substitute_model_declines_when_no_fallback_is_servable() -> None:
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
-        ("databricks-claude-opus-4-8", "claude"),
-        ("databricks-gpt-5-5", "gpt"),
+        ("databricks-claude-opus-5-5", "claude"),
+        ("databricks-gpt-6-1-sol", "gpt"),
         ("gpt-5-6-sol", "gpt"),
         # The router's glm arm and its servable spellings must all read as
         # the codex family, or a pick lands on the wrong harness.
@@ -287,15 +290,15 @@ def test_catalog_models_for_harness_matches_worker_rows() -> None:
     from omnigent.server.smart_routing import catalog_models_for_harness
 
     catalog = {
-        "self": ["databricks-claude-sonnet-5"],
-        "codex": ["databricks-gpt-5-5"],
+        "self": ["databricks-claude-sonnet-5-5"],
+        "codex": ["databricks-gpt-6-1-sol"],
     }
     # A worker row for the counterpart family, matched by family not id.
-    assert catalog_models_for_harness(catalog, "codex-native") == ["databricks-gpt-5-5"]
+    assert catalog_models_for_harness(catalog, "codex-native") == ["databricks-gpt-6-1-sol"]
     # "self" only counts for the session's own harness.
     assert catalog_models_for_harness(catalog, "claude-native") is None
     assert catalog_models_for_harness(catalog, "claude-native", allow_self=True) == [
-        "databricks-claude-sonnet-5"
+        "databricks-claude-sonnet-5-5"
     ]
     assert catalog_models_for_harness(None, "claude-native", allow_self=True) is None
 
@@ -317,25 +320,25 @@ def test_models_fixture_unknown_harness() -> None:
 
 def test_build_rubric_includes_all_models() -> None:
     available = {
-        "claude-sdk": ["databricks-claude-haiku-4-5", "databricks-claude-opus-4-8"],
+        "claude-sdk": ["databricks-claude-haiku-5-5", "databricks-claude-opus-5-5"],
     }
     rubric = _build_rubric(available)
-    assert "databricks-claude-haiku-4-5" in rubric
-    assert "databricks-claude-opus-4-8" in rubric
+    assert "databricks-claude-haiku-5-5" in rubric
+    assert "databricks-claude-opus-5-5" in rubric
     assert "strict JSON" in rubric
     assert "haiku" in rubric and "opus" in rubric
 
 
 def test_build_rubric_shows_harness_names() -> None:
     available = {
-        "claude-sdk": ["databricks-claude-haiku-4-5"],
-        "codex": ["databricks-gpt-5-4-nano"],
+        "claude-sdk": ["databricks-claude-haiku-5-5"],
+        "codex": ["databricks-gpt-5-nano"],
     }
     rubric = _build_rubric(available)
     assert "claude-sdk" in rubric
     assert "codex" in rubric
-    assert "databricks-claude-haiku-4-5" in rubric
-    assert "databricks-gpt-5-4-nano" in rubric
+    assert "databricks-claude-haiku-5-5" in rubric
+    assert "databricks-gpt-5-nano" in rubric
 
 
 # ── LLMRoutingClient ───────────────────────────────────────────────
@@ -348,14 +351,14 @@ def test_build_rubric_shows_harness_names() -> None:
 @pytest.mark.parametrize(
     ("verdict_harness", "verdict_model", "available", "expect_harness"),
     [
-        ("claude-sdk", "databricks-claude-opus-4-8", None, "claude-sdk"),
+        ("claude-sdk", "databricks-claude-opus-5-5", None, "claude-sdk"),
         (
             "codex",
-            "databricks-claude-opus-4-8",
-            {"codex": ["databricks-gpt-5-4"]},
+            "databricks-claude-opus-5-5",
+            {"codex": ["databricks-gpt-6-1-sol"]},
             "claude-sdk",
         ),
-        ("hallucinated-harness", "databricks-claude-haiku-4-5", None, "claude-sdk"),
+        ("hallucinated-harness", "databricks-claude-haiku-5-5", None, "claude-sdk"),
     ],
 )
 async def test_llm_routing_client_resolves_harness_to_the_model_owner(
@@ -421,8 +424,8 @@ async def test_fetch_runner_models_parses_catalog() -> None:
                 "source": "catalog",
                 "verified": True,
                 "models": [
-                    {"id": "databricks-claude-haiku-4-5", "family": "claude"},
-                    {"id": "databricks-claude-opus-4-8", "family": "claude"},
+                    {"id": "databricks-claude-haiku-5-5", "family": "claude"},
+                    {"id": "databricks-claude-opus-5-5", "family": "claude"},
                 ],
                 "note": "",
             },
@@ -430,8 +433,8 @@ async def test_fetch_runner_models_parses_catalog() -> None:
                 "source": "catalog",
                 "verified": True,
                 "models": [
-                    {"id": "databricks-claude-haiku-4-5", "family": "claude"},
-                    {"id": "databricks-claude-sonnet-4-6", "family": "claude"},
+                    {"id": "databricks-claude-haiku-5-5", "family": "claude"},
+                    {"id": "databricks-claude-sonnet-5-5", "family": "claude"},
                 ],
                 "note": "",
             },
@@ -446,9 +449,9 @@ async def test_fetch_runner_models_parses_catalog() -> None:
 
     result = await fetch_runner_models("conv_123", mock_client)
     assert result is not None
-    assert "databricks-claude-haiku-4-5" in result["self"]
-    assert "databricks-claude-opus-4-8" in result["self"]
-    assert "databricks-claude-sonnet-4-6" in result["claude_code"]
+    assert "databricks-claude-haiku-5-5" in result["self"]
+    assert "databricks-claude-opus-5-5" in result["self"]
+    assert "databricks-claude-sonnet-5-5" in result["claude_code"]
 
 
 @pytest.mark.asyncio
@@ -507,7 +510,7 @@ async def test_fetch_runner_models_returns_none_on_empty_workers() -> None:
 @pytest.mark.asyncio
 async def test_route_turn_uses_caps_routing_client() -> None:
     expected = RoutingResult(
-        model="databricks-claude-haiku-4-5",
+        model="databricks-claude-haiku-5-5",
         rationale="trivial",
         harness="claude-sdk",
     )
@@ -522,7 +525,7 @@ async def test_route_turn_uses_caps_routing_client() -> None:
             session_id="conv_123",
             runner_client=_catalog_client(),
         )
-    assert model == "databricks-claude-haiku-4-5"
+    assert model == "databricks-claude-haiku-5-5"
     assert v is not None
     assert "tier" not in v
 
@@ -549,7 +552,7 @@ async def test_route_turn_unknown_harness() -> None:
 async def test_route_turn_uses_runner_catalog_when_available() -> None:
     """route_turn uses live runner catalog instead of static table when provided."""
     expected = RoutingResult(
-        model="databricks-claude-opus-4-8",
+        model="databricks-claude-opus-5-5",
         rationale="complex task",
         harness="self",
     )
@@ -561,8 +564,8 @@ async def test_route_turn_uses_runner_catalog_when_available() -> None:
                 "source": "catalog",
                 "verified": True,
                 "models": [
-                    {"id": "databricks-claude-haiku-4-5"},
-                    {"id": "databricks-claude-opus-4-8"},
+                    {"id": "databricks-claude-haiku-5-5"},
+                    {"id": "databricks-claude-opus-5-5"},
                 ],
                 "note": "",
             }
@@ -580,7 +583,7 @@ async def test_route_turn_uses_runner_catalog_when_available() -> None:
             session_id="conv_123",
             runner_client=mock_client,
         )
-    assert model == "databricks-claude-opus-4-8"
+    assert model == "databricks-claude-opus-5-5"
     # Runner endpoint was called
     mock_client.get.assert_called_once()
     call_url = mock_client.get.call_args[0][0]
@@ -591,7 +594,7 @@ async def test_route_turn_uses_runner_catalog_when_available() -> None:
 async def test_route_turn_prefers_the_callers_session_vocabulary() -> None:
     """A pane can only switch onto its picker rows, so those win over the gateway."""
     expected = RoutingResult(
-        model="databricks-claude-opus-5",
+        model="databricks-claude-opus-5-5",
         rationale="complex task",
         harness="self",
     )
@@ -601,7 +604,7 @@ async def test_route_turn_prefers_the_callers_session_vocabulary() -> None:
             "self": {
                 "source": "catalog",
                 "verified": True,
-                "models": [{"id": "databricks-claude-opus-4-8"}],
+                "models": [{"id": "databricks-claude-opus-5-5"}],
                 "note": "",
             }
         }
@@ -618,14 +621,14 @@ async def test_route_turn_prefers_the_callers_session_vocabulary() -> None:
             "complex task",
             session_id="conv_123",
             runner_client=mock_client,
-            catalog=["databricks-claude-opus-5", "databricks-gpt-5-5"],
+            catalog=["databricks-claude-opus-5-5", "databricks-gpt-6-1-sol"],
         )
 
-    assert model == "databricks-claude-opus-5"
+    assert model == "databricks-claude-opus-5-5"
     # The wider runner catalog was never consulted, and the out-of-family id
     # in the vocabulary was still dropped.
     mock_client.get.assert_not_called()
-    assert routing_client.offered == [{"claude-native": ["databricks-claude-opus-5"]}]
+    assert routing_client.offered == [{"claude-native": ["databricks-claude-opus-5-5"]}]
 
 
 @pytest.mark.asyncio
@@ -638,8 +641,8 @@ async def test_route_turn_drops_out_of_family_catalog_models() -> None:
                 "source": "catalog",
                 "verified": True,
                 "models": [
-                    {"id": "databricks-gpt-5-5"},
-                    {"id": "databricks-claude-opus-4-8"},
+                    {"id": "databricks-gpt-6-1-sol"},
+                    {"id": "databricks-claude-opus-5-5"},
                     {"id": "databricks-gpt-5-4-mini"},
                 ],
                 "note": "",
@@ -651,7 +654,7 @@ async def test_route_turn_drops_out_of_family_catalog_models() -> None:
     mock_client.get = AsyncMock(return_value=mock_response)
 
     client = FakeRoutingClient(
-        RoutingResult(model="databricks-gpt-5-5", rationale="gpt task", harness="codex-native")
+        RoutingResult(model="databricks-gpt-6-1-sol", rationale="gpt task", harness="codex-native")
     )
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
         model, _v = await route_turn(
@@ -660,8 +663,10 @@ async def test_route_turn_drops_out_of_family_catalog_models() -> None:
             session_id="conv_123",
             runner_client=mock_client,
         )
-    assert model == "databricks-gpt-5-5"
-    assert client.offered == [{"codex-native": ["databricks-gpt-5-5", "databricks-gpt-5-4-mini"]}]
+    assert model == "databricks-gpt-6-1-sol"
+    assert client.offered == [
+        {"codex-native": ["databricks-gpt-6-1-sol", "databricks-gpt-5-4-mini"]}
+    ]
 
 
 @pytest.mark.asyncio
@@ -679,10 +684,10 @@ async def test_route_turn_offers_and_applies_a_glm_pick_on_codex() -> None:
                 "source": "catalog",
                 "verified": True,
                 "models": [
-                    {"id": "databricks-gpt-5-5"},
+                    {"id": "databricks-gpt-6-1-sol"},
                     {"id": "databricks-glm-5-2"},
                     {"id": "databricks-kimi-k2-6"},
-                    {"id": "databricks-claude-opus-4-8"},
+                    {"id": "databricks-claude-opus-5-5"},
                 ],
                 "note": "",
             }
@@ -705,7 +710,7 @@ async def test_route_turn_offers_and_applies_a_glm_pick_on_codex() -> None:
     assert client.offered == [
         {
             "codex-native": [
-                "databricks-gpt-5-5",
+                "databricks-gpt-6-1-sol",
                 "databricks-glm-5-2",
                 "databricks-kimi-k2-6",
             ]
@@ -723,7 +728,7 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
     mock_client.get = AsyncMock(side_effect=httpx.HTTPError("runner down"))
 
     expected = RoutingResult(
-        model="databricks-claude-haiku-4-5",
+        model="databricks-claude-haiku-5-5",
         rationale="simple",
         harness="claude-sdk",
     )
@@ -735,8 +740,8 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
             session_id="conv_123",
             runner_client=mock_client,
         )
-    # Still routes — fell back to the static infer_models table.
-    assert model == "databricks-claude-haiku-4-5"
+    # Historical static endpoints cannot qualify a current target without a current catalog.
+    assert model is None
 
 
 # ── ExternalRoutingClient ─────────────────────────────────────────────
@@ -771,7 +776,7 @@ async def test_external_routing_client_sends_snake_case_and_parses() -> None:
             200,
             json={
                 "route_selection": [
-                    {"route_option": {"model": "claude-opus-4-8", "harness": "claude"}}
+                    {"route_option": {"model": "claude-opus-5-5", "harness": "claude"}}
                 ],
                 "rationale": "task_v0 matched rule 'bugfix_to_opus'.",
             },
@@ -783,11 +788,11 @@ async def test_external_routing_client_sends_snake_case_and_parses() -> None:
     with _patch_httpx(httpx.MockTransport(handler)):
         result = await client.route(
             "fix this code: x = y + 2",
-            {"claude": ["claude-opus-4-8"], "codex": ["gpt-5-5"]},
+            {"claude": ["claude-opus-5-5"], "codex": ["gpt-6-1-sol"]},
         )
 
     assert result is not None
-    assert result.model == "claude-opus-4-8"
+    assert result.model == "claude-opus-5-5"
     assert result.harness == "claude"
     assert result.rationale == "task_v0 matched rule 'bugfix_to_opus'."
     assert captured["url"] == "https://host/ai-gateway/routing/v1/routes:select"
@@ -795,8 +800,8 @@ async def test_external_routing_client_sends_snake_case_and_parses() -> None:
     assert body["route_selector"]["router_name"] == "task_v0"  # snake_case
     assert body["task"]["prompt"] == "fix this code: x = y + 2"
     assert body["route_options"] == [
-        {"model": "claude-opus-4-8", "harness": "claude"},
-        {"model": "gpt-5-5", "harness": "codex"},
+        {"model": "claude-opus-5-5", "harness": "claude"},
+        {"model": "gpt-6-1-sol", "harness": "codex"},
     ]
 
 
@@ -819,7 +824,7 @@ async def test_external_routing_client_roundtrips_provider_prefix() -> None:
         # Router echoes the bare id it was given.
         return httpx.Response(
             200,
-            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+            json={"route_selection": [{"route_option": {"model": "claude-opus-5-5"}}]},
         )
 
     client = ExternalRoutingClient(
@@ -827,17 +832,17 @@ async def test_external_routing_client_roundtrips_provider_prefix() -> None:
     )
     with _patch_httpx(httpx.MockTransport(handler)):
         result = await client.route(
-            "hi", {"self": ["databricks-claude-opus-4-8", "databricks-gpt-5-5"]}
+            "hi", {"self": ["databricks-claude-opus-5-5", "databricks-gpt-6-1-sol"]}
         )
 
     # Outbound: configured prefix stripped for the router's vocabulary.
     assert captured["body"]["route_options"] == [
-        {"model": "claude-opus-4-8", "harness": "self"},
-        {"model": "gpt-5-5", "harness": "self"},
+        {"model": "claude-opus-5-5", "harness": "self"},
+        {"model": "gpt-6-1-sol", "harness": "self"},
     ]
     # Inbound: mapped back to the local (prefixed) catalog id.
     assert result is not None
-    assert result.model == "databricks-claude-opus-4-8"
+    assert result.model == "databricks-claude-opus-5-5"
 
 
 @pytest.mark.asyncio
@@ -853,7 +858,7 @@ async def test_external_routing_client_strips_first_matching_prefix() -> None:
         captured["body"] = json.loads(request.content)
         return httpx.Response(
             200,
-            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+            json={"route_selection": [{"route_option": {"model": "claude-opus-5-5"}}]},
         )
 
     client = ExternalRoutingClient(
@@ -863,16 +868,16 @@ async def test_external_routing_client_strips_first_matching_prefix() -> None:
     )
     with _patch_httpx(httpx.MockTransport(handler)):
         result = await client.route(
-            "hi", {"self": ["databricks-claude-opus-4-8", "system.ai.claude-sonnet-5"]}
+            "hi", {"self": ["databricks-claude-opus-5-5", "system.ai.claude-sonnet-5-5"]}
         )
 
     # Each id has its own matching prefix stripped.
     assert captured["body"]["route_options"] == [
-        {"model": "claude-opus-4-8", "harness": "self"},
-        {"model": "claude-sonnet-5", "harness": "self"},
+        {"model": "claude-opus-5-5", "harness": "self"},
+        {"model": "claude-sonnet-5-5", "harness": "self"},
     ]
     assert result is not None
-    assert result.model == "databricks-claude-opus-4-8"
+    assert result.model == "databricks-claude-opus-5-5"
 
 
 @pytest.mark.asyncio
@@ -894,7 +899,9 @@ async def test_external_routing_client_maps_back_by_harness() -> None:
         # Router picks the codex option (bare id, codex harness).
         return httpx.Response(
             200,
-            json={"route_selection": [{"route_option": {"model": "gpt-5-5", "harness": "codex"}}]},
+            json={
+                "route_selection": [{"route_option": {"model": "gpt-6-1-sol", "harness": "codex"}}]
+            },
         )
 
     client = ExternalRoutingClient(
@@ -903,13 +910,13 @@ async def test_external_routing_client_maps_back_by_harness() -> None:
     with _patch_httpx(httpx.MockTransport(handler)):
         result = await client.route(
             "hi",
-            {"pi": ["databricks-gpt-5-5"], "codex": ["gpt-5-5"]},
+            {"pi": ["databricks-gpt-6-1-sol"], "codex": ["gpt-6-1-sol"]},
         )
 
-    # Both harnesses reduce to router id "gpt-5-5"; the pick maps back to the
+    # Both harnesses reduce to router id "gpt-6-1-sol"; the pick maps back to the
     # codex local id, not pi's prefixed one.
     assert result is not None
-    assert result.model == "gpt-5-5"
+    assert result.model == "gpt-6-1-sol"
     assert result.harness == "codex"
 
 
@@ -931,20 +938,20 @@ async def test_external_routing_client_strips_the_default_prefixes() -> None:
         captured["body"] = json.loads(request.content)
         return httpx.Response(
             200,
-            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+            json={"route_selection": [{"route_option": {"model": "claude-opus-5-5"}}]},
         )
 
     client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
     with _patch_httpx(httpx.MockTransport(handler)):
-        result = await client.route("hi", {"self": ["databricks-claude-opus-4-8", "gpt-5-5"]})
+        result = await client.route("hi", {"self": ["databricks-claude-opus-5-5", "gpt-6-1-sol"]})
 
     assert captured["body"]["route_options"] == [
-        {"model": "claude-opus-4-8", "harness": "self"},
-        {"model": "gpt-5-5", "harness": "self"},
+        {"model": "claude-opus-5-5", "harness": "self"},
+        {"model": "gpt-6-1-sol", "harness": "self"},
     ]
     # Restored to the exact catalog id the runner needs.
     assert result is not None
-    assert result.model == "databricks-claude-opus-4-8"
+    assert result.model == "databricks-claude-opus-5-5"
 
 
 @pytest.mark.asyncio
@@ -979,7 +986,7 @@ async def test_external_routing_client_swallows_http_error() -> None:
 
     client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
     with _patch_httpx(httpx.MockTransport(handler)):
-        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+        assert await client.route("hi", {"claude": ["claude-opus-5-5"]}) is None
 
 
 @pytest.mark.asyncio
@@ -994,7 +1001,7 @@ async def test_external_routing_client_empty_selection_returns_none() -> None:
 
     client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
     with _patch_httpx(httpx.MockTransport(handler)):
-        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+        assert await client.route("hi", {"claude": ["claude-opus-5-5"]}) is None
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1028,7 @@ async def test_external_routing_client_rejects_out_of_set_model() -> None:
 
     client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
     with _patch_httpx(httpx.MockTransport(handler)):
-        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+        assert await client.route("hi", {"claude": ["claude-opus-5-5"]}) is None
 
 
 @pytest.mark.asyncio
@@ -1246,7 +1253,31 @@ def _ambient_sdk(config: Any) -> Any:  # type: ignore[explicit-any]
             raise ValueError("default auth: cannot configure default credentials")
         return config
 
-    with patch("databricks.sdk.config.Config", factory):
+    import builtins
+    from types import SimpleNamespace
+
+    original_import = builtins.__import__
+
+    def reviewed_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "databricks.sdk.config":
+            assert fromlist == ("Config",)
+            return SimpleNamespace(Config=factory)
+        return original_import(name, globals, locals, fromlist, level)
+
+    def configured_ambient(client):
+        # Intercept Config only while the real ambient method executes, never
+        # during pytest fixture teardown or unrelated package discovery.
+        with patch("builtins.__import__", reviewed_import):
+            return _REAL_AMBIENT_AUTH(client)
+
+    with patch.object(ExternalRoutingClient, "_ambient_auth", configured_ambient):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _deny_unconfigured_ambient_credentials():
+    """Real SDK/credential discovery is forbidden; explicit synthetic cases override it."""
+    with patch.object(ExternalRoutingClient, "_ambient_auth", return_value=None):
         yield
 
 
@@ -1477,7 +1508,7 @@ async def test_route_session_harness_surfaces_router_error_detail() -> None:
 async def test_route_session_harness_picks_harness_and_model() -> None:
     """route_session_harness returns (harness, model, verdict) from the router."""
     expected = RoutingResult(
-        model="databricks-claude-opus-4-8",
+        model="databricks-claude-opus-5-5",
         rationale="complex codebase task",
         harness="claude-sdk",
     )
@@ -1489,7 +1520,7 @@ async def test_route_session_harness_picks_harness_and_model() -> None:
             runner_client=_catalog_client(),
         )
     assert harness == "claude-sdk"
-    assert model == "databricks-claude-opus-4-8"
+    assert model == "databricks-claude-opus-5-5"
     assert verdict is not None
     assert "rationale" in verdict
     assert error is None
@@ -1505,7 +1536,7 @@ async def test_route_session_harness_passes_discovered_sdk_harnesses() -> None:
             self, _message: str, available_models: dict[str, list[str]]
         ) -> RoutingResult | None:
             received_harnesses.extend(available_models.keys())
-            return RoutingResult(model="databricks-claude-haiku-4-5", rationale="x", harness="pi")
+            return RoutingResult(model="databricks-claude-haiku-5-5", rationale="x", harness="pi")
 
     caps = FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -1577,15 +1608,15 @@ async def test_route_session_harness_uses_live_catalog_skips_absent_harness() ->
                 "source": "catalog",
                 "verified": True,
                 "models": [
-                    {"id": "databricks-claude-haiku-4-5"},
-                    {"id": "databricks-claude-opus-4-8"},
+                    {"id": "databricks-claude-haiku-5-5"},
+                    {"id": "databricks-claude-opus-5-5"},
                 ],
                 "note": "",
             },
             "codex": {
                 "source": "catalog",
                 "verified": True,
-                "models": [{"id": "databricks-gpt-5-4-nano"}],
+                "models": [{"id": "databricks-gpt-5-nano"}],
                 "note": "",
             },
         }
@@ -1602,7 +1633,7 @@ async def test_route_session_harness_uses_live_catalog_skips_absent_harness() ->
         ) -> RoutingResult | None:
             received_harnesses.extend(available_models.keys())
             return RoutingResult(
-                model="databricks-claude-haiku-4-5", rationale="simple", harness="claude-sdk"
+                model="databricks-claude-haiku-5-5", rationale="simple", harness="claude-sdk"
             )
 
     caps = FakeCaps(routing_client=_CapturingClient())
@@ -1617,7 +1648,7 @@ async def test_route_session_harness_uses_live_catalog_skips_absent_harness() ->
     assert "claude-sdk" in received_harnesses
     assert "codex" in received_harnesses
     assert harness == "claude-sdk"
-    assert model == "databricks-claude-haiku-4-5"
+    assert model == "databricks-claude-haiku-5-5"
 
 
 @pytest.mark.asyncio
@@ -1632,13 +1663,13 @@ async def test_route_session_harness_maps_worker_names_to_harnesses() -> None:
             "claude_code": {
                 "source": "catalog",
                 "verified": True,
-                "models": [{"id": "databricks-claude-opus-4-8"}],
+                "models": [{"id": "databricks-claude-opus-5-5"}],
                 "note": "",
             },
             "codex": {
                 "source": "catalog",
                 "verified": True,
-                "models": [{"id": "databricks-gpt-5-4-nano"}],
+                "models": [{"id": "databricks-gpt-5-nano"}],
                 "note": "",
             },
         }
@@ -1655,7 +1686,7 @@ async def test_route_session_harness_maps_worker_names_to_harnesses() -> None:
         ) -> RoutingResult | None:
             received.extend(available_models.keys())
             return RoutingResult(
-                model="databricks-claude-opus-4-8", rationale="complex", harness="claude-sdk"
+                model="databricks-claude-opus-5-5", rationale="complex", harness="claude-sdk"
             )
 
     caps = FakeCaps(routing_client=_CapturingClient())
@@ -1669,7 +1700,7 @@ async def test_route_session_harness_maps_worker_names_to_harnesses() -> None:
     assert "claude-sdk" in received
     assert "codex" in received
     assert harness == "claude-sdk"
-    assert model == "databricks-claude-opus-4-8"
+    assert model == "databricks-claude-opus-5-5"
     assert error is None
 
 
@@ -1690,7 +1721,7 @@ async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> 
             "self": {
                 "source": "catalog",
                 "verified": True,
-                "models": [{"id": "databricks-claude-opus-4-8"}],
+                "models": [{"id": "databricks-claude-opus-5-5"}],
                 "note": "",
             },
         }
@@ -1701,7 +1732,7 @@ async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> 
 
     routing_client = FakeRoutingClient(
         RoutingResult(
-            model="databricks-claude-haiku-4-5", rationale="simple", harness="claude-sdk"
+            model="databricks-claude-haiku-5-5", rationale="simple", harness="claude-sdk"
         )
     )
     caps = FakeCaps(routing_client=routing_client)
@@ -1711,9 +1742,9 @@ async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> 
             session_id="conv_child",
             runner_client=mock_client,
         )
-    assert error is None
-    assert harness == "claude-sdk"
-    assert model == "databricks-claude-haiku-4-5"
+    assert error is not None
+    assert harness is None and model is None
+    # No current catalog target is invented from historical static fallback rows.
     # The self-only row never reached the router; the static table did.
     assert routing_client.offered
     assert set(routing_client.offered[0]) == set(_AUTO_ROUTING_HARNESSES)
@@ -1756,7 +1787,7 @@ async def test_route_session_harness_sends_full_candidate_set_unfiltered() -> No
             self, _message: str, available_models: dict[str, list[str]]
         ) -> RoutingResult | None:
             pi_models.extend(available_models.get("pi", []))
-            return RoutingResult(model="databricks-gpt-5-4-nano", rationale="x", harness="codex")
+            return RoutingResult(model="databricks-gpt-5-nano", rationale="x", harness="codex")
 
     caps = FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -1764,8 +1795,8 @@ async def test_route_session_harness_sends_full_candidate_set_unfiltered() -> No
             "hello", session_id="conv_123", runner_client=_catalog_client()
         )
     # Every discovered Pi model is still sent to the router.
-    assert "databricks-claude-haiku-4-5" in pi_models
-    assert "databricks-gpt-5-5" in pi_models
+    assert "databricks-claude-haiku-5-5" in pi_models
+    assert "databricks-gpt-6-1-sol" in pi_models
 
 
 @pytest.mark.asyncio
@@ -1777,7 +1808,7 @@ async def test_route_session_harness_keeps_responses_capable_model_on_pi() -> No
     :data:`_HARNESS_EXCLUDED_MODELS` bars those outright.
     """
     expected = RoutingResult(
-        model="databricks-gpt-5-4-nano", rationale="responses-capable", harness="pi"
+        model="databricks-gpt-5-nano", rationale="responses-capable", harness="pi"
     )
     caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -1785,7 +1816,7 @@ async def test_route_session_harness_keeps_responses_capable_model_on_pi() -> No
             "do something", session_id="conv_123", runner_client=_catalog_client()
         )
     assert harness == "pi"
-    assert model == "databricks-gpt-5-4-nano"
+    assert model == "databricks-gpt-5-nano"
     assert error is None
 
 
@@ -1796,14 +1827,14 @@ async def test_route_session_harness_redirects_claude_on_pi_to_claude_sdk() -> N
     sonnet-4-6 is not in :data:`_HARNESS_EXCLUDED_MODELS`, so the move is the
     catalog's advertised wire set alone.
     """
-    expected = RoutingResult(model="databricks-claude-sonnet-4-6", rationale="mid", harness="pi")
+    expected = RoutingResult(model="databricks-claude-sonnet-5-5", rationale="mid", harness="pi")
     caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, error = await route_session_harness(
             "quick q", session_id="conv_123", runner_client=_catalog_client()
         )
     assert harness == "claude-sdk", f"claude on pi should redirect to claude-sdk, got {harness!r}"
-    assert model == "databricks-claude-sonnet-4-6"
+    assert model == "databricks-claude-sonnet-5-5"
     assert error is None
 
 
@@ -1840,8 +1871,8 @@ def _capturing_handler(captured: dict[str, Any], pick: dict[str, Any]) -> Any:
     return handler
 
 
-_CODEX_CATALOG_ONLY = {"codex": ["databricks-gpt-5-4"]}
-_CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
+_CODEX_CATALOG_ONLY = {"codex": ["databricks-gpt-6-1-sol"]}
+_CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-5-5"]}
 
 
 @pytest.mark.asyncio
@@ -1869,7 +1900,7 @@ _CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
             _CLAUDE_ARMS,
             None,
             # The caller's own catalog id leads; the router tolerates the extra.
-            "gpt-5-4",
+            "gpt-6-1-sol",
             False,
         ),
         # sonnet-5 has no endpoint here and the claude fallback is sonnet-5
@@ -1901,10 +1932,10 @@ _CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
         (
             "task_v0",
             _CODEX_CATALOG_ONLY,
-            {"model": "gpt-5-4", "harness": "codex"},
+            {"model": "gpt-6-1-sol", "harness": "codex"},
             (),
             (),
-            ["gpt-5-4"],
+            ["gpt-6-1-sol"],
             None,
             True,
         ),
@@ -1961,7 +1992,7 @@ async def test_task_v1_partial_menu_error_surfaces_last_error() -> None:
 
     client = _task_v1_client()
     with _patch_httpx(httpx.MockTransport(handler)):
-        result = await client.route("hi", {"codex": ["databricks-gpt-5-4"]})
+        result = await client.route("hi", {"codex": ["databricks-gpt-6-1-sol"]})
 
     assert result is None
     assert "requires its full menu" in (client.last_error or "")
@@ -1980,11 +2011,11 @@ async def test_task_v1_unservable_arm_maps_to_servable_id() -> None:
         )
     ):
         result = await client.route(
-            "hi", {"codex": ["databricks-gpt-5-4", "databricks-gpt-5-6-luna"]}
+            "hi", {"codex": ["databricks-gpt-6-1-sol", "databricks-gpt-6-luna"]}
         )
 
     assert result is not None
-    assert result.model == "databricks-gpt-5-6-luna"  # the gpt family fallback
+    assert result.model == "databricks-gpt-6-1-sol"  # the qualified current successor
     assert result.raw_model == "gpt-5-6-sol"  # what the router actually said
     assert result.harness == "codex"
 
@@ -2006,8 +2037,8 @@ async def test_task_v1_ignores_echoed_harness_and_derives_from_arm() -> None:
         result = await client.route(
             "refactor",
             {
-                "claude-sdk": ["databricks-claude-haiku-4-5", "databricks-claude-sonnet-5"],
-                "codex": ["databricks-gpt-5-4"],
+                "claude-sdk": ["databricks-claude-haiku-5-5", "databricks-claude-sonnet-5-5"],
+                "codex": ["databricks-gpt-6-1-sol"],
             },
         )
 
@@ -2015,7 +2046,7 @@ async def test_task_v1_ignores_echoed_harness_and_derives_from_arm() -> None:
     # and the harness derives from the arm's family, never the nonsense echo.
     assert result is not None
     assert result.harness == "claude-sdk"
-    assert result.model == "databricks-claude-sonnet-5"
+    assert result.model == "databricks-claude-sonnet-5-5"
     assert result.raw_model == "claude-opus-4-8"
 
 
@@ -2024,13 +2055,13 @@ async def test_task_v1_sends_selection_model_as_selector_config() -> None:
     import httpx
 
     captured: dict[str, Any] = {}
-    client = _task_v1_client(selection_model="gpt-5-4-mini")
+    client = _task_v1_client(selection_model="gpt-6-luna")
     with _patch_httpx(
         httpx.MockTransport(_capturing_handler(captured, {"model": "glm-5-2", "harness": "codex"}))
     ):
-        await client.route("hi", {"codex": ["databricks-gpt-5-4"]})
+        await client.route("hi", {"codex": ["databricks-gpt-6-1-sol"]})
 
-    assert captured["body"]["route_selector"]["config"] == {"model": "gpt-5-4-mini"}
+    assert captured["body"]["route_selector"]["config"] == {"model": "gpt-6-luna"}
 
 
 @pytest.mark.asyncio
@@ -2042,7 +2073,7 @@ async def test_task_v1_omits_selector_config_without_selection_model() -> None:
     with _patch_httpx(
         httpx.MockTransport(_capturing_handler(captured, {"model": "glm-5-2", "harness": "codex"}))
     ):
-        await client.route("hi", {"codex": ["databricks-gpt-5-4"]})
+        await client.route("hi", {"codex": ["databricks-gpt-6-1-sol"]})
 
     assert "config" not in captured["body"]["route_selector"]
 
@@ -2057,7 +2088,7 @@ async def test_task_v1_keeps_raw_prompt_and_4000_char_cap() -> None:
     with _patch_httpx(
         httpx.MockTransport(_capturing_handler(captured, {"model": "glm-5-2", "harness": "codex"}))
     ):
-        await client.route(prompt, {"codex": ["databricks-gpt-5-4"]})
+        await client.route(prompt, {"codex": ["databricks-gpt-6-1-sol"]})
 
     assert captured["body"]["task"]["prompt"] == "x" * 4000
 
@@ -2066,7 +2097,7 @@ async def test_task_v1_keeps_raw_prompt_and_4000_char_cap() -> None:
 async def test_route_session_harness_keeps_raw_pick_in_verdict() -> None:
     """An unservable pick is applied as a servable id but reported verbatim."""
     expected = RoutingResult(
-        model="databricks-gpt-5-5",
+        model="databricks-gpt-6-1-sol",
         rationale="cheapest arm",
         harness="codex",
         raw_model="gpt-5-6-sol",
@@ -2076,10 +2107,10 @@ async def test_route_session_harness_keeps_raw_pick_in_verdict() -> None:
         harness, model, verdict, error = await route_session_harness(
             "do it",
             harness_candidates=("codex",),
-            catalog={"codex": ["databricks-gpt-5-5"]},
+            catalog={"codex": ["databricks-gpt-6-1-sol"]},
         )
     assert harness == "codex"
-    assert model == "databricks-gpt-5-5"
+    assert model == "databricks-gpt-6-1-sol"
     assert verdict is not None
     assert verdict["raw_model"] == "gpt-5-6-sol"
     assert error is None
@@ -2093,15 +2124,15 @@ def test_route_option_source_offers_only_the_catalog_for_another_router() -> Non
     from omnigent.server.smart_routing import TaskV1RouteOptionSource
 
     source = TaskV1RouteOptionSource(router_name="task_v9")
-    options = source.build_route_options(["codex"], {"codex": ["databricks-gpt-5-4"]})
-    assert [o.model for o in options] == ["gpt-5-4"]
+    options = source.build_route_options(["codex"], {"codex": ["databricks-gpt-6-1-sol"]})
+    assert [o.model for o in options] == ["gpt-6-1-sol"]
 
 
 def test_route_option_source_rejects_never_offered_pick() -> None:
     from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
 
     source = TaskV1RouteOptionSource()
-    catalog = {"codex": ["databricks-gpt-5-4"]}
+    catalog = {"codex": ["databricks-gpt-6-1-sol"]}
     assert source.resolve_selection(RoutePick(model="hallucinated"), ["codex"], catalog) is None
 
 
@@ -2111,14 +2142,14 @@ def test_route_option_source_redirects_excluded_pick_off_pi() -> None:
 
     source = TaskV1RouteOptionSource()
     catalog = {
-        "pi": ["databricks-gpt-5-5", "databricks-claude-haiku-4-5"],
-        "codex": ["databricks-gpt-5-5"],
-        "claude-sdk": ["databricks-claude-haiku-4-5"],
+        "pi": ["databricks-gpt-6-1-sol", "databricks-claude-haiku-5-5"],
+        "codex": ["databricks-gpt-6-1-sol"],
+        "claude-sdk": ["databricks-claude-haiku-5-5"],
     }
     harnesses = ["pi", "codex", "claude-sdk"]
-    gpt = source.resolve_selection(RoutePick(model="databricks-gpt-5-5"), harnesses, catalog)
+    gpt = source.resolve_selection(RoutePick(model="databricks-gpt-6-1-sol"), harnesses, catalog)
     claude = source.resolve_selection(
-        RoutePick(model="databricks-claude-haiku-4-5"), harnesses, catalog
+        RoutePick(model="databricks-claude-haiku-5-5"), harnesses, catalog
     )
     assert gpt is not None and gpt.harness == "codex"
     assert claude is not None and claude.harness == "claude-sdk"
@@ -2135,11 +2166,9 @@ def test_resolve_selection_never_leaves_the_offered_harnesses() -> None:
     from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
 
     source = TaskV1RouteOptionSource()
-    catalog = {"pi": list(infer_models("pi") or ())}
+    catalog = {"pi": ["databricks-claude-sonnet-5-5", "databricks-gpt-6-1-sol"]}
     # haiku's claude fallback (sonnet-5) is servable and unbarred on pi.
-    haiku = source.resolve_selection(
-        RoutePick(model="databricks-claude-haiku-4-5"), ["pi"], catalog
-    )
+    haiku = source.resolve_selection(RoutePick(model="claude-haiku-4-5"), ["pi"], catalog)
     assert haiku is not None
     assert haiku.harness == "pi"
     assert not harness_bars_model("pi", haiku.model)
@@ -2168,11 +2197,11 @@ def _substitute(arm: str, models: Sequence[str], harness: str = "codex") -> str:
 @pytest.mark.parametrize(
     "catalog",
     [
-        ("databricks-gpt-5-5", "databricks-glm-5-2"),
-        ("databricks-gpt-5-5", "system.ai.glm-5-2"),
-        ("databricks-gpt-5-5", "databricks-glm-5-2", "system.ai.glm-5-2"),
+        ("databricks-gpt-6-1-sol", "databricks-glm-5-2"),
+        ("databricks-gpt-6-1-sol", "system.ai.glm-5-2"),
+        ("databricks-gpt-6-1-sol", "databricks-glm-5-2", "system.ai.glm-5-2"),
         # The picker's dotted spelling still keys to the dashed arm.
-        ("databricks-gpt-5-5", "databricks-glm-5.2"),
+        ("databricks-gpt-6-1-sol", "databricks-glm-5.2"),
     ],
 )
 def test_glm_arm_applies_the_gateway_model_route_spelling(catalog: Sequence[str]) -> None:
@@ -2183,7 +2212,7 @@ def test_glm_arm_applies_the_gateway_model_route_spelling(catalog: Sequence[str]
 def test_servable_alias_leaves_other_arms_alone() -> None:
     from omnigent.server.smart_routing import apply_servable_alias
 
-    for model in ("databricks-gpt-5-5", "system.ai.claude-opus-4-8", "databricks-kimi-k2-6"):
+    for model in ("databricks-gpt-6-1-sol", "system.ai.claude-opus-4-8", "databricks-kimi-k2-6"):
         assert apply_servable_alias(model) == model
 
 
@@ -2195,7 +2224,7 @@ def test_aliased_glm_pick_reports_no_substitution() -> None:
     resolved = source.resolve_selection(
         RoutePick(model="glm-5-2"),
         ["codex"],
-        {"codex": ["databricks-gpt-5-5", "databricks-glm-5-2"]},
+        {"codex": ["databricks-gpt-6-1-sol", "databricks-glm-5-2"]},
     )
     assert resolved is not None
     assert resolved.model == "system.ai.glm-5-2"
@@ -2258,7 +2287,7 @@ async def test_llm_routing_client_records_last_error_on_fail_open() -> None:
             raise RuntimeError("judge exploded")
 
     client = LLMRoutingClient(_Boom())
-    assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-4-5"]}) is None
+    assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-5-5"]}) is None
     assert client.last_error is not None
     assert "judge exploded" in client.last_error
 
@@ -2266,7 +2295,7 @@ async def test_llm_routing_client_records_last_error_on_fail_open() -> None:
 # ── model_prefixes flow from RoutingSettings to the seam ───────────────────
 
 _PREFIXED_CODEX_CATALOG: dict[str, list[str]] = {
-    "codex": ["databricks-gpt-5-6-sol", "databricks-gpt-5-5-pro"]
+    "codex": ["databricks-gpt-6-1-sol", "databricks-gpt-6-1-sol-pro"]
 }
 
 
@@ -2279,7 +2308,7 @@ def test_route_option_source_takes_model_prefixes_from_the_settings() -> None:
             RoutePick(model="gpt-5-6-sol"), ["codex"], _PREFIXED_CODEX_CATALOG
         )
     assert resolved is not None
-    assert resolved.model == "databricks-gpt-5-6-sol"
+    assert resolved.model == "databricks-gpt-6-1-sol"
 
 
 def test_route_option_source_defaults_to_the_shared_catalog_prefixes() -> None:
@@ -2297,20 +2326,20 @@ def test_route_option_source_defaults_to_the_shared_catalog_prefixes() -> None:
         )
     assert resolved is not None
     assert resolved.raw_model == "gpt-5-6-sol"
-    assert resolved.model == "databricks-gpt-5-6-sol"
+    assert resolved.model == "databricks-gpt-6-1-sol"
 
 
 def test_explicit_model_prefixes_win_over_the_settings() -> None:
     from omnigent.server.smart_routing import RoutePick, RoutingSettings, route_option_source
 
-    catalog = {"codex": ["system.ai.gpt-5-6-sol"]}
+    catalog = {"codex": ["system.ai.gpt-6-1-sol"]}
     caps = _SettingsCaps(routing_settings=RoutingSettings(model_prefixes=("databricks-",)))
     with patch("omnigent.runtime._globals._caps", new=caps):
         resolved = route_option_source(model_prefixes=["system.ai."]).resolve_selection(
             RoutePick(model="gpt-5-6-sol"), ["codex"], catalog
         )
     assert resolved is not None
-    assert resolved.model == "system.ai.gpt-5-6-sol"
+    assert resolved.model == "system.ai.gpt-6-1-sol"
 
 
 # ── The frozen router tables are deployment-overridable ───────────────────
@@ -2326,10 +2355,10 @@ def test_route_option_source_offers_a_configured_arm_menu() -> None:
 
     settings = RoutingSettings(menus={"codex": ("acme-large", "acme-small")})
     options = route_option_source(settings).build_route_options(
-        ["codex"], {"codex": ["databricks-gpt-5-4"]}
+        ["codex"], {"codex": ["databricks-gpt-6-1-sol"]}
     )
     # The configured arms are injected and the default task_v1 ones are not.
-    assert [o.model for o in options] == ["gpt-5-4", "acme-large", "acme-small"]
+    assert [o.model for o in options] == ["gpt-6-1-sol", "acme-large", "acme-small"]
 
 
 def test_a_configured_menu_applies_to_a_router_other_than_task_v1() -> None:
@@ -2338,9 +2367,9 @@ def test_a_configured_menu_applies_to_a_router_other_than_task_v1() -> None:
 
     settings = RoutingSettings(router_name="task_v9", menus={"codex": ("acme-large",)})
     options = route_option_source(settings).build_route_options(
-        ["codex"], {"codex": ["databricks-gpt-5-4"]}
+        ["codex"], {"codex": ["databricks-gpt-6-1-sol"]}
     )
-    assert [o.model for o in options] == ["gpt-5-4", "acme-large"]
+    assert [o.model for o in options] == ["gpt-6-1-sol", "acme-large"]
 
 
 def test_an_unconfigured_menu_stays_off_for_a_router_other_than_task_v1() -> None:
@@ -2348,9 +2377,9 @@ def test_an_unconfigured_menu_stays_off_for_a_router_other_than_task_v1() -> Non
 
     settings = RoutingSettings(router_name="task_v9")
     options = route_option_source(settings).build_route_options(
-        ["codex"], {"codex": ["databricks-gpt-5-4"]}
+        ["codex"], {"codex": ["databricks-gpt-6-1-sol"]}
     )
-    assert [o.model for o in options] == ["gpt-5-4"]
+    assert [o.model for o in options] == ["gpt-6-1-sol"]
 
 
 def test_an_empty_configured_menu_means_no_arms() -> None:
@@ -2359,9 +2388,9 @@ def test_an_empty_configured_menu_means_no_arms() -> None:
 
     settings = RoutingSettings(menus={})
     options = route_option_source(settings).build_route_options(
-        ["codex"], {"codex": ["databricks-gpt-5-4"]}
+        ["codex"], {"codex": ["databricks-gpt-6-1-sol"]}
     )
-    assert [o.model for o in options] == ["gpt-5-4"]
+    assert [o.model for o in options] == ["gpt-6-1-sol"]
 
 
 def test_a_configured_alias_maps_a_pick_onto_the_served_spelling() -> None:
@@ -2369,10 +2398,10 @@ def test_a_configured_alias_maps_a_pick_onto_the_served_spelling() -> None:
 
     settings = RoutingSettings(
         model_prefixes=("databricks-",),
-        servable_aliases={"gpt-5-6-sol": "acme.serving.sol"},
+        servable_aliases={"gpt-6-1-sol": "acme.serving.sol"},
     )
     resolved = route_option_source(settings).resolve_selection(
-        RoutePick(model="gpt-5-6-sol"), ["codex"], {"codex": ["databricks-gpt-5-6-sol"]}
+        RoutePick(model="gpt-5-6-sol"), ["codex"], {"codex": ["databricks-gpt-6-1-sol"]}
     )
     assert resolved is not None
     assert (resolved.model, resolved.raw_model) == ("acme.serving.sol", "gpt-5-6-sol")
@@ -2381,9 +2410,9 @@ def test_a_configured_alias_maps_a_pick_onto_the_served_spelling() -> None:
 def test_apply_servable_alias_reads_the_deployment_table() -> None:
     from omnigent.server.smart_routing import RoutingSettings, apply_servable_alias
 
-    settings = RoutingSettings(servable_aliases={"gpt-5-6-sol": "acme.serving.sol"})
+    settings = RoutingSettings(servable_aliases={"gpt-6-1-sol": "acme.serving.sol"})
     with patch("omnigent.runtime._globals._caps", new=_SettingsCaps(settings)):
-        assert apply_servable_alias("databricks-gpt-5-6-sol") == "acme.serving.sol"
+        assert apply_servable_alias("databricks-gpt-6-1-sol") == "acme.serving.sol"
         # A configured table replaces the default one wholesale.
         assert apply_servable_alias("databricks-glm-5-2") == "databricks-glm-5-2"
     assert apply_servable_alias("databricks-glm-5-2") == "system.ai.glm-5-2"
@@ -2399,7 +2428,9 @@ def test_infer_models_takes_the_current_generation_arms_from_the_settings() -> N
     assert models[-1] == "databricks-acme-1"
     assert "databricks-glm-5-2" not in models
     # The curated cost/capability spread is not a deployment knob.
-    assert models[0] == "databricks-gpt-5-4-nano"
+    assert (
+        models[0] == "databricks-gpt-5-4-nano"
+    )  # Historical metadata; final policy guards serving.
 
 
 def test_task_v1_claude_arms_follows_a_configured_menu() -> None:
@@ -2459,9 +2490,9 @@ def test_configured_tables_reach_the_behaviour_through_the_config_block() -> Non
         }
     )
     source = route_option_source(settings)
-    catalog = {"codex": ["databricks-gpt-5-4"]}
+    catalog = {"codex": ["databricks-gpt-6-1-sol"]}
     assert [o.model for o in source.build_route_options(["codex"], catalog)] == [
-        "gpt-5-4",
+        "gpt-6-1-sol",
         "acme-sol",
     ]
     # The injected arm is unservable here, so it substitutes — and the pick that
@@ -2631,11 +2662,11 @@ def test_default_on_skips_without_a_routable_databricks_workspace(
 @pytest.mark.asyncio
 async def test_route_session_harness_keeps_unknown_pi_compatibility() -> None:
     """Missing wire metadata from an older runner does not imply incompatibility."""
-    expected = RoutingResult(model="databricks-claude-sonnet-4-6", rationale="mid", harness="pi")
+    expected = RoutingResult(model="databricks-claude-sonnet-5-5", rationale="mid", harness="pi")
     client = _catalog_client()
     payload = client.get.return_value.json.return_value
     sonnet = next(
-        row for row in payload["workers"]["pi"]["models"] if row["id"].endswith("sonnet-4-6")
+        row for row in payload["workers"]["pi"]["models"] if row["id"].endswith("sonnet-5-5")
     )
     sonnet.pop("wire_apis")
     caps = FakeCaps(routing_client=FakeRoutingClient(expected))
@@ -2646,7 +2677,7 @@ async def test_route_session_harness_keeps_unknown_pi_compatibility() -> None:
         )
 
     assert harness == "pi"
-    assert model == "databricks-claude-sonnet-4-6"
+    assert model == "databricks-claude-sonnet-5-5"
     assert error is None
 
 
@@ -2654,7 +2685,7 @@ async def test_route_session_harness_keeps_unknown_pi_compatibility() -> None:
 async def test_route_session_harness_falls_back_by_model_when_harness_absent() -> None:
     """When the router returns no harness, fall back to finding it by model."""
     expected = RoutingResult(
-        model="databricks-gpt-5-4-nano",
+        model="databricks-gpt-5-nano",
         rationale="cheap task",
         harness=None,
     )
@@ -2668,7 +2699,7 @@ async def test_route_session_harness_falls_back_by_model_when_harness_absent() -
     # codex precedes pi in _AUTO_ROUTING_HARNESSES, so a GPT model owned by both
     # deterministically resolves to codex.
     assert harness == "codex"
-    assert model == "databricks-gpt-5-4-nano"
+    assert model == "databricks-gpt-5-nano"
 
 
 # ── Single resolution authority (no double-resolution) ─────────────────────
@@ -2683,15 +2714,15 @@ async def test_route_session_harness_falls_back_by_model_when_harness_absent() -
     [
         (
             "claude-native",
-            "databricks-claude-opus-4-8",
-            "claude-opus-4-8",
-            ["databricks-claude-opus-4-8", "databricks-claude-sonnet-5"],
+            "databricks-claude-opus-5-5",
+            "claude-opus-5-5",
+            ["databricks-claude-opus-5-5", "databricks-claude-sonnet-5-5"],
         ),
         (
             "codex-native",
-            "databricks-gpt-5-6-luna",
-            "gpt-5-6-luna",
-            ["databricks-gpt-5-4-mini", "databricks-gpt-5-6-luna"],
+            "databricks-gpt-6-luna",
+            "gpt-6-luna",
+            ["databricks-gpt-5-4-mini", "databricks-gpt-6-luna"],
         ),
     ],
 )
@@ -2725,9 +2756,11 @@ async def test_route_turn_substitutes_a_model_the_harness_gateway_bars() -> None
         )
     )
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
-        model, verdict = await route_turn("pi", "quick lookup")
+        model, verdict = await route_turn(
+            "pi", "quick lookup", catalog=["databricks-claude-sonnet-5-5"]
+        )
     # haiku 400s on pi's completions path; the claude fallback (sonnet-5) does not.
-    assert model == "databricks-claude-sonnet-5"
+    assert model == "databricks-claude-sonnet-5-5"
     assert verdict is not None and verdict["raw_model"] == "claude-haiku-4-5"
 
 
@@ -2747,13 +2780,13 @@ def test_resolve_selection_accepts_an_already_local_id() -> None:
     from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
 
     source = TaskV1RouteOptionSource(model_prefixes=["databricks-", "system.ai."])
-    catalog = {"claude-native": ["databricks-claude-opus-4-8"]}
+    catalog = {"claude-native": ["databricks-claude-opus-5-5"]}
     resolved = source.resolve_selection(
-        RoutePick(model="databricks-claude-opus-4-8"), ["claude-native"], catalog
+        RoutePick(model="databricks-claude-opus-5-5"), ["claude-native"], catalog
     )
     assert resolved is not None
     assert resolved.harness == "claude-native"
-    assert resolved.model == "databricks-claude-opus-4-8"
+    assert resolved.model == "databricks-claude-opus-5-5"
 
 
 # ── Prefix stripping never leaves a separator ──────────────────────────────
@@ -2764,8 +2797,8 @@ def test_resolve_selection_accepts_an_already_local_id() -> None:
     [
         ("system.ai", "system.ai.claude-opus-5", "claude-opus-5"),
         ("system.ai.", "system.ai.claude-opus-5", "claude-opus-5"),
-        ("databricks", "databricks-gpt-5-6-sol", "gpt-5-6-sol"),
-        ("databricks-", "databricks-gpt-5-6-sol", "gpt-5-6-sol"),
+        ("databricks", "databricks-gpt-6-1-sol", "gpt-6-1-sol"),
+        ("databricks-", "databricks-gpt-6-1-sol", "gpt-6-1-sol"),
     ],
 )
 def test_to_router_id_never_yields_a_leading_separator(
@@ -2811,7 +2844,7 @@ async def test_route_turn_never_offers_pi_a_model_its_gateway_bars() -> None:
 async def test_route_turn_declines_when_every_candidate_is_barred() -> None:
     client = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-5", rationale="x"))
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
-        model, verdict = await route_turn("pi", "hi", catalog=["databricks-gpt-5-6-luna"])
+        model, verdict = await route_turn("pi", "hi", catalog=["databricks-gpt-5-5"])
     assert (model, verdict) == (None, None)
 
 
@@ -2820,16 +2853,16 @@ async def test_route_turn_declines_when_every_candidate_is_barred() -> None:
 # Non-Databricks codex panes spell rows ``gpt-5.6-sol`` while the router's arms
 # are dashed, so unnormalized ids missed every substitution chain.
 
-_DOTTED_CODEX_CATALOG: list[str] = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4-mini"]
+_DOTTED_CODEX_CATALOG: list[str] = ["gpt-6-luna", "gpt-6.1-sol", "gpt-5.5", "gpt-5.4-mini"]
 
 
 @pytest.mark.parametrize(
     ("arm", "expected"),
     [
-        ("gpt-5-6-sol", "gpt-5.6-sol"),
-        ("gpt-5-6-luna", "gpt-5.6-luna"),
+        ("gpt-5-6-sol", "gpt-6.1-sol"),
+        ("gpt-5-6-luna", "gpt-6-luna"),
         # glm has no local endpoint; it falls back to luna, which this pane serves.
-        ("glm-5-2", "gpt-5.6-luna"),
+        ("glm-5-2", "gpt-6-luna"),
     ],
 )
 def test_dot_spelled_picker_rows_match_the_router_arms(arm: str, expected: str) -> None:
@@ -2858,7 +2891,7 @@ def test_dot_spelled_rows_are_not_offered_twice() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["databricks-claude-haiku-4-5", "databricks-gpt-5-5"])
+@pytest.mark.parametrize("model", ["databricks-claude-haiku-5-5", "databricks-gpt-6-1-sol"])
 async def test_route_session_harness_keeps_a_pi_child_on_pi(model: str) -> None:
     """``allowed_family="pi"`` must never yield codex or claude-sdk."""
     # A pi child either stays on pi or declines (harness None) — a decline is
@@ -2904,14 +2937,14 @@ async def test_route_turn_keeps_the_rationale_off_info(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = FakeRoutingClient(
-        RoutingResult(model="databricks-gpt-5-4", rationale="secret prompt paraphrase")
+        RoutingResult(model="databricks-gpt-6-1-sol", rationale="secret prompt paraphrase")
     )
     with (
         caplog.at_level(logging.INFO, logger="omnigent.server.smart_routing"),
         patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)),
     ):
         model, _verdict = await route_turn("codex", "hello")
-    assert model == "databricks-gpt-5-4"
+    assert model == "databricks-gpt-6-1-sol"
     assert "secret prompt paraphrase" not in caplog.text
 
 
@@ -2920,7 +2953,7 @@ async def test_route_session_harness_keeps_the_rationale_off_info(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = FakeRoutingClient(
-        RoutingResult(model="databricks-gpt-5-4", rationale="secret prompt paraphrase")
+        RoutingResult(model="databricks-gpt-6-1-sol", rationale="secret prompt paraphrase")
     )
     with (
         caplog.at_level(logging.INFO, logger="omnigent.server.smart_routing"),
@@ -2947,7 +2980,7 @@ def _both_backends(external: FakeRoutingClient, local: FakeRoutingClient) -> Rou
 @pytest.mark.asyncio
 async def test_route_session_harness_declines_rather_than_offer_gateway_ids_off_gateway() -> None:
     local = FakeRoutingClient(
-        RoutingResult(model="databricks-claude-opus-4-8", rationale="big", harness="claude-native")
+        RoutingResult(model="databricks-claude-opus-5-5", rationale="big", harness="claude-native")
     )
     caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -2966,7 +2999,7 @@ async def test_route_session_harness_declines_rather_than_offer_gateway_ids_off_
 
 @pytest.mark.asyncio
 async def test_route_turn_declines_rather_than_offer_gateway_ids_off_gateway() -> None:
-    local = FakeRoutingClient(RoutingResult(model="databricks-claude-opus-4-8", rationale="big"))
+    local = FakeRoutingClient(RoutingResult(model="databricks-claude-opus-5-5", rationale="big"))
     caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
     with patch("omnigent.runtime._globals._caps", new=caps):
         model, verdict = await route_turn(
@@ -2983,19 +3016,19 @@ async def test_route_turn_declines_rather_than_offer_gateway_ids_off_gateway() -
 async def test_route_session_harness_skips_the_static_top_up_off_gateway() -> None:
     """A partial pre-session catalog is offered as-is, not topped up."""
     local = FakeRoutingClient(
-        RoutingResult(model="claude-sonnet-4-6", rationale="mid", harness="claude-native")
+        RoutingResult(model="claude-sonnet-5-5", rationale="mid", harness="claude-native")
     )
     caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, error = await route_session_harness(
             "hello",
             harness_candidates=("claude-native", "codex-native"),
-            catalog={"claude-native": ["claude-sonnet-4-6", "claude-opus-4-8"]},
+            catalog={"claude-native": ["claude-sonnet-5-5", "claude-opus-5-5"]},
             gateway_backed=False,
             allow_static_fallback=False,
         )
     assert error is None
-    assert (harness, model) == ("claude-native", "claude-sonnet-4-6")
+    assert (harness, model) == ("claude-native", "claude-sonnet-5-5")
     # Only the harness the caller could answer for; codex-native was NOT topped
     # up from the static table.
     assert list(local.offered[0]) == ["claude-native"]
@@ -3004,19 +3037,19 @@ async def test_route_session_harness_skips_the_static_top_up_off_gateway() -> No
 
 @pytest.mark.asyncio
 async def test_route_turn_skips_the_static_table_off_gateway_but_takes_the_catalog() -> None:
-    local = FakeRoutingClient(RoutingResult(model="claude-sonnet-4-6", rationale="mid"))
+    local = FakeRoutingClient(RoutingResult(model="claude-sonnet-5-5", rationale="mid"))
     caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
     with patch("omnigent.runtime._globals._caps", new=caps):
         model, verdict = await route_turn(
             "claude-native",
             "hello",
-            catalog=["claude-sonnet-4-6", "claude-opus-4-8"],
+            catalog=["claude-sonnet-5-5", "claude-opus-5-5"],
             gateway_backed=False,
             allow_static_fallback=False,
         )
-    assert model == "claude-sonnet-4-6"
+    assert model == "claude-sonnet-5-5"
     assert verdict is not None
-    assert local.offered == [{"claude-native": ["claude-sonnet-4-6", "claude-opus-4-8"]}]
+    assert local.offered == [{"claude-native": ["claude-sonnet-5-5", "claude-opus-5-5"]}]
 
 
 @pytest.mark.asyncio
@@ -3027,17 +3060,19 @@ async def test_route_turn_skips_the_static_table_off_gateway_but_takes_the_catal
 async def test_route_turn_picks_the_router_gateway_backing_allows(
     gateway_backed: bool, expected_source: str
 ) -> None:
-    external = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-4", rationale="external"))
-    local = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-5", rationale="local"))
+    external = FakeRoutingClient(
+        RoutingResult(model="databricks-gpt-6-1-sol", rationale="external")
+    )
+    local = FakeRoutingClient(RoutingResult(model="databricks-gpt-6-1-sol", rationale="local"))
     caps = FakeCaps(routing_client=external, routing_backends=_both_backends(external, local))
     with patch("omnigent.runtime._globals._caps", new=caps):
         model, verdict = await route_turn("codex", "hello", gateway_backed=gateway_backed)
     assert verdict is not None
     assert verdict["router_source"] == expected_source
     if gateway_backed:
-        assert (model, local.offered) == ("databricks-gpt-5-4", [])
+        assert (model, local.offered) == ("databricks-gpt-6-1-sol", [])
     else:
-        assert (model, external.offered) == ("databricks-gpt-5-5", [])
+        assert (model, external.offered) == ("databricks-gpt-6-1-sol", [])
 
 
 @pytest.mark.asyncio
@@ -3049,10 +3084,10 @@ async def test_route_session_harness_picks_the_router_gateway_backing_allows(
     gateway_backed: bool, expected_source: str
 ) -> None:
     external = FakeRoutingClient(
-        RoutingResult(model="databricks-gpt-5-4", rationale="external", harness="codex")
+        RoutingResult(model="databricks-gpt-6-1-sol", rationale="external", harness="codex")
     )
     local = FakeRoutingClient(
-        RoutingResult(model="databricks-gpt-5-5", rationale="local", harness="codex")
+        RoutingResult(model="databricks-gpt-6-1-sol", rationale="local", harness="codex")
     )
     caps = FakeCaps(routing_client=external, routing_backends=_both_backends(external, local))
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -3062,7 +3097,7 @@ async def test_route_session_harness_picks_the_router_gateway_backing_allows(
     assert error is None
     assert verdict is not None
     assert verdict["router_source"] == expected_source
-    assert model == ("databricks-gpt-5-4" if gateway_backed else "databricks-gpt-5-5")
+    assert model == "databricks-gpt-6-1-sol"
 
 
 @pytest.mark.asyncio
@@ -3078,7 +3113,7 @@ async def test_routing_is_unavailable_when_neither_backend_is_configured() -> No
 @pytest.mark.asyncio
 async def test_external_only_deployment_cannot_route_off_the_gateway() -> None:
     """No built-in judge means an off-gateway harness has no source at all."""
-    external = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-4", rationale="x"))
+    external = FakeRoutingClient(RoutingResult(model="databricks-gpt-6-1-sol", rationale="x"))
     caps = FakeCaps(routing_client=external, routing_backends=RoutingBackends(external=external))
     with patch("omnigent.runtime._globals._caps", new=caps):
         assert await route_turn("codex", "hello", gateway_backed=False) == (None, None)
@@ -3088,7 +3123,7 @@ async def test_external_only_deployment_cannot_route_off_the_gateway() -> None:
 @pytest.mark.asyncio
 async def test_a_legacy_single_routing_client_is_classified_as_the_oss_judge() -> None:
     """``routing_backends`` unset derives the pair from ``routing_client``."""
-    client = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-4", rationale="x"))
+    client = FakeRoutingClient(RoutingResult(model="databricks-gpt-6-1-sol", rationale="x"))
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
         _model, verdict = await route_turn("codex", "hello", gateway_backed=True)
     assert verdict is not None
@@ -3098,7 +3133,7 @@ async def test_a_legacy_single_routing_client_is_classified_as_the_oss_judge() -
 @pytest.mark.asyncio
 async def test_llm_routing_client_serves_a_cross_harness_verdict_without_a_raw_model() -> None:
     """The built-in judge picks from the menu, so its pick needs no resolution."""
-    llm = _FakeLLMClient({"model": "databricks-gpt-5-5", "harness": "codex-native"})
+    llm = _FakeLLMClient({"model": "databricks-gpt-6-1-sol", "harness": "codex-native"})
     client = LLMRoutingClient(llm)
     caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -3106,14 +3141,14 @@ async def test_llm_routing_client_serves_a_cross_harness_verdict_without_a_raw_m
             "hello",
             harness_candidates=("claude-native", "codex-native"),
             catalog={
-                "claude-native": ["databricks-claude-sonnet-5"],
-                "codex-native": ["databricks-gpt-5-5"],
+                "claude-native": ["databricks-claude-sonnet-5-5"],
+                "codex-native": ["databricks-gpt-6-1-sol"],
             },
             gateway_backed=False,
             allow_static_fallback=False,
         )
     assert error is None
-    assert (harness, model) == ("codex-native", "databricks-gpt-5-5")
+    assert (harness, model) == ("codex-native", "databricks-gpt-6-1-sol")
     assert verdict is not None
     assert verdict["router_source"] == "oss-llm"
     assert "raw_model" not in verdict
@@ -3266,7 +3301,7 @@ async def test_the_judge_declines_rather_than_hang_on_a_stalled_model() -> None:
 
     client = LLMRoutingClient(_Stalled())
     with patch("asyncio.wait_for", new=_recording_wait_for):
-        assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-4-5"]}) is None
+        assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-5-5"]}) is None
     assert budgets == [ROUTING_REQUEST_TIMEOUT_S]
     assert client.last_error is not None
 
@@ -3288,7 +3323,7 @@ async def test_the_judge_is_capped_by_its_own_request_timeout_too() -> None:
             raise RuntimeError("no verdict today")
 
     client = LLMRoutingClient(_Recording())
-    assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-4-5"]}) is None
+    assert await client.route("hi", {"claude-sdk": ["databricks-claude-haiku-5-5"]}) is None
     assert seen["timeout"] == ROUTING_REQUEST_TIMEOUT_S
 
 
@@ -3351,12 +3386,12 @@ def _counting_catalog_client(models: Sequence[str]) -> MagicMock:
 @pytest.mark.asyncio
 async def test_a_warm_catalog_cache_costs_no_runner_round_trip() -> None:
     """The second turn of a session reads the cache instead of the runner."""
-    client = _counting_catalog_client(["databricks-claude-haiku-4-5"])
+    client = _counting_catalog_client(["databricks-claude-haiku-5-5"])
 
     first = await fetch_runner_models("conv_warm", client)
     second = await fetch_runner_models("conv_warm", client)
 
-    assert first == second == {"self": ["databricks-claude-haiku-4-5"]}
+    assert first == second == {"self": ["databricks-claude-haiku-5-5"]}
     client.get.assert_called_once()
 
 
@@ -3364,12 +3399,12 @@ async def test_a_warm_catalog_cache_costs_no_runner_round_trip() -> None:
 async def test_a_cold_cache_still_fetches_and_routes() -> None:
     """Nothing cached is the ordinary first turn: it fetches, and it routes."""
     expected = RoutingResult(
-        model="databricks-claude-opus-4-8",
+        model="databricks-claude-opus-5-5",
         rationale="complex task",
         harness="self",
     )
     client = _counting_catalog_client(
-        ["databricks-claude-haiku-4-5", "databricks-claude-opus-4-8"]
+        ["databricks-claude-haiku-5-5", "databricks-claude-opus-5-5"]
     )
     caps = FakeCaps(routing_client=FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
@@ -3380,7 +3415,7 @@ async def test_a_cold_cache_still_fetches_and_routes() -> None:
             runner_client=client,
         )
 
-    assert model == "databricks-claude-opus-4-8"
+    assert model == "databricks-claude-opus-5-5"
     client.get.assert_called_once()
 
 
@@ -3390,12 +3425,12 @@ async def test_a_warm_cache_routes_a_turn_without_touching_the_runner() -> None:
     from omnigent.server.smart_routing import prefetch_runner_catalog
 
     expected = RoutingResult(
-        model="databricks-claude-opus-4-8",
+        model="databricks-claude-opus-5-5",
         rationale="complex task",
         harness="self",
     )
     client = _counting_catalog_client(
-        ["databricks-claude-haiku-4-5", "databricks-claude-opus-4-8"]
+        ["databricks-claude-haiku-5-5", "databricks-claude-opus-5-5"]
     )
     await prefetch_runner_catalog("conv_prefetched", client)
     client.get.reset_mock()
@@ -3409,7 +3444,7 @@ async def test_a_warm_cache_routes_a_turn_without_touching_the_runner() -> None:
             runner_client=client,
         )
 
-    assert model == "databricks-claude-opus-4-8"
+    assert model == "databricks-claude-opus-5-5"
     client.get.assert_not_called()
 
 
@@ -3418,7 +3453,7 @@ async def test_invalidating_the_catalog_makes_the_next_turn_re_fetch() -> None:
     """A rebind changes which models a pane can take, so the cache must drop."""
     from omnigent.server.smart_routing import invalidate_runner_catalog
 
-    client = _counting_catalog_client(["databricks-claude-haiku-4-5"])
+    client = _counting_catalog_client(["databricks-claude-haiku-5-5"])
     await fetch_runner_models("conv_rebound", client)
     invalidate_runner_catalog("conv_rebound")
     await fetch_runner_models("conv_rebound", client)
@@ -3444,7 +3479,7 @@ async def test_a_runner_rebind_invalidates_the_routing_catalog() -> None:
     """The snapshot-overlay invalidation seam is wired to the routing cache."""
     from omnigent.server.routes.sessions import _invalidate_runner_backed_snapshot_state
 
-    client = _counting_catalog_client(["databricks-claude-haiku-4-5"])
+    client = _counting_catalog_client(["databricks-claude-haiku-5-5"])
     await fetch_runner_models("conv_overlay", client)
     _invalidate_runner_backed_snapshot_state(
         "conv_overlay", cancel_inflight=True, drop_model_options=False
