@@ -8637,6 +8637,15 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
         return await real_ensure(*args, **kwargs)
 
     monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_on_first_call)
+    # Capture the deadline warning on caplog's handler alone. The warning
+    # carries ``exc_info=True``; when it also propagates to the root logger,
+    # the pytest structlog plugin renders the chained traceback with rich +
+    # locals *synchronously on the event loop* (~1.8s idle, 5s+ on a loaded
+    # CI runner with coverage on). That starves the loop past the 5s wait
+    # below and the test times out although the forwarder behaved correctly.
+    fwd_logger = logging.getLogger("omnigent.claude_native_forwarder")
+    monkeypatch.setattr(fwd_logger, "propagate", False)
+    monkeypatch.setattr(fwd_logger, "handlers", [caplog.handler])
 
     with caplog.at_level(logging.WARNING, logger="omnigent.claude_native_forwarder"):
         task = asyncio.create_task(
@@ -8656,7 +8665,7 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
                 while len(ensure_calls) < 2:
                     await asyncio.sleep(0.01)
 
-            await asyncio.wait_for(_second_iteration_ran(), timeout=5.0)
+            await asyncio.wait_for(_second_iteration_ran(), timeout=30.0)
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
