@@ -3509,7 +3509,9 @@ class HostProcess:
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
         url = self._tunnel_url()
-        headers = self._build_connect_headers()
+        # Off the event loop: minting headers may refresh the stored login over
+        # HTTP (with retry backoff), which must not stall heartbeats.
+        headers = await asyncio.to_thread(self._build_connect_headers)
 
         _logger.info("Connecting to %s", url)
         # Build a verifying SSL context from a real CA bundle for wss:// — a bare
@@ -3596,7 +3598,7 @@ class HostProcess:
         try:
             from omnigent.resume_dispatch import _resolve_current_user_id
 
-            headers = self._build_connect_headers()
+            headers = await asyncio.to_thread(self._build_connect_headers)
             owner = await asyncio.to_thread(
                 _resolve_current_user_id, base_url=self._server_url, headers=headers
             )

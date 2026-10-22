@@ -15,7 +15,7 @@ from omnigent.db.utils import _build_alembic_config
 from omnigent.stores.host_admission_store import Binding, Refused, Store, hosts, operations
 
 HEAD = "gc1d2e3f4a5b"
-PARENT = "zc1d2e3f4a5b"
+PARENT = "zr7a1c3e5b90"
 B = Binding(0, "1" * 32, "alice@example.test")
 PROOF = "a" * 64
 

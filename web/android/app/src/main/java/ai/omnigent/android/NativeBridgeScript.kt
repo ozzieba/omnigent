@@ -17,9 +17,10 @@ package ai.omnigent.android
  * `__omnigentNativeEmitSharedText`, both fed by an OS Share
  * (ACTION_SEND/ACTION_SEND_MULTIPLE) via [SharedFileReceiver] and
  * `MainActivity.handleShareIntent`. The files side of that handoff is
- * acknowledged back (`acknowledgeSharedFiles`, web -> native) once the web
- * layer has taken ownership of a delivery — see `MainActivity`'s
- * `onSharedFilesAcknowledged` / `pendingSharedFilesRetries`.
+ * acknowledged back (`acknowledgeSharedFiles` / `acknowledgeSharedText`,
+ * web -> native) once the web layer has taken ownership of a delivery — see
+ * `MainActivity`'s `onSharedFilesAcknowledged` / `pendingSharedFilesRetries`
+ * and [SharedTextHandoff].
  */
 object NativeBridgeScript {
     val source: String =
@@ -231,14 +232,51 @@ object NativeBridgeScript {
           // Same cold-start race and same queue-until-first-subscriber
           // treatment as shared files above, for a text-only OS share
           // (ACTION_SEND EXTRA_TEXT, no attached file).
+          //
+          // The shell retries an unacknowledged text share on every page load
+          // (SharedTextHandoff), so delivery is at-least-once while appending
+          // the same text twice is a visible bug. The dedup ledger lives here,
+          // in the script the shell injects into every document, so it also
+          // covers a web build too old to acknowledge at all.
+          const DELIVERED_KEY = "omnigent:nativeSharedTextDelivered";
+          const DELIVERED_CAP = 20;
+          const deliveredIds = () => {
+            try {
+              const raw = window.sessionStorage.getItem(DELIVERED_KEY);
+              const parsed = raw ? JSON.parse(raw) : [];
+              return Array.isArray(parsed) ? parsed.filter((v) => typeof v === "string") : [];
+            } catch (_) { return []; }
+          };
+          const wasSharedTextDelivered = (id) =>
+            typeof id === "string" && id !== "" && deliveredIds().indexOf(id) !== -1;
+          const markSharedTextDelivered = (id) => {
+            if (typeof id !== "string" || id === "") return;
+            try {
+              const next = deliveredIds().filter((v) => v !== id);
+              next.push(id);
+              window.sessionStorage.setItem(
+                DELIVERED_KEY, JSON.stringify(next.slice(-DELIVERED_CAP)),
+              );
+            } catch (_) {}
+          };
+          // Recorded at hand-off, not on arrival: text buffered for a
+          // subscriber that never appears must stay eligible for the retry.
+          const handSharedText = (callbacks, text, id) => {
+            markSharedTextDelivered(id);
+            for (const cb of callbacks) { try { cb(text); } catch (_) {} }
+          };
           const sharedTextCallbacks = new Set();
           let pendingSharedText = null;
           Object.defineProperty(window, "__omnigentNativeEmitSharedText", {
             configurable: false, enumerable: false, writable: false,
-            value(text) {
+            value(text, deliveryId) {
               if (typeof text !== "string" || text === "") return;
-              if (sharedTextCallbacks.size === 0) { pendingSharedText = text; return; }
-              for (const cb of sharedTextCallbacks) { try { cb(text); } catch (_) {} }
+              if (wasSharedTextDelivered(deliveryId)) return;
+              if (sharedTextCallbacks.size === 0) {
+                pendingSharedText = { text: text, id: deliveryId };
+                return;
+              }
+              handSharedText(sharedTextCallbacks, text, deliveryId);
             },
           });
 
@@ -308,11 +346,14 @@ object NativeBridgeScript {
               if (typeof callback !== "function") return () => {};
               sharedTextCallbacks.add(callback);
               if (pendingSharedText) {
-                const t = pendingSharedText;
+                const queued = pendingSharedText;
                 pendingSharedText = null;
-                try { callback(t); } catch (_) {}
+                handSharedText([callback], queued.text, queued.id);
               }
               return () => sharedTextCallbacks.delete(callback);
+            },
+            acknowledgeSharedText() {
+              post({ method: "sharedTextReceived" });
             },
           });
         })();

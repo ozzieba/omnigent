@@ -73,7 +73,9 @@ jobs:
       - name: Checkout (tags only)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          fetch-depth: 0
+          # Only tag names are read here; a full-history fetch of every branch exceeds the 5-minute cap on Forge.
+          fetch-depth: 1
+          fetch-tags: true
           sparse-checkout: .github/scripts/ci
           persist-credentials: false
       - name: Resolve latest final tag
@@ -262,8 +264,9 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           sparse-checkout: .github/scripts/ci
-          # Full history so `git tag` sees every release tag for the matrix.
-          fetch-depth: 0
+          # Only tag names are read here; a full-history fetch of every branch exceeds the 5-minute cap on Forge.
+          fetch-depth: 1
+          fetch-tags: true
           persist-credentials: false
       - name: Compute pairwise matrices
         id: matrix
@@ -354,7 +357,9 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           sparse-checkout: .github/scripts/ci
-          fetch-depth: 0
+          # Only tag names are read here; a full-history fetch of every branch exceeds the 5-minute cap on Forge.
+          fetch-depth: 1
+          fetch-tags: true
           persist-credentials: false
       - name: Compute UI matrix
         id: matrix

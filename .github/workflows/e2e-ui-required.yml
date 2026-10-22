@@ -56,6 +56,22 @@ jobs:
           sparse-checkout: .github/scripts
           persist-credentials: false
 
+      - name: Select personal Forge platform client
+        if: github.server_url == 'https://forge.ozba.me'
+        env:
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE/.github/scripts/polly"
+          python3 -B "$source_dir/forge_client.py" --check-binding
+          client_dir="$(mktemp -d "$RUNNER_TEMP/ui-gate-platform.XXXXXXXX")"
+          cp "$source_dir/forge_client.py" "$client_dir/forge_client.py"
+          printf '%s\n' '#!/bin/bash' 'exec python3 -B "$(dirname "$0")/forge_client.py" "$@"' > "$client_dir/gh"
+          chmod 500 "$client_dir/gh"
+          chmod 400 "$client_dir/forge_client.py"
+          echo "$client_dir" >> "$GITHUB_PATH"
+
       - name: Load maintainers
         id: maintainers
         env:

@@ -2496,6 +2496,8 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
 
     from omnigent.host import local_server as _local_server_mod
 
+    bind_probe = Mock()
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
     monkeypatch.setattr(_local_server_mod, "local_server_url_if_healthy", _must_not_check_existing)
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_touch_pidfile)
@@ -2516,6 +2518,7 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     )
 
     assert result.exit_code == 0, result.output
+    bind_probe.assert_called_once_with("127.0.0.1", 44770)
     assert "already running" not in result.output
     assert captured["uvicorn_kwargs"]["port"] == 44770
     assert "Starting omnigent server on 127.0.0.1:44770" in result.output

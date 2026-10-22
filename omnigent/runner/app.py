@@ -7015,8 +7015,8 @@ def create_runner_app(
             except _json.JSONDecodeError:
                 return {"result": result_str}
 
-        try:
-            relay: ClaudeNativeToolRelay = start_tool_relay(
+        def _start_relay() -> ClaudeNativeToolRelay:
+            return start_tool_relay(
                 bridge_dir=bridge_dir,
                 tools=relay_schemas,
                 tool_executor=_relay_tool_executor,
@@ -7024,14 +7024,58 @@ def create_runner_app(
                 policy_client=server_client,
                 session_id=session_id,
             )
-        except (OSError, RuntimeError):
-            _logger.warning(
-                "Failed to start comment relay for session=%s",
-                session_id,
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
-            return
+
+        relay: ClaudeNativeToolRelay
+        try:
+            relay = _start_relay()
+        except (OSError, RuntimeError) as exc:
+            # A bridge dir replaced by a symlink (a storage migration) fails
+            # the secure-dir check. Materialize it as a real dir and retry
+            # once. Otherwise surface the failure on the session, not only in
+            # the log: every tool call from it is blocked until this is fixed.
+            from omnigent._native_post_delivery import post_external_session_status
+            from omnigent.claude_native_bridge import materialize_symlinked_bridge_dir
+
+            restored_from = materialize_symlinked_bridge_dir(bridge_dir)
+            started: ClaudeNativeToolRelay | None = None
+            if restored_from is not None:
+                _logger.warning(
+                    "comment relay for session=%s: bridge dir %s was a symlink to %s; "
+                    "materialized a real copy and retrying (the target is kept as rollback)",
+                    session_id,
+                    bridge_dir,
+                    restored_from,
+                    extra={"session_id": session_id},
+                )
+                try:
+                    started = _start_relay()
+                except (OSError, RuntimeError):
+                    started = None
+            if started is None:
+                _logger.warning(
+                    "Failed to start comment relay for session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                detail = (
+                    f"Omnigent tool relay could not start ({type(exc).__name__}: {exc}). "
+                    "Tool calls from this session will be blocked until it is relaunched "
+                    "from a real bridge directory."
+                )
+                try:
+                    await post_external_session_status(
+                        server_client, session_id=session_id, status="failed", output=detail
+                    )
+                except Exception:  # noqa: BLE001 — best-effort visibility
+                    _logger.debug(
+                        "relay failure status post failed for session=%s",
+                        session_id,
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+                return
+            relay = started
         superseded = _session_comment_relays.get(session_id)
         _session_comment_relays[session_id] = _CommentRelayBinding(
             relay=relay,

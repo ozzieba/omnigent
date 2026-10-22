@@ -1,7 +1,7 @@
 """Add durable host admission fences and operation custody.
 
 Revision ID: gc1d2e3f4a5b
-Revises: zc1d2e3f4a5b
+Revises: zr7a1c3e5b90
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "gc1d2e3f4a5b"
-down_revision: str | None = "zc1d2e3f4a5b"
+down_revision: str | None = "zr7a1c3e5b90"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

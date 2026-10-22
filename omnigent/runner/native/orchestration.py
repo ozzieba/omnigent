@@ -766,7 +766,10 @@ def _codex_session_workspace(session_workspace: str | None) -> Path:
         session snapshot nor ``OMNIGENT_RUNNER_WORKSPACE``).
     """
     raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
-    return Path(raw.strip()).expanduser().resolve()
+    stripped = raw.strip()
+    if not stripped:
+        raise RuntimeError("Session workspace must not be empty after normalization.")
+    return Path(stripped).expanduser().resolve()
 
 
 def _pi_session_workspace(session_workspace: str | None) -> Path:
@@ -777,13 +780,19 @@ def _pi_session_workspace(session_workspace: str | None) -> Path:
     :returns: Workspace path for the terminal cwd.
     """
     raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
-    return Path(raw.strip()).expanduser().resolve()
+    stripped = raw.strip()
+    if not stripped:
+        raise RuntimeError("Session workspace must not be empty after normalization.")
+    return Path(stripped).expanduser().resolve()
 
 
 def _kiro_session_workspace(session_workspace: str | None) -> Path:
     """Resolve the cwd for a runner-owned Kiro terminal."""
     raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
-    return Path(raw.strip()).expanduser().resolve()
+    stripped = raw.strip()
+    if not stripped:
+        raise RuntimeError("Session workspace must not be empty after normalization.")
+    return Path(stripped).expanduser().resolve()
 
 
 async def _kiro_native_launch_config(
@@ -1228,7 +1237,9 @@ async def _auto_create_opencode_terminal(
         OpenCodeNativeBridgeState,
         clear_bridge_state,
         prepare_bridge_dir,
+        read_owned_gemma_auth_snapshot,
         seed_opencode_auth,
+        seed_owned_gemma_auth,
         write_bridge_state,
         write_opencode_policy_plugin,
         write_relay_bridge_config,
@@ -1239,23 +1250,19 @@ async def _auto_create_opencode_terminal(
         session_id=session_id,
         server_client=server_client,
     )
+    tool_role = _opencode_native_tool_role(agent_spec, launch_config)
+    if tool_role is not None and session_id in _AUTO_OPENCODE_SERVERS:
+        raise ValueError("Owned Gemma role cannot replace a cached native instance")
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
+    role_auth_snapshot = (
+        read_owned_gemma_auth_snapshot(bridge_dir) if tool_role is not None else None
+    )
     # Seed the token the shared ``serve-mcp`` reads at boot (idempotent) so the
     # Omnigent builtin-tool relay (wired below) can start. Safe to call before
     # the relay; ``start_tool_relay`` mints its own relay token in
     # ``tool_relay.json``.
     write_relay_bridge_config(bridge_dir)
-    # Cancel any surviving forwarder first so its teardown closes the OLD
-    # server, then clear stale bridge state so web injection waits for the
-    # new launch's URL/session instead of a dead one.
-    await _cancel_auto_forwarder_task(session_id)
-    leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
-    if leftover is not None:
-        with contextlib.suppress(Exception):
-            await leftover.close()
-    clear_bridge_state(bridge_dir)
-
     model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
     # Route opencode through the Databricks AI gateway when the spec names a
     # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
@@ -1320,9 +1327,11 @@ async def _auto_create_opencode_terminal(
     # PostToolUse hooks); coordinates come from the OMNIGENT_* env stamped on
     # the server below. Only wired when there's a server to evaluate against.
     policy_env: dict[str, str] = {}
+    policy_plugin: str | None = None
     runner_server_url = os.environ.get("RUNNER_SERVER_URL")
     if server_client is not None and runner_server_url:
         plugin_path = write_opencode_policy_plugin(bridge_dir)
+        policy_plugin = str(plugin_path)
         config.setdefault("$schema", "https://opencode.ai/config.json")
         config["plugin"] = [str(plugin_path)]
         policy_env["OMNIGENT_POLICY_URL"] = runner_server_url
@@ -1351,6 +1360,24 @@ async def _auto_create_opencode_terminal(
     # hides the user's ~/.config/opencode/opencode.jsonc, so without this
     # merge, custom providers with non-default base URLs are invisible.
     config = maybe_merge_user_provider_config(config)
+    if tool_role is not None:
+        from omnigent.opencode_native_provider import project_owned_gemma_tool_config
+
+        config, role_env = project_owned_gemma_tool_config(
+            config, bridge_dir=bridge_dir, policy_plugin=policy_plugin
+        )
+        (bridge_dir / "owned-role-home").mkdir(mode=0o700, exist_ok=True)
+        policy_env.update(role_env)
+
+    # Cancel any surviving forwarder first so its teardown closes the OLD
+    # server, then clear stale bridge state so web injection waits for the
+    # new launch's URL/session instead of a dead one.
+    await _cancel_auto_forwarder_task(session_id)
+    leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+    if leftover is not None:
+        with contextlib.suppress(Exception):
+            await leftover.close()
+    clear_bridge_state(bridge_dir)
 
     if config:
         write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
@@ -1359,7 +1386,10 @@ async def _auto_create_opencode_terminal(
     # `opencode auth login` credentials in — otherwise it can't authenticate
     # their providers and falls back to the no-auth default model. No-op on a
     # remote runner (no local auth.json) / Databricks-gateway path.
-    seed_opencode_auth(bridge_dir)
+    if tool_role is not None:
+        seed_owned_gemma_auth(bridge_dir, snapshot=role_auth_snapshot)
+    else:
+        seed_opencode_auth(bridge_dir)
 
     # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
     # ``tool_relay.json`` exists when opencode launches the ``serve-mcp`` MCP
@@ -1939,6 +1969,43 @@ def _resolve_opencode_compact_model(
             return provider_id, model_id
 
     return None, None
+
+
+def _opencode_native_tool_role(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+    launch_config: _OpenCodeNativeLaunchConfig,
+) -> str | None:
+    """Validate opt-in role binding before changing a cached native instance."""
+    from omnigent.opencode_native_provider import (
+        OPENCODE_OWNED_GEMMA_MODEL,
+        OPENCODE_OWNED_GEMMA_ROLE,
+    )
+
+    if agent_spec is None:
+        return None
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if "opencode_tool_role" not in spec.executor.config:
+        return None
+    role = spec.executor.config["opencode_tool_role"]
+    if role != OPENCODE_OWNED_GEMMA_ROLE:
+        raise ValueError("Unknown OpenCode tool role")
+    if sys.platform != "linux" or Path("/etc/opencode").exists():
+        raise ValueError("Owned Gemma role requires an unmanaged Linux config context")
+    spec_model = _opencode_native_model_from_spec(agent_spec)
+    if spec_model != OPENCODE_OWNED_GEMMA_MODEL or launch_config.model_override not in (
+        None,
+        OPENCODE_OWNED_GEMMA_MODEL,
+    ):
+        raise ValueError("Owned Gemma role requires its exact provider/model")
+    if (
+        launch_config.external_session_id is not None
+        or launch_config.fork_carry_history
+        or launch_config.terminal_launch_args
+        or spec.executor.config.get("profile")
+        or spec.mcp_servers
+    ):
+        raise ValueError("Owned Gemma role requires an unambiguous new native session")
+    return str(role)
 
 
 def _opencode_native_profile_from_spec(

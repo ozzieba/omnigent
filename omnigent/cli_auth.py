@@ -23,7 +23,9 @@ import json
 import logging
 import math
 import os
+import shlex
 import stat
+import subprocess
 import tempfile
 import time
 from collections.abc import Iterator
@@ -45,6 +47,24 @@ _TOKEN_FILE_NAME = "auth_tokens.json"
 # Comfortably longer than a WebSocket handshake, far shorter than the
 # server's 1-hour access-token TTL.
 REFRESH_MIN_REMAINING_SECONDS = 90.0
+
+# Machine-readable refresh health, one record per server, beside the token
+# file. Watchdogs read it; it never holds token material.
+_REFRESH_STATUS_FILE_NAME = "auth_refresh_status.json"
+# Command run (detached, no token material) when refresh needs a human:
+# a definitive refusal, an approaching grant expiry, or a long outage.
+AUTH_ALERT_COMMAND_ENV = "OMNIGENT_AUTH_ALERT_COMMAND"
+# Warn this many days before the refresh grant's absolute lifetime ends.
+REFRESH_EXPIRY_WARN_DAYS_ENV = "OMNIGENT_REFRESH_EXPIRY_WARN_DAYS"
+_DEFAULT_REFRESH_EXPIRY_WARN_DAYS = 7.0
+# The same alert for the same server repeats at most this often.
+_ALERT_REPEAT_SECONDS = 6 * 3600.0
+# Transient failures (connection errors, 5xx, 429) are retried in-call with
+# these pauses; consecutive transient failures past the threshold alert.
+_REFRESH_ATTEMPTS = 3
+_REFRESH_BACKOFF_SECONDS: tuple[float, ...] = (0.5, 1.5)
+_UNREACHABLE_ALERT_THRESHOLD = 20
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def _token_file_path() -> Path:
@@ -72,7 +92,7 @@ def _normalize_server_url(server_url: str) -> str:
     return server_url.rstrip("/")
 
 
-def _write_tokens_file(path: Path, data: dict[str, dict[str, str | float]]) -> None:
+def _write_tokens_file(path: Path, data: dict[str, Any]) -> None:
     """Atomically write the auth-tokens file, never exposing it readable.
 
     The previous sequence was ``path.write_text(...)`` followed by ``os.chmod``.
@@ -160,6 +180,7 @@ def store_token(
     user_id: str,
     expires_at: float,
     refresh_token: str | None = None,
+    refresh_expires_at: float | None = None,
 ) -> None:
     """Persist a session token for a server.
 
@@ -173,6 +194,9 @@ def store_token(
         server handed one out. Lets :func:`refresh_stored_token` renew
         the access token past expiry without a human re-running
         ``omnigent login``.
+    :param refresh_expires_at: Unix timestamp when the refresh grant's
+        absolute lifetime ends, when the server reported it. Drives the
+        expiry-ahead warning.
     """
     entry: dict[str, str | float] = {
         "token": token,
@@ -181,6 +205,8 @@ def store_token(
     }
     if refresh_token is not None:
         entry["refresh_token"] = refresh_token
+        if refresh_expires_at is not None and math.isfinite(refresh_expires_at):
+            entry["refresh_expires_at"] = refresh_expires_at
     _store_entry(server_url, entry)
 
 
@@ -426,25 +452,12 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     if not isinstance(refresh_token, str) or not refresh_token:
         return None
 
-    import httpx
-
-    try:
-        resp = httpx.post(
-            f"{normalized}/oauth/token",
-            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-            timeout=timeout,
-        )
-    except httpx.HTTPError as exc:
-        _logger.warning("Token refresh against %s failed: %s", normalized, exc)
+    resp = _post_refresh_with_retry(normalized, refresh_token, timeout)
+    if resp is None:
+        # Transient: the stored pair is kept untouched for the next attempt.
         return None
     if resp.status_code != 200:
-        _logger.warning(
-            "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
-            "to re-authenticate.",
-            normalized,
-            resp.status_code,
-            normalized,
-        )
+        _record_refusal(normalized, resp)
         return None
     try:
         payload = resp.json()
@@ -466,20 +479,328 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
         # one we already hold (login grants deliberately do not rotate).
         new_refresh = refresh_token
     expires_in = _coerce_expires_in(payload.get("expires_in"))
+    refresh_expires_at = _refresh_expires_at(payload, entry, rotated=new_refresh != refresh_token)
 
     user_id = entry.get("user_id")
+    # Persist before handing the token out: a rotated refresh token that is
+    # used but never stored would strand the grant.
     store_token(
         server_url,
         token=access_token,
         user_id=user_id if isinstance(user_id, str) else "",
         expires_at=time.time() + expires_in,
         refresh_token=new_refresh,
+        refresh_expires_at=refresh_expires_at,
     )
     # A fresh token means any earlier expiry warning is stale; allow
     # a new one if this credential ever lapses again.
     _warned_expired_servers.discard(normalized)
     _logger.info("Refreshed login session for %s", normalized)
+    _record_success(normalized, refresh_expires_at)
     return access_token
+
+
+def _post_refresh_with_retry(
+    normalized: str, refresh_token: str, timeout: float
+) -> httpx.Response | None:
+    """POST the refresh grant, retrying transient failures within *timeout*.
+
+    Connection errors, timeouts, 5xx and 429 are transient (a server restart
+    or DB failover): they are retried with short backoff and, if they
+    persist, recorded without touching the stored credential. Any other
+    response — success or a definitive refusal — is returned as-is.
+
+    :returns: The final non-transient response, or ``None`` when every
+        attempt failed transiently.
+    """
+    import httpx
+
+    deadline = time.monotonic() + timeout
+    last_problem = ""
+    for attempt in range(_REFRESH_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if attempt > 0 and remaining <= 0:
+            break
+        remaining = max(1.0, remaining)
+        try:
+            resp = httpx.post(
+                f"{normalized}/oauth/token",
+                data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+                timeout=remaining,
+            )
+        except httpx.HTTPError as exc:
+            last_problem = f"{type(exc).__name__}: {exc}"
+        else:
+            if resp.status_code not in _TRANSIENT_HTTP_STATUSES:
+                return resp
+            last_problem = f"HTTP {resp.status_code}"
+        if attempt + 1 >= _REFRESH_ATTEMPTS:
+            break
+        pause = _REFRESH_BACKOFF_SECONDS[min(attempt, len(_REFRESH_BACKOFF_SECONDS) - 1)]
+        if time.monotonic() + pause >= deadline:
+            break
+        time.sleep(pause)
+    _logger.warning(
+        "Token refresh against %s failed transiently (%s); keeping the stored "
+        "credential and retrying on the next connection attempt.",
+        normalized,
+        last_problem,
+    )
+    _record_transient_failure(normalized, last_problem)
+    return None
+
+
+def _refresh_expires_at(
+    payload: dict[str, Any], entry: dict[str, str | float], *, rotated: bool
+) -> float | None:
+    """Return the refresh grant's absolute expiry from a refresh response.
+
+    Falls back to the stored value when the server omits it and the refresh
+    token did not change (same grant, same lifetime).
+    """
+    raw = payload.get("refresh_token_expires_in")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw):
+        return time.time() + max(0.0, float(raw))
+    previous = entry.get("refresh_expires_at")
+    if not rotated and isinstance(previous, (int, float)) and math.isfinite(previous):
+        return float(previous)
+    return None
+
+
+def _oauth_error_code(resp: httpx.Response) -> str:
+    """Return the RFC 6749 ``error`` code from a refusal, or ``""``."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    return error if isinstance(error, str) else ""
+
+
+def _record_refusal(normalized: str, resp: httpx.Response) -> None:
+    """Log, record and alert a definitive refresh refusal.
+
+    The stored credential is left in place: a human re-login replaces it,
+    and keeping it preserves evidence (e.g. the grant id) for diagnosis.
+    """
+    error = _oauth_error_code(resp)
+    if error == "expired_token":
+        cause = "the refresh grant reached its absolute lifetime"
+    elif error == "invalid_grant":
+        cause = "the refresh grant is unknown, revoked or was replayed"
+    else:
+        cause = "the server does not accept this refresh grant"
+    message = (
+        f"Token refresh against {normalized} refused (HTTP {resp.status_code}"
+        f"{' ' + error if error else ''}): {cause}. Run `omnigent login {normalized}` "
+        "to re-authenticate; hosts using this credential stay offline until then."
+    )
+    _logger.warning("%s", message)
+    status = _update_refresh_status(
+        normalized,
+        state="refused",
+        http_status=resp.status_code,
+        error=error or None,
+        message=message,
+        failure=True,
+    )
+    _maybe_alert(normalized, "refresh_refused", message, status, log_level=logging.ERROR)
+
+
+def _record_transient_failure(normalized: str, problem: str) -> None:
+    status = _update_refresh_status(
+        normalized,
+        state="unreachable",
+        http_status=None,
+        error=problem[:200],
+        message=f"Token refresh against {normalized} failing transiently: {problem[:200]}",
+        failure=True,
+    )
+    failures = status.get("consecutive_failures", 0)
+    if isinstance(failures, int) and failures >= _UNREACHABLE_ALERT_THRESHOLD:
+        _maybe_alert(
+            normalized,
+            "refresh_unreachable",
+            f"Token refresh against {normalized} has failed transiently {failures} times "
+            f"in a row (last: {problem[:200]}); the stored credential is kept.",
+            status,
+            log_level=logging.WARNING,
+        )
+
+
+def _record_success(normalized: str, refresh_expires_at: float | None) -> None:
+    warn_seconds = _refresh_expiry_warn_seconds()
+    remaining = None if refresh_expires_at is None else refresh_expires_at - time.time()
+    expiring = remaining is not None and remaining < warn_seconds
+    message = "ok"
+    if expiring and remaining is not None and refresh_expires_at is not None:
+        expires_on = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(refresh_expires_at))
+        message = (
+            f"The refresh grant for {normalized} expires on {expires_on} "
+            f"(in {remaining / 86400:.1f} days). Run `omnigent login {normalized}` "
+            "before then or hosts using it go offline."
+        )
+    status = _update_refresh_status(
+        normalized,
+        state="expiring" if expiring else "ok",
+        http_status=200,
+        error=None,
+        message=message,
+        failure=False,
+        refresh_expires_at=refresh_expires_at,
+    )
+    if expiring:
+        _maybe_alert(normalized, "refresh_expiring", message, status, log_level=logging.WARNING)
+
+
+def _refresh_expiry_warn_seconds() -> float:
+    raw = os.environ.get(REFRESH_EXPIRY_WARN_DAYS_ENV, "").strip()
+    try:
+        days = float(raw) if raw else _DEFAULT_REFRESH_EXPIRY_WARN_DAYS
+    except ValueError:
+        days = _DEFAULT_REFRESH_EXPIRY_WARN_DAYS
+    if not math.isfinite(days) or days < 0:
+        days = _DEFAULT_REFRESH_EXPIRY_WARN_DAYS
+    return days * 86400.0
+
+
+def _refresh_status_path() -> Path:
+    return _token_file_path().with_name(_REFRESH_STATUS_FILE_NAME)
+
+
+def load_refresh_status(server_url: str) -> dict[str, Any] | None:
+    """Return the recorded refresh health for a server, if any.
+
+    :param server_url: The server URL.
+    :returns: The status record (``state`` is ``ok``, ``expiring``,
+        ``refused`` or ``unreachable``), or ``None``.
+    """
+    path = _refresh_status_path()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    record = data.get(_normalize_server_url(server_url))
+    return record if isinstance(record, dict) else None
+
+
+def _update_refresh_status(
+    normalized: str,
+    *,
+    state: str,
+    http_status: int | None,
+    error: str | None,
+    message: str,
+    failure: bool,
+    refresh_expires_at: float | None = None,
+) -> dict[str, Any]:
+    """Merge one refresh outcome into the status file; never raises."""
+    path = _refresh_status_path()
+    data: dict[str, Any] = {}
+    try:
+        loaded = json.loads(path.read_text())
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        data = {}
+    previous = data.get(normalized)
+    record: dict[str, Any] = dict(previous) if isinstance(previous, dict) else {}
+    now = time.time()
+    record.update(
+        {
+            "state": state,
+            "updated_at": now,
+            "http_status": http_status,
+            "error": error,
+            "message": message,
+        }
+    )
+    if failure:
+        record["last_failure_at"] = now
+        failures = record.get("consecutive_failures", 0)
+        record["consecutive_failures"] = (failures if isinstance(failures, int) else 0) + 1
+    else:
+        record["last_success_at"] = now
+        record["consecutive_failures"] = 0
+        record["refresh_expires_at"] = refresh_expires_at
+        # A healthy refresh clears suppression for failure alerts.
+        alerted = record.get("alerted")
+        if isinstance(alerted, dict):
+            for kind in ("refresh_refused", "refresh_unreachable"):
+                alerted.pop(kind, None)
+    data[normalized] = record
+    try:
+        _write_tokens_file(path, data)
+    except OSError as exc:
+        _logger.debug("Could not record refresh status for %s: %s", normalized, exc)
+    return record
+
+
+def _maybe_alert(
+    normalized: str, kind: str, message: str, status: dict[str, Any], *, log_level: int
+) -> None:
+    """Emit an operator alert for *kind*, at most once per repeat interval."""
+    alerted = status.get("alerted")
+    if not isinstance(alerted, dict):
+        alerted = {}
+    last = alerted.get(kind)
+    now = time.time()
+    if isinstance(last, (int, float)) and now - last < _ALERT_REPEAT_SECONDS:
+        return
+    alerted[kind] = now
+    status["alerted"] = alerted
+    _logger.log(log_level, "omnigent auth alert kind=%s server=%s: %s", kind, normalized, message)
+    _persist_alert_marker(normalized, alerted)
+    _run_alert_hook(kind, normalized, message)
+
+
+def _persist_alert_marker(normalized: str, alerted: dict[str, Any]) -> None:
+    path = _refresh_status_path()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict) or not isinstance(data.get(normalized), dict):
+        return
+    data[normalized]["alerted"] = alerted
+    with contextlib.suppress(OSError):
+        _write_tokens_file(path, data)
+
+
+def _run_alert_hook(kind: str, normalized: str, message: str) -> None:
+    """Start :data:`AUTH_ALERT_COMMAND_ENV` detached, if configured.
+
+    The hook gets the alert in ``OMNIGENT_AUTH_ALERT_KIND``/``_SERVER``/
+    ``_MESSAGE``; it never receives token material. Failures only log.
+    """
+    command = os.environ.get(AUTH_ALERT_COMMAND_ENV, "").strip()
+    if not command:
+        return
+    try:
+        argv = shlex.split(command)
+        if not argv:
+            return
+        from omnigent.runner.identity import strip_runner_auth_secrets
+
+        env = {
+            **strip_runner_auth_secrets(os.environ),
+            "OMNIGENT_AUTH_ALERT_KIND": kind,
+            "OMNIGENT_AUTH_ALERT_SERVER": normalized,
+            "OMNIGENT_AUTH_ALERT_MESSAGE": message,
+        }
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, ValueError) as exc:
+        _logger.warning("Auth alert hook %s could not start: %s", AUTH_ALERT_COMMAND_ENV, exc)
 
 
 def _coerce_expires_in(raw: object) -> float:
