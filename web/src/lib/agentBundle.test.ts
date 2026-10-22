@@ -87,7 +87,7 @@ describe("buildAgentBundle", () => {
     );
 
     expect(yaml).toContain('environment_profile: "team-python@42"');
-    expect(yaml).toContain('    write_paths: []');
+    expect(yaml).toContain("    write_paths: []");
   });
 
   it("uses the catalog read-write policy for any profile reference", async () => {
