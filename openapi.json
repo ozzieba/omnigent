@@ -6324,6 +6324,18 @@
             "description": "Immutable server-published profile revision selected when this session was created, e.g. `workspace-readonly@1`.",
             "title": "Environment Profile"
           },
+          "environment_runtime_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Immutable managed-host runtime image catalog revision resolved by the server, or `None` when no managed image was selected.",
+            "title": "Environment Runtime Ref"
+          },
           "external_session_id": {
             "anyOf": [
               {
