@@ -8628,15 +8628,27 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     bridge_dir.mkdir()
     monkeypatch.setattr(forwarder, "_FORWARD_LOOP_STALL_DEADLINE_S", 0.2)
     ensure_calls: list[int] = []
-    real_ensure = forwarder._ensure_hook_state
 
-    async def _stalls_on_first_call(*args: Any, **kwargs: Any) -> Any:
+    # Exercise poll cancellation without starting unrelated filesystem jobs.
+    async def _stalls_until_cancelled(*args: Any, **kwargs: Any) -> Any:
         ensure_calls.append(len(ensure_calls) + 1)
-        if len(ensure_calls) == 1:
-            await asyncio.Event().wait()
-        return await real_ensure(*args, **kwargs)
+        await asyncio.Event().wait()
 
-    monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_on_first_call)
+    monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_until_cancelled)
+
+    from omnigent.cli_auth import open_server_client
+
+    transport = httpx.MockTransport(lambda _request: httpx.Response(202, json={}))
+
+    def _open_client(server_url: str, **kwargs: Any) -> httpx.AsyncClient:
+        return open_server_client(server_url, transport=transport, **kwargs)
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", _open_client)
+
+    # Keep the real warning and traceback in caplog without rendering the
+    # unrelated Rich console traceback synchronously in the poll task.
+    monkeypatch.setattr(forwarder._logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(forwarder._logger, "propagate", False)
 
     with caplog.at_level(logging.WARNING, logger="omnigent.claude_native_forwarder"):
         task = asyncio.create_task(

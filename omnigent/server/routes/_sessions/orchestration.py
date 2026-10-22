@@ -25,6 +25,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.db.db_models import current_workspace_id, uuid_to_bytes
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.debug_logging import debug_event
 from omnigent.entities import (
@@ -93,6 +94,7 @@ from omnigent.runtime.policies.builder import (
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.subagent_block_notifier import WakeDeliveryUnknown
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
@@ -112,6 +114,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.host_admission import AsyncAdmission, guarded_operation
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
@@ -346,6 +349,7 @@ from omnigent.stores.conversation_store import (
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.host_admission_store import Refused
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
@@ -7151,6 +7155,7 @@ async def _wake_parent_for_blocked_child(
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    host_admission: AsyncAdmission | None = None,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -7196,24 +7201,28 @@ async def _wake_parent_for_blocked_child(
             child.id,
         )
         return False
-    # Ensure the parent's SSE relay is live so the wake turn's output is
-    # persisted (parity with post_event).
-    _ensure_runner_relay(
-        parent_id,
-        parent_conv.runner_id,
-        runner_client,
-        conversation_store,
-    )
-    body = SessionEventInput(
-        type="message",
-        data={
-            "role": "user",
-            "content": [{"type": "input_text", "text": notice}],
-        },
-    )
-    try:
-        # None args: a system notice carries no agent/files/artifacts; the runner
-        # recomputes has_mcp_servers from the parent's cached spec.
+    binding = None
+    if host_admission is not None and parent_conv.host_id is not None:
+        try:
+            binding = await host_admission.binding_for_host(
+                current_workspace_id(), uuid_to_bytes(parent_conv.host_id).hex()
+            )
+        except (Refused, TimeoutError, ValueError):
+            return False
+
+    invoked = False
+
+    async def invoke() -> bool:
+        nonlocal invoked
+        invoked = True
+        _ensure_runner_relay(parent_id, parent_conv.runner_id, runner_client, conversation_store)
+        body = SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": notice}],
+            },
+        )
         await _dispatch_session_event_to_runner(
             parent_id,
             parent_conv,
@@ -7225,7 +7234,21 @@ async def _wake_parent_for_blocked_child(
             artifact_store=None,
             runner_router=runner_router,
         )
-    except (httpx.HTTPError, OmnigentError):
+        return True
+
+    try:
+        if binding is None:
+            return await invoke()
+        return await guarded_operation(host_admission, binding, "input", invoke)
+    except Refused as exc:
+        if binding is None:
+            raise
+        if invoked:
+            raise WakeDeliveryUnknown("HOST_WAKE_UNRESOLVED") from exc
+        return False
+    except (httpx.HTTPError, OmnigentError) as exc:
+        if binding is not None:
+            raise WakeDeliveryUnknown("HOST_WAKE_UNRESOLVED") from exc
         _logger.warning(
             "subagent block wake POST failed for parent=%s child=%s",
             parent_id,
@@ -7233,12 +7256,17 @@ async def _wake_parent_for_blocked_child(
             exc_info=True,
         )
         return False
-    return True
+    except Exception as exc:
+        if binding is not None:
+            raise WakeDeliveryUnknown("HOST_WAKE_UNRESOLVED") from exc
+        raise
 
 
 def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    *,
+    host_admission: AsyncAdmission | None = None,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -7282,6 +7310,7 @@ def configure_subagent_block_notifier(
             notice,
             conversation_store=conversation_store,
             runner_router=runner_router,
+            host_admission=host_admission,
         )
 
     notifier = SubagentBlockNotifier(

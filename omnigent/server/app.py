@@ -59,6 +59,8 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.host_admission import AsyncAdmission
+from omnigent.server.host_admission_integration import HostAdmissionIntegration
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -1044,6 +1046,8 @@ def create_app(
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
+    host_admission: AsyncAdmission | None = None,
+    host_maintenance_ready: Callable[[], bool] | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1161,10 +1165,21 @@ def create_app(
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
+    :param host_admission: Optional bounded adapter on the host store's canonical
+        engine. The application lifespan owns its close; the caller retains the
+        engine if close fails. No schema changes or enrollment are automatic.
+    :param host_maintenance_ready: Trusted server-owned coverage predicate.
+        Defaults to false; requests and server_config cannot enable maintenance.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
     """
+    _host_admission = HostAdmissionIntegration(
+        adapter=host_admission,
+        host_store=host_store,
+        auth_provider=auth_provider,
+        maintenance_ready=host_maintenance_ready,
+    )
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
@@ -1278,209 +1293,212 @@ def create_app(
         """
         # Bump AnyIO default thread limiter from 40 → 200; every
         # ``asyncio.to_thread`` and FastAPI sync route grabs one.
-        from anyio import to_thread as _to_thread
+        async with _host_admission.lifespan():
+            from anyio import to_thread as _to_thread
 
-        _to_thread.current_default_thread_limiter().total_tokens = 200
+            _to_thread.current_default_thread_limiter().total_tokens = 200
 
-        # Initialise usage telemetry (fire-and-forget; no-op when disabled).
-        from omnigent.telemetry import init_client as _init_telemetry
+            # Initialise usage telemetry (fire-and-forget; no-op when disabled).
+            from omnigent.telemetry import init_client as _init_telemetry
 
-        _init_telemetry(config=server_config)
+            _init_telemetry(config=server_config)
 
-        # Apply OMNIGENT_LOG_LEVEL to the omnigent namespace after
-        # uvicorn's dictConfig runs (dictConfig resets existing handlers,
-        # making a pre-run basicConfig call ineffective).
-        import os as _os
+            # Apply OMNIGENT_LOG_LEVEL to the omnigent namespace after
+            # uvicorn's dictConfig runs (dictConfig resets existing handlers,
+            # making a pre-run basicConfig call ineffective).
+            import os as _os
 
-        _log_level_name = _os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
-        logging.getLogger("omnigent").setLevel(getattr(logging, _log_level_name, logging.INFO))
+            _log_level_name = _os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
+            logging.getLogger("omnigent").setLevel(getattr(logging, _log_level_name, logging.INFO))
 
-        harness_pm = HarnessProcessManager()
-        await harness_pm.start()
-        # Store on both ``app.state`` (canonical, accessible from
-        # routes) AND a runtime-module global (workflows access it
-        # via ``get_harness_process_manager()`` because workflows
-        # can't easily receive non-serializable args).
-        app_inst.state.harness_process_manager = harness_pm
-        set_harness_process_manager(harness_pm)
+            harness_pm = HarnessProcessManager()
+            await harness_pm.start()
+            # Store on both ``app.state`` (canonical, accessible from
+            # routes) AND a runtime-module global (workflows access it
+            # via ``get_harness_process_manager()`` because workflows
+            # can't easily receive non-serializable args).
+            app_inst.state.harness_process_manager = harness_pm
+            set_harness_process_manager(harness_pm)
 
-        set_runner_router(runner_router)
+            set_runner_router(runner_router)
 
-        # Wake a blocked sub-agent's immediate parent: hooks
-        # ``pending_elicitations.record_publish`` to post a ``[System: …]``
-        # notice to the parent's ``/events``. Uninstalled at teardown so a
-        # fresh app instance doesn't inherit a prior run's observer (matters
-        # for multi-app test setups).
-        from omnigent.server.routes.sessions import (
-            configure_subagent_block_notifier,
-        )
+            # Wake a blocked sub-agent's immediate parent: hooks
+            # ``pending_elicitations.record_publish`` to post a ``[System: …]``
+            # notice to the parent's ``/events``. Uninstalled at teardown so a
+            # fresh app instance doesn't inherit a prior run's observer (matters
+            # for multi-app test setups).
+            from omnigent.server.routes.sessions import (
+                configure_subagent_block_notifier,
+            )
 
-        _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
-            conversation_store,
-            runner_router,
-        )
+            _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
+                conversation_store,
+                runner_router,
+                host_admission=_host_admission.adapter,
+            )
 
-        from omnigent.runner.resource_registry import (
-            SessionResourceRegistry,
-        )
-        from omnigent.runtime import set_resource_registry
+            from omnigent.runner.resource_registry import (
+                SessionResourceRegistry,
+            )
+            from omnigent.runtime import set_resource_registry
 
-        resource_reg = SessionResourceRegistry(
-            terminal_registry=get_terminal_registry(),
-        )
-        set_resource_registry(resource_reg)
+            resource_reg = SessionResourceRegistry(
+                terminal_registry=get_terminal_registry(),
+            )
+            set_resource_registry(resource_reg)
 
-        # Install the tunnel-backed WS factory so browser terminal
-        # attach can proxy frames over the same persistent WebSocket
-        # the runner already uses for HTTP.
-        from omnigent.server._runner_ws_tunnel import (
-            make_direct_attach_resolver,
-            make_tunnel_ws_factory,
-        )
+            # Install the tunnel-backed WS factory so browser terminal
+            # attach can proxy frames over the same persistent WebSocket
+            # the runner already uses for HTTP.
+            from omnigent.server._runner_ws_tunnel import (
+                make_direct_attach_resolver,
+                make_tunnel_ws_factory,
+            )
 
-        set_runner_ws_factory(make_tunnel_ws_factory(runner_router, tunnel_registry))
-        # Companion resolver: lets the terminals API surface a runner's
-        # advertised loopback attach endpoint so a browser on the same
-        # machine can skip the relay entirely.
-        set_runner_direct_attach_resolver(
-            make_direct_attach_resolver(runner_router, tunnel_registry)
-        )
+            set_runner_ws_factory(make_tunnel_ws_factory(runner_router, tunnel_registry))
+            # Companion resolver: lets the terminals API surface a runner's
+            # advertised loopback attach endpoint so a browser on the same
+            # machine can skip the relay entirely.
+            set_runner_direct_attach_resolver(
+                make_direct_attach_resolver(runner_router, tunnel_registry)
+            )
 
-        # MCP execution moved to the runner (designs/RUNNER_MCP.md);
-        # SessionFilesystemRegistry moved to the runner. Both
-        # warmup blocks deleted here.
+            # MCP execution moved to the runner (designs/RUNNER_MCP.md);
+            # SessionFilesystemRegistry moved to the runner. Both
+            # warmup blocks deleted here.
 
-        _ensure_default_agents(agent_store, artifact_store, agent_cache)
+            _ensure_default_agents(agent_store, artifact_store, agent_cache)
 
-        # Populate the policy registry (builtins + user-configured
-        # modules) so GET /v1/policy-registry serves the catalog.
-        from omnigent.policies.registry import load_registry
+            # Populate the policy registry (builtins + user-configured
+            # modules) so GET /v1/policy-registry serves the catalog.
+            from omnigent.policies.registry import load_registry
 
-        load_registry(extra_modules=policy_modules)
+            load_registry(extra_modules=policy_modules)
 
-        # Accounts first-run: open the browser after uvicorn has bound
-        # the port. bootstrap_admin sets open_url to the loopback base
-        # URL on a needs-setup boot so the browser lands on the
-        # Create-admin form. Gated on (a) bootstrap asked for an open,
-        # and (b) the auto-open env var is truthy (default ON; CLI
-        # passes OMNIGENT_ACCOUNTS_AUTO_OPEN=0 for --no-open). Broad
-        # try so a missing display / browser never blocks startup.
-        if _bootstrap_result is not None and _bootstrap_result.open_url:
-            from omnigent.server.auth import env_var_is_truthy
+            # Accounts first-run: open the browser after uvicorn has bound
+            # the port. bootstrap_admin sets open_url to the loopback base
+            # URL on a needs-setup boot so the browser lands on the
+            # Create-admin form. Gated on (a) bootstrap asked for an open,
+            # and (b) the auto-open env var is truthy (default ON; CLI
+            # passes OMNIGENT_ACCOUNTS_AUTO_OPEN=0 for --no-open). Broad
+            # try so a missing display / browser never blocks startup.
+            if _bootstrap_result is not None and _bootstrap_result.open_url:
+                from omnigent.server.auth import env_var_is_truthy
 
-            if env_var_is_truthy("OMNIGENT_ACCOUNTS_AUTO_OPEN", default=True):
-                import webbrowser
+                if env_var_is_truthy("OMNIGENT_ACCOUNTS_AUTO_OPEN", default=True):
+                    import webbrowser
 
+                    try:
+                        webbrowser.open(_bootstrap_result.open_url)
+                    except Exception as exc:  # noqa: BLE001
+                        _logger.warning(
+                            "accounts: auto-open browser failed (%s) — open the "
+                            "server URL in a browser instead",
+                            exc,
+                        )
+
+            metrics_publish_task = asyncio.create_task(
+                publish_server_metrics_periodically(
+                    server_metrics,
+                    otel_publisher=server_metrics_otel,
+                )
+            )
+            # Runner ``runner_last_seen`` is refreshed per-tunnel from each
+            # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
+            # that handler's ``workspace_scope`` — not from a lifespan sweep,
+            # which would run context-free (default workspace) over a
+            # workspace-blind registry and never stamp a multi-tenant row.
+
+            # Recurring-task scheduler: arm a timer per active
+            # scheduled task and fire the injected ``on_fire`` callback on
+            # schedule. The callback (see scheduled.fire) re-reads the row,
+            # creates + owner-grants a session, launches its runner, and records
+            # the run — all fire-and-forget so the timer re-arms immediately.
+            scheduled_task_scheduler: ScheduledTaskScheduler | None = None
+            if scheduled_task_store is not None:
+                from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+
+                fire_deps = FireDeps(
+                    scheduled_task_store=scheduled_task_store,
+                    agent_store=agent_store,
+                    conversation_store=conversation_store,
+                    permission_store=permission_store,
+                    policy_store=policy_store,
+                    host_store=host_store,
+                    host_registry=host_registry,
+                    agent_cache=agent_cache,
+                    runner_router=runner_router,
+                    tunnel_registry=tunnel_registry,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                    project_store=project_store,
+                )
+                on_fire = build_on_fire(fire_deps)
+                # The manual "run now" trigger reuses the same fire path (dispatch /
+                # preflight / in-flight guard) as the scheduler; it only differs in
+                # allowing a paused task to fire. Exposed on app.state for the
+                # POST /v1/scheduled-tasks/{id}/run route.
+                app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
+                scheduled_task_scheduler = ScheduledTaskScheduler(
+                    store=scheduled_task_store,
+                    on_fire=on_fire,
+                )
+                app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
+                # Scheduled tasks are a non-critical subsystem: a failure loading the
+                # schedule (e.g. a DB error listing active tasks) must not take
+                # down server boot. Log and continue with the scheduler unstarted.
                 try:
-                    webbrowser.open(_bootstrap_result.open_url)
-                except Exception as exc:  # noqa: BLE001
-                    _logger.warning(
-                        "accounts: auto-open browser failed (%s) — open the "
-                        "server URL in a browser instead",
+                    await scheduled_task_scheduler.start()
+                except Exception as exc:
+                    _logger.exception(
+                        "scheduled task scheduler failed to start; continuing "
+                        "without recurring tasks (%s)",
                         exc,
                     )
 
-        metrics_publish_task = asyncio.create_task(
-            publish_server_metrics_periodically(
-                server_metrics,
-                otel_publisher=server_metrics_otel,
-            )
-        )
-        # Runner ``runner_last_seen`` is refreshed per-tunnel from each
-        # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
-        # that handler's ``workspace_scope`` — not from a lifespan sweep,
-        # which would run context-free (default workspace) over a
-        # workspace-blind registry and never stamp a multi-tenant row.
+                # Run completion is event-driven (persist_scheduled_run_completion
+                # fires from _publish_status the instant a fired conversation's turn
+                # ends — no poll). The only orphan backstop is a lazy-on-read
+                # force-fail of stale ``running`` runs on the scheduled-task read
+                # endpoints (see routes/scheduled_tasks.py); there is no startup
+                # sweep and no periodic reconcile.
 
-        # Recurring-task scheduler: arm a timer per active
-        # scheduled task and fire the injected ``on_fire`` callback on
-        # schedule. The callback (see scheduled.fire) re-reads the row,
-        # creates + owner-grants a session, launches its runner, and records
-        # the run — all fire-and-forget so the timer re-arms immediately.
-        scheduled_task_scheduler: ScheduledTaskScheduler | None = None
-        if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
-
-            fire_deps = FireDeps(
-                scheduled_task_store=scheduled_task_store,
-                agent_store=agent_store,
-                conversation_store=conversation_store,
-                permission_store=permission_store,
-                policy_store=policy_store,
-                host_store=host_store,
-                host_registry=host_registry,
-                agent_cache=agent_cache,
-                runner_router=runner_router,
-                tunnel_registry=tunnel_registry,
-                file_store=file_store,
-                artifact_store=artifact_store,
-                project_store=project_store,
-            )
-            on_fire = build_on_fire(fire_deps)
-            # The manual "run now" trigger reuses the same fire path (dispatch /
-            # preflight / in-flight guard) as the scheduler; it only differs in
-            # allowing a paused task to fire. Exposed on app.state for the
-            # POST /v1/scheduled-tasks/{id}/run route.
-            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
-            scheduled_task_scheduler = ScheduledTaskScheduler(
-                store=scheduled_task_store,
-                on_fire=on_fire,
-            )
-            app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
-            # Scheduled tasks are a non-critical subsystem: a failure loading the
-            # schedule (e.g. a DB error listing active tasks) must not take
-            # down server boot. Log and continue with the scheduler unstarted.
             try:
-                await scheduled_task_scheduler.start()
-            except Exception as exc:
-                _logger.exception(
-                    "scheduled task scheduler failed to start; continuing "
-                    "without recurring tasks (%s)",
-                    exc,
-                )
+                yield
+            finally:
+                # Run completion is event-driven (the _publish_status hook) plus a
+                # lazy-on-read stale backstop — there is no run-reconciler task to
+                # cancel. Only the per-job scheduler holds timers that need stopping.
+                if scheduled_task_scheduler is not None:
+                    scheduled_task_scheduler.stop()
+                metrics_publish_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await metrics_publish_task
+                # Stop in-flight background managed-sandbox launches so a
+                # slow provision doesn't outlive the ASGI shutdown (the
+                # sandbox itself, if already provisioned, is reaped by the
+                # provider lifetime cap — see the hook's docstring).
+                from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
-            # Run completion is event-driven (persist_scheduled_run_completion
-            # fires from _publish_status the instant a fired conversation's turn
-            # ends — no poll). The only orphan backstop is a lazy-on-read
-            # force-fail of stale ``running`` runs on the scheduled-task read
-            # endpoints (see routes/scheduled_tasks.py); there is no startup
-            # sweep and no periodic reconcile.
+                await cancel_managed_launch_tasks()
+                await background_title_coordinator.shutdown()
+                _uninstall_subagent_block_notifier()
+                set_resource_registry(None)
+                set_runner_ws_factory(None)
+                set_runner_direct_attach_resolver(None)
+                set_runner_router(None)
+                await runner_router.aclose()
 
-        try:
-            yield
-        finally:
-            # Run completion is event-driven (the _publish_status hook) plus a
-            # lazy-on-read stale backstop — there is no run-reconciler task to
-            # cancel. Only the per-job scheduler holds timers that need stopping.
-            if scheduled_task_scheduler is not None:
-                scheduled_task_scheduler.stop()
-            metrics_publish_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await metrics_publish_task
-            # Stop in-flight background managed-sandbox launches so a
-            # slow provision doesn't outlive the ASGI shutdown (the
-            # sandbox itself, if already provisioned, is reaped by the
-            # provider lifetime cap — see the hook's docstring).
-            from omnigent.server.routes.sessions import cancel_managed_launch_tasks
-
-            await cancel_managed_launch_tasks()
-            await background_title_coordinator.shutdown()
-            _uninstall_subagent_block_notifier()
-            set_resource_registry(None)
-            set_runner_ws_factory(None)
-            set_runner_direct_attach_resolver(None)
-            set_runner_router(None)
-            await runner_router.aclose()
-
-            set_harness_process_manager(None)
-            await harness_pm.shutdown()
-            await get_terminal_registry().shutdown()
-            # Shut down all AP-side MCP connections opened by the proxy
-            # endpoint. Best-effort — individual close failures are logged
-            # inside shutdown_all().
-            await _mcp_pool.shutdown_all()
+                set_harness_process_manager(None)
+                await harness_pm.shutdown()
+                await get_terminal_registry().shutdown()
+                # Shut down all AP-side MCP connections opened by the proxy
+                # endpoint. Best-effort — individual close failures are logged
+                # inside shutdown_all().
+                await _mcp_pool.shutdown_all()
 
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    _host_admission.install(app)
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)

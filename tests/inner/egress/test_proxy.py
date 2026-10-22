@@ -1611,6 +1611,7 @@ async def _proxied_http_request(
     method: str,
     authorization: str | None = None,
     extra_headers: str = "",
+    path: str = "/probe",
 ) -> bytes:
     """Send one plain-HTTP request of an arbitrary method through the proxy.
 
@@ -1625,12 +1626,13 @@ async def _proxied_http_request(
         to omit the header (the swap-on-access client shape).
     :param extra_headers: Additional header lines, each CRLF-terminated,
         inserted verbatim before the ``Connection: close`` line.
+    :param path: Request path sent to the upstream.
     :returns: The raw response bytes the client received from the proxy.
     """
     reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
     auth_line = f"Authorization: {authorization}\r\n" if authorization is not None else ""
     request = (
-        f"{method} http://127.0.0.1:{upstream_port}/probe HTTP/1.1\r\n"
+        f"{method} http://127.0.0.1:{upstream_port}{path} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{upstream_port}\r\n"
         f"{auth_line}"
         f"{extra_headers}"
@@ -2044,6 +2046,7 @@ async def test_credential_not_injected_on_loopback_method(
         synthetic=None,
         username=None,
     )
+    request_path = f"/credential-not-injected/{uuid.uuid4().hex}"
     captured: list[_CapturedRequest] = []
     upstream = await _start_capturing_upstream(captured)
     upstream_port = upstream.sockets[0].getsockname()[1]
@@ -2064,6 +2067,7 @@ async def test_credential_not_injected_on_loopback_method(
             proxy_port=proxy_port,
             upstream_port=upstream_port,
             method=method,
+            path=request_path,
             authorization=None,
         )
     finally:
@@ -2072,10 +2076,13 @@ async def test_credential_not_injected_on_loopback_method(
         await upstream.wait_closed()
 
     assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
-    assert len(captured) == 1
-    assert captured[0].method == method
+    own_requests = [
+        request for request in captured if (request.target or "").endswith(request_path)
+    ]
+    assert len(own_requests) == 1
+    assert own_requests[0].method == method
     # The real credential was NOT injected on the loopback/diagnostic verb.
-    assert captured[0].authorization is None
+    assert own_requests[0].authorization is None
     assert b"real-secret-value" not in response
 
 
