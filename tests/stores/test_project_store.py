@@ -51,6 +51,23 @@ def test_create_returns_project(store: SqlAlchemyProjectStore) -> None:
     assert project.updated_at is None
 
 
+def _is_lock_refusal(dialect: str, error: OperationalError) -> bool:
+    """Whether *error* is the database refusing a write because a row lock is held."""
+    orig = error.orig
+    if dialect == "sqlite":
+        return (
+            isinstance(orig, sqlite3.OperationalError)
+            and orig.sqlite_errorcode == sqlite3.SQLITE_BUSY
+        )
+    if dialect == "postgresql":
+        # 55P03 = lock_not_available (lock_timeout expired).
+        return getattr(orig, "sqlstate", None) == "55P03"
+    if dialect == "mysql":
+        # 1205 = ER_LOCK_WAIT_TIMEOUT.
+        return bool(orig is not None and orig.args and orig.args[0] == 1205)
+    return False
+
+
 @pytest.mark.parametrize(
     ("initial_routing", "admin_routing"),
     [
@@ -63,6 +80,9 @@ def test_admin_routing_write_cannot_land_between_ordinary_read_and_flush(
     initial_routing: dict[str, str],
     admin_routing: dict[str, str],
 ) -> None:
+    dialect = store._engine.dialect.name
+    if dialect not in ("sqlite", "postgresql", "mysql"):
+        pytest.skip(f"no row-lock timeout setup for dialect {dialect!r}")
     project = store.create(_uid("routing-race"), "Routing race", "alice", initial_routing)
     workspace_id = current_workspace_id()
     observed: list[str] = []
@@ -74,7 +94,16 @@ def test_admin_routing_write_cannot_land_between_ordinary_read_and_flush(
         if not any(isinstance(row, SqlProject) for row in session.dirty):
             return
         with store._engine.connect() as connection:
-            connection.exec_driver_sql("PRAGMA busy_timeout = 0")
+            # The store holds a write lock on the project row from its initial
+            # read until commit (SQLite: BEGIN IMMEDIATE; Postgres/MySQL:
+            # SELECT ... FOR UPDATE). A competing writer must therefore be
+            # refused. Fail fast instead of waiting out the default lock timeout.
+            if dialect == "sqlite":
+                connection.exec_driver_sql("PRAGMA busy_timeout = 0")
+            elif dialect == "postgresql":
+                connection.exec_driver_sql("SET lock_timeout = '200ms'")
+            else:
+                connection.exec_driver_sql("SET SESSION innodb_lock_wait_timeout = 1")
             try:
                 connection.execute(
                     statement.values(config=json.dumps(admin_routing) if admin_routing else None)
@@ -82,8 +111,7 @@ def test_admin_routing_write_cannot_land_between_ordinary_read_and_flush(
                 connection.commit()
                 observed.append("committed")
             except OperationalError as error:
-                assert isinstance(error.orig, sqlite3.OperationalError)
-                assert error.orig.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                assert _is_lock_refusal(dialect, error), error
                 observed.append("blocked")
 
     event.listen(Session, "before_flush", interleave)
