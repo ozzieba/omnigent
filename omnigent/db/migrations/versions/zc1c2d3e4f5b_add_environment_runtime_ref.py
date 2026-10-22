@@ -1,7 +1,7 @@
 """Persist the resolved managed-host image catalog revision.
 
 Revision ID: zc1c2d3e4f5b
-Revises: zr7a1c3e5b90
+Revises: za4b5c6d7e8f
 Create Date: 2026-09-23 00:00:00.000000
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "zc1c2d3e4f5b"
-down_revision: str | Sequence[str] | None = "zr7a1c3e5b90"
+down_revision: str | Sequence[str] | None = "za4b5c6d7e8f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
