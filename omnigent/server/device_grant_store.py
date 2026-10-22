@@ -23,6 +23,7 @@ See ``designs/DEVICE_AUTH.md`` for the full flow and threat model.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import secrets
@@ -30,8 +31,15 @@ from typing import cast
 
 from sqlalchemy import and_, delete, or_, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.orm import InstrumentedAttribute, Session
+from sqlalchemy.sql.elements import ColumnElement
 
-from omnigent.db.db_models import SqlDeviceGrant, SqlDeviceGrantSession, current_workspace_id
+from omnigent.db.db_models import (
+    SqlDeviceGrant,
+    SqlDeviceGrantRetiredRefreshToken,
+    SqlDeviceGrantSession,
+    current_workspace_id,
+)
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
 from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
 from omnigent.entities import DeviceGrant
@@ -50,6 +58,35 @@ def hash_secret(secret: str, key: bytes) -> str:
     :returns: Hex-encoded HMAC-SHA256 digest (64 chars).
     """
     return hmac.new(key, secret.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+_SUCCESSOR_DOMAIN = b"omnigent/refresh-token-successor/v1"
+
+
+def derive_successor_refresh_token(token: str, *, grant_id: str, key: bytes) -> str:
+    """Return the deterministic successor of a rotating refresh token.
+
+    Deriving the successor (instead of drawing it at random) makes rotation
+    idempotent: a client retrying a refresh whose response was lost receives
+    the same new token, and a server whose rotation commit was rolled back
+    re-issues the token the client may already hold. Only a holder of
+    ``token`` (or of the server key) can compute it.
+
+    :param token: The raw refresh token being rotated out.
+    :param grant_id: The grant the token belongs to (domain separation).
+    :param key: HMAC key — the server's ``cookie_secret``.
+    :returns: A URL-safe token with 256 bits of HMAC output.
+    """
+    message = b"\0".join((_SUCCESSOR_DOMAIN, grant_id.encode("utf-8"), token.encode("utf-8")))
+    digest = hmac.new(key, message, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _same_or_null(
+    column: InstrumentedAttribute[str | None], value: str | None
+) -> ColumnElement[bool]:
+    """SQL predicate ``column IS NOT DISTINCT FROM value`` for nullable digests."""
+    return column.is_(None) if value is None else column == value
 
 
 def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
@@ -402,9 +439,10 @@ class DeviceGrantStore:
         *,
         refresh_token_hash: str,
         now_epoch_seconds: int,
+        next_refresh_token_hash: str | None = None,
     ) -> DeviceGrant | None:
         """Atomically transition ``approved`` → ``redeemed`` and store the
-        first refresh-token digest.
+        first refresh-token digest (and its deterministic successor's).
 
         A single ``UPDATE … WHERE status = approved`` + rowcount check
         guarantees the device_code is exchanged for tokens at most once,
@@ -429,6 +467,7 @@ class DeviceGrantStore:
                     .values(
                         status=encode_device_grant_status("redeemed"),
                         refresh_token_hash=refresh_token_hash,
+                        next_refresh_token_hash=next_refresh_token_hash,
                     )
                 ),
             )
@@ -445,34 +484,38 @@ class DeviceGrantStore:
         new_hash: str,
         now_epoch_seconds: int,
         max_lifetime_seconds: int,
+        next_hash: str | None = None,
     ) -> DeviceGrant | None:
         """Atomically rotate the refresh token.
 
         The ``WHERE refresh_token_hash = expected_hash`` clause is the
         reuse-detection lock: only the holder of the *current* refresh
         token can rotate it. A client presenting an already-rotated
-        token will not match (rowcount 0) — the caller looks it up via
-        :meth:`get_by_prev_refresh_hash` and, on a hit, revokes the
-        grant as a theft signal.
+        token will not match (rowcount 0) — the caller then checks the
+        reuse-grace window (:meth:`match_grace_replay`) and otherwise
+        revokes the grant as a theft signal.
 
         An absolute-lifetime clause (``approved_at > now - max_lifetime``)
         refuses rotation once the grant is older than
         ``max_lifetime_seconds``, so a delegated grant cannot refresh
-        forever — the user must re-consent. This is distinct from reuse:
-        the caller only reaches this method when the presented token is the
-        current one (``get_by_refresh_hash`` matched), so a ``None`` return
-        here means "aged out," not "replayed," and must not revoke.
+        forever — the user must re-consent. A ``None`` return for an aged
+        grant means "aged out," not "replayed," and must not revoke.
 
-        The just-superseded token's digest is preserved in
-        ``prev_refresh_token_hash`` precisely so that replay can be
-        detected. Only a ``redeemed`` (live) grant can rotate; a revoked
-        or denied grant will not match.
+        In the same transaction the superseded token's digest moves to
+        ``prev_refresh_token_hash`` (stamped with ``prev_rotated_at``) and
+        the digest it displaces there is retired, so any older token stays
+        recognisable as reuse. ``next_hash`` records the new token's
+        deterministic successor for lost-commit recovery.
 
         Returns the grant with the new token stored, or ``None`` on a
         stale/mismatched/expired token.
         """
         min_approved_at = now_epoch_seconds - max_lifetime_seconds
         with self._session("rotate_refresh_token") as session:
+            row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            if row is None or row.refresh_token_hash != expected_hash:
+                return None
+            displaced_prev = row.prev_refresh_token_hash
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -483,16 +526,163 @@ class DeviceGrantStore:
                             SqlDeviceGrant.id == grant_id,
                             SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
                             SqlDeviceGrant.refresh_token_hash == expected_hash,
+                            _same_or_null(SqlDeviceGrant.prev_refresh_token_hash, displaced_prev),
                             SqlDeviceGrant.approved_at > min_approved_at,
                         )
                     )
-                    .values(refresh_token_hash=new_hash, prev_refresh_token_hash=expected_hash)
+                    .values(
+                        refresh_token_hash=new_hash,
+                        prev_refresh_token_hash=expected_hash,
+                        prev_rotated_at=now_epoch_seconds,
+                        next_refresh_token_hash=next_hash,
+                    )
+                    .execution_options(synchronize_session=False)
                 ),
             )
             if result.rowcount == 0:
                 return None
+            self._retire(session, grant_id, displaced_prev, now_epoch_seconds)
+            session.expire(row)
             row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
             return _to_device_grant(row) if row is not None else None
+
+    def match_grace_replay(
+        self,
+        refresh_token_hash: str,
+        *,
+        successor_hash: str,
+        now_epoch_seconds: int,
+        grace_seconds: int,
+    ) -> DeviceGrant | None:
+        """Return the grant if this is a retried refresh inside the grace window.
+
+        Matches only a live grant whose *previous* token is the presented
+        one, superseded at most ``grace_seconds`` ago, and whose current
+        token is still that token's deterministic successor (no newer
+        rotation happened). The caller re-issues that same successor, so the
+        replay is idempotent and needs no write. Read-only.
+        """
+        if grace_seconds <= 0:
+            return None
+        with self._session("select_device_grant_refresh_grace_replay") as session:
+            row = (
+                session.query(SqlDeviceGrant)
+                .filter(
+                    SqlDeviceGrant.workspace_id == current_workspace_id(),
+                    SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                    SqlDeviceGrant.prev_refresh_token_hash == refresh_token_hash,
+                    SqlDeviceGrant.refresh_token_hash == successor_hash,
+                    SqlDeviceGrant.prev_rotated_at.isnot(None),
+                    SqlDeviceGrant.prev_rotated_at >= now_epoch_seconds - grace_seconds,
+                )
+                .one_or_none()
+            )
+            return _to_device_grant(row) if row is not None else None
+
+    def get_by_next_refresh_hash(self, refresh_token_hash: str) -> DeviceGrant | None:
+        """Look up a live grant whose current token's successor is this one.
+
+        A hit means the presented token was issued by a rotation whose
+        commit was lost (e.g. rolled back by an async replica promotion).
+        """
+        with self._session("select_device_grant_by_next_refresh_hash") as session:
+            row = (
+                session.query(SqlDeviceGrant)
+                .filter(
+                    SqlDeviceGrant.workspace_id == current_workspace_id(),
+                    SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                    SqlDeviceGrant.next_refresh_token_hash == refresh_token_hash,
+                )
+                .one_or_none()
+            )
+            return _to_device_grant(row) if row is not None else None
+
+    def roll_forward_rotation(
+        self,
+        grant_id: str,
+        *,
+        presented_hash: str,
+        new_hash: str,
+        next_hash: str | None,
+        now_epoch_seconds: int,
+        max_lifetime_seconds: int,
+    ) -> DeviceGrant | None:
+        """Re-apply a lost rotation, then rotate the presented successor.
+
+        ``presented_hash`` must equal the grant's ``next_refresh_token_hash``:
+        the client holds the token a rolled-back rotation issued. The
+        stored current token and previous token are both retired, the
+        presented token becomes the previous one (so its own retries get the
+        grace window), and ``new_hash`` becomes current. Atomic: the update
+        is conditioned on the exact row state read in the same transaction.
+        """
+        min_approved_at = now_epoch_seconds - max_lifetime_seconds
+        with self._session("roll_forward_refresh_rotation") as session:
+            row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            if row is None or row.next_refresh_token_hash != presented_hash:
+                return None
+            displaced_current = row.refresh_token_hash
+            displaced_prev = row.prev_refresh_token_hash
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlDeviceGrant)
+                    .where(
+                        and_(
+                            SqlDeviceGrant.workspace_id == current_workspace_id(),
+                            SqlDeviceGrant.id == grant_id,
+                            SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                            SqlDeviceGrant.next_refresh_token_hash == presented_hash,
+                            _same_or_null(SqlDeviceGrant.refresh_token_hash, displaced_current),
+                            _same_or_null(SqlDeviceGrant.prev_refresh_token_hash, displaced_prev),
+                            SqlDeviceGrant.approved_at > min_approved_at,
+                        )
+                    )
+                    .values(
+                        refresh_token_hash=new_hash,
+                        prev_refresh_token_hash=presented_hash,
+                        prev_rotated_at=now_epoch_seconds,
+                        next_refresh_token_hash=next_hash,
+                    )
+                    .execution_options(synchronize_session=False)
+                ),
+            )
+            if result.rowcount == 0:
+                return None
+            self._retire(session, grant_id, displaced_current, now_epoch_seconds)
+            self._retire(session, grant_id, displaced_prev, now_epoch_seconds)
+            session.expire(row)
+            row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
+            return _to_device_grant(row) if row is not None else None
+
+    def get_by_retired_refresh_hash(self, refresh_token_hash: str) -> DeviceGrant | None:
+        """Look up the grant that once held this (now retired) refresh token.
+
+        Any hit is a replay of a token older than the grant's previous one,
+        which the caller treats as theft. Returns the grant in any status.
+        """
+        with self._session("select_device_grant_by_retired_refresh_hash") as session:
+            retired = session.get(
+                SqlDeviceGrantRetiredRefreshToken,
+                (current_workspace_id(), refresh_token_hash),
+            )
+            if retired is None:
+                return None
+            row = session.get(SqlDeviceGrant, (current_workspace_id(), retired.grant_id))
+            return _to_device_grant(row) if row is not None else None
+
+    @staticmethod
+    def _retire(session: Session, grant_id: str, token_hash: str | None, now: int) -> None:
+        """Record a superseded refresh-token digest (idempotent)."""
+        if token_hash is None:
+            return
+        key = (current_workspace_id(), token_hash)
+        if session.get(SqlDeviceGrantRetiredRefreshToken, key) is None:
+            session.add(
+                SqlDeviceGrantRetiredRefreshToken(
+                    token_hash=token_hash, grant_id=grant_id, retired_at=now
+                )
+            )
 
     def get_by_prev_refresh_hash(self, refresh_token_hash: str) -> DeviceGrant | None:
         """Look up a live grant whose *previous* refresh token was this one.
@@ -539,6 +729,8 @@ class DeviceGrantStore:
                         status=encode_device_grant_status("revoked"),
                         refresh_token_hash=None,
                         prev_refresh_token_hash=None,
+                        prev_rotated_at=None,
+                        next_refresh_token_hash=None,
                     )
                 ),
             )
@@ -559,7 +751,11 @@ class DeviceGrantStore:
             return decode_device_grant_status(row.status) == "revoked"
 
     def purge_expired(
-        self, now_epoch_seconds: int, *, max_lifetime_seconds: int | None = None
+        self,
+        now_epoch_seconds: int,
+        *,
+        max_lifetime_seconds: int | None = None,
+        retention_seconds: int = 0,
     ) -> int:
         """Delete grants that can no longer yield a usable token.
 
@@ -568,12 +764,14 @@ class DeviceGrantStore:
         - ``pending`` / ``denied`` rows whose ``device_code`` window has
           passed (``expires_at <= now``) — they can never be redeemed.
         - When ``max_lifetime_seconds`` is given, ``redeemed`` / ``revoked``
-          rows older than that absolute lifetime — their refresh tokens are
-          already refused by :meth:`rotate_refresh_token`, so the rows are
-          dead weight.
+          rows older than that absolute lifetime plus ``retention_seconds``.
+          Retention keeps an aged-out row around long enough for its client
+          to be told ``expired_token`` (re-login) instead of an opaque
+          ``invalid_grant``. Retired refresh-token digests past the same
+          cutoff go with them.
 
         A live ``redeemed`` grant (within its lifetime) is always kept.
-        Returns rows deleted.
+        Returns grant rows deleted.
         """
         conds = [
             and_(
@@ -586,8 +784,9 @@ class DeviceGrantStore:
                 ),
             )
         ]
+        cutoff: int | None = None
         if max_lifetime_seconds is not None:
-            cutoff = now_epoch_seconds - max_lifetime_seconds
+            cutoff = now_epoch_seconds - max_lifetime_seconds - max(0, retention_seconds)
             conds.append(
                 and_(
                     SqlDeviceGrant.status.in_(
@@ -612,4 +811,15 @@ class DeviceGrantStore:
                     )
                 ),
             )
+            if cutoff is not None:
+                # A retired digest is never newer than its grant's lifetime end.
+                session.execute(
+                    delete(SqlDeviceGrantRetiredRefreshToken).where(
+                        and_(
+                            SqlDeviceGrantRetiredRefreshToken.workspace_id
+                            == current_workspace_id(),
+                            SqlDeviceGrantRetiredRefreshToken.retired_at <= cutoff,
+                        )
+                    )
+                )
             return result.rowcount

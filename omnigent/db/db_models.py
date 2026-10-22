@@ -586,6 +586,12 @@ class SqlDeviceGrant(OmnigentBase):
     last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     capability_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     approved_by_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Epoch seconds when ``prev_refresh_token_hash`` was superseded; bounds the
+    # window in which a retried refresh of that token is answered idempotently.
+    prev_rotated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Digest of the current token's deterministic successor, so a successor
+    # whose rotation commit was lost (replica promotion) can be rolled forward.
+    next_refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),
@@ -598,6 +604,35 @@ class SqlDeviceGrant(OmnigentBase):
         # digest; index both so those paths stay point lookups.
         Index("ix_device_grants_refresh_hash", "workspace_id", "refresh_token_hash"),
         Index("ix_device_grants_prev_refresh_hash", "workspace_id", "prev_refresh_token_hash"),
+        Index("ix_device_grants_next_refresh_hash", "workspace_id", "next_refresh_token_hash"),
+    )
+
+
+class SqlDeviceGrantRetiredRefreshToken(OmnigentBase):
+    """Digests of refresh tokens older than a grant's previous token.
+
+    A rotating grant keeps its current and previous token digests on the
+    grant row; every token rotated out past that lands here so replaying it
+    is recognised as reuse and revokes the whole grant family. Rows are
+    purged once older than the grant lifetime plus retention.
+    """
+
+    __tablename__ = "device_grant_retired_refresh_tokens"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    grant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    retired_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index("ix_device_grant_retired_refresh_tokens_grant", "workspace_id", "grant_id"),
+        Index("ix_device_grant_retired_refresh_tokens_retired_at", "workspace_id", "retired_at"),
     )
 
 

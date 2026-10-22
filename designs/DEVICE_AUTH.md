@@ -224,7 +224,8 @@ mount is gated. This router also **owns** `mint_delegated_token` and
     the stored hash, **rotate** it (issue new, invalidate old), mint a new
     access token. Refuses rotation past the 30-day absolute lifetime
     (`expired_token`). **Reuse detection**: presenting an already-rotated
-    refresh token revokes the whole grant (token-theft signal).
+    refresh token revokes the whole grant (token-theft signal), with a short
+    **reuse-grace window** for retried requests (see *Rotation resilience*).
 - `POST /oauth/revoke` — revoke a grant: null the refresh token, mark revoked
   (the `grant_id` then reads as revoked in the denylist check). Accepts a
   `refresh_token`, or falls back to the `grant_id` on the caller's own bearer
@@ -245,6 +246,7 @@ atomic single-use redemption, `purge_expired`. New table `device_grants`:
 | `status`             | `pending` / `approved` / `denied` / `redeemed` / `revoked` |
 | `user_id`            | bound Omnigent identity, set at approval           |
 | `refresh_token_hash` / `prev_refresh_token_hash` | current + prior digest (rotation + reuse detection) |
+| `prev_rotated_at` / `next_refresh_token_hash` | when the prior digest was superseded (grace window); digest of the current token's deterministic successor (lost-commit recovery) |
 | `created_at` / `expires_at` / `approved_at` / `last_polled_at` | TTL, absolute-lifetime clock, `slow_down` timing |
 
 ### Token claims and validation (`auth.py`, `device_auth.py`)
@@ -297,7 +299,7 @@ HS256 shape (so `_check_cookie` accepts them) plus four delegated-only claims:
 | 5 | Compromised Slack server acts as all users (inherent to delegation) | Reduced scope (no admin), short TTL + refresh rotation, per-grant revocation, **absolute grant lifetime (30 d) enforced on refresh** so even an un-revoked grant dies, and an `act`-claim audit trail. |
 | 6 | Confused deputy — user A's token used for user B | On the Slack side, token lookup is strictly keyed by acting `slack_user_id`; the thread `owner_user_id` gate drops non-owner follow-ups (`service.py`). |
 | 7 | Stale/leaked delegated token can't be revoked | Per-grant `grant_id` revocation denylist (`is_revoked`, checked every request) makes delegated-token revocation immediate — closes today's stateless-JWT gap for these higher-value tokens. |
-| 8 | Refresh-token theft | Rotation on every use + **reuse detection**: the just-superseded token's digest is retained in `prev_refresh_token_hash`; presenting it (a replay) is recognised and revokes the whole grant, killing the attacker's freshly-rotated token too. |
+| 8 | Refresh-token theft | Rotation on every use + **reuse detection**: the just-superseded token's digest is retained in `prev_refresh_token_hash` and every older one in `device_grant_retired_refresh_tokens`; presenting any of them (a replay) revokes the whole grant, killing the attacker's freshly-rotated token too. The only exception is a retry of the just-superseded token within `OMNIGENT_REFRESH_REUSE_GRACE_SECONDS` (default 120 s, max 600 s, `0` = strict) while its successor is still unused: that returns the same successor, so a stolen token replayed inside the window obtains nothing the legitimate holder lacks, and the first later use of the other copy past the window revokes. |
 | 9 | Transport interception | Require HTTPS for `verification_uri` and all token/bearer traffic; refuse the flow over plaintext except localhost dev. |
 | 10 | Open redirect on the consent login bounce | Reuse `_sanitize_return_to` (OIDC, `routes/auth.py`) / `sanitizeReturnTo` (accounts SPA). Verified both providers reject absolute / `//` targets. |
 | 11 | CSRF on approve/deny if `SameSite=none` is ever enabled | `_require_browser_origin` rejects a **missing** `Origin` on approve/deny (stricter than the shared `require_trusted_origin`, which fail-opens for non-browser clients). These routes are browser-only, so the CSRF defense no longer depends on the cookie's `SameSite`. |
@@ -418,10 +420,50 @@ the stored `{token, user_id, expires_at}` record simply lapsed, default
   refresh/access token is itself the credential, and a CLI renewing its own
   login has no way to carry that secret (gating it made every automatic
   refresh 401 in a Slack-serving deployment).
+- **Expiry visibility** — `/auth/login` (with `issue_refresh`) and every
+  `/oauth/token` refresh return `refresh_token_expires_in`, the seconds left
+  in the grant's absolute lifetime. The CLI stores it as
+  `refresh_expires_at` and warns `OMNIGENT_REFRESH_EXPIRY_WARN_DAYS`
+  (default 7) days ahead, so an unattended host is re-logged in before it
+  silently drops offline.
+- **Refresh health + alerts** — each refresh outcome is recorded in
+  `auth_refresh_status.json` next to the token file (`state` = `ok`,
+  `expiring`, `refused` or `unreachable`; never token material) for
+  watchdogs. Transient failures (connection errors, 5xx, 429) are retried
+  in-call with backoff and never touch the stored credential. A definitive
+  refusal, an approaching expiry, or a long outage logs an
+  `omnigent auth alert kind=...` line and starts
+  `OMNIGENT_AUTH_ALERT_COMMAND` (detached; alert in
+  `OMNIGENT_AUTH_ALERT_KIND`/`_SERVER`/`_MESSAGE`), at most once per kind
+  per six hours.
 - **Housekeeping** — `/oauth/token` opportunistically purges expired and
-  aged-out grants. The device flow purges on `authorize`, which a
+  aged-out grants. Aged-out rows are kept for seven more days so their
+  clients receive `expired_token` (re-login) instead of `invalid_grant`. The device flow purges on `authorize`, which a
   standalone token-router mount does not have, so login-grant rows would
   otherwise accumulate one per login.
+
+### Rotation resilience
+
+Rotating (device) grants must survive the ways a refresh response gets lost:
+
+- **Deterministic successor.** The new refresh token is
+  `HMAC(cookie_secret, "omnigent/refresh-token-successor/v1", grant_id, old)`
+  instead of a random draw, so rotating the same token twice yields the same
+  successor. Only a holder of the old token (or the server key) can compute it.
+- **Commit, then lost response.** The client retries with the old token,
+  which is now `prev_refresh_token_hash`. Within the grace window, and while
+  the current token is still that token's successor, the server re-issues the
+  same successor with a fresh access token; no write, no revocation.
+- **Concurrent double refresh.** One request's conditional `UPDATE` wins; the
+  loser falls through to the same grace check and returns the identical
+  successor, so both responses agree.
+- **Rotation rolled back** (async replica promotion loses the commit). If the
+  client kept the old token, it is current again and rotates to the same
+  successor. If the client kept the new token, it matches
+  `next_refresh_token_hash` (written with the old token) and the lost rotation
+  is rolled forward atomically.
+- **Theft.** The previous token after the window, or any older retired
+  token, revokes the grant family.
 
 ### Known limitation
 
