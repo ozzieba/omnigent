@@ -11206,7 +11206,10 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
     ]
 
 
-def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:
+@pytest.mark.parametrize("window_id", [2, "01a15f09-4b04-71a2-86aa-c48f0333e697"])
+def test_rollout_records_includes_compacted_entry_from_compaction_item(
+    window_id: int | str,
+) -> None:
     """Compaction items emit a Compacted rollout record and discard prior items."""
     items: list[dict[str, Any]] = [
         {
@@ -11238,7 +11241,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
                     "encrypted_content": "gAAAA_encrypted",
                 },
             ],
-            "window_id": 2,
+            "window_id": window_id,
             "response_id": "compact_1",
         },
         {
@@ -11273,7 +11276,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
     compacted_records = [r for r in records if r["type"] == "compacted"]
     assert len(compacted_records) == 1
     cp = compacted_records[0]["payload"]
-    assert cp["window_id"] == 2
+    assert cp["window_id"] == window_id
     assert len(cp["replacement_history"]) == 2
     assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
     # Post-compaction message should still be present

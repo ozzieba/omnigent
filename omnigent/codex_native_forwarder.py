@@ -6767,6 +6767,18 @@ async def _persist_codex_compaction_item(
         f"/v1/sessions/{session_id}/events",
         json={"type": "compaction", "data": data},
     )
+    if resp.status_code == 400 and isinstance(data.get("window_id"), str):
+        # Older servers only accept an integer window_id; current Codex writes
+        # a UUID. Keep the compaction boundary rather than lose the whole item.
+        _logger.warning(
+            "Server rejected string compaction window_id for %s; retrying without it",
+            session_id,
+        )
+        data.pop("window_id")
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "compaction", "data": data},
+        )
     resp.raise_for_status()
 
 
