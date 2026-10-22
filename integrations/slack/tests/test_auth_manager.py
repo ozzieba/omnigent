@@ -362,8 +362,10 @@ class _FakeRotator:
     def __init__(self, result: object) -> None:
         self._result = result
         self.revoked: list[str] = []
+        self.calls = 0
 
     async def refresh(self, refresh_token: str):  # type: ignore[no-untyped-def]
+        self.calls += 1
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
@@ -430,13 +432,18 @@ async def test_rotator_refresh_omitted_retains_previous_refresh_token(tmp_path: 
     assert rec is not None and rec.refresh_token == "keep-me"
 
 
-async def test_rotator_transient_failure_keeps_token(tmp_path: Path) -> None:
+async def test_rotator_transient_failure_keeps_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # A transient failure (network blip / 5xx — no grant_expired marker) must NOT
     # discard a still-valid refresh grant. It raises TokenRefreshTransientError
     # (so the caller keeps the current access token and skips a re-login prompt),
     # and the stored refresh token is untouched.
     from omnigent_slack.omnigent import TokenRefreshTransientError
 
+    monkeypatch.setattr(
+        "omnigent_slack.auth_manager._TRANSIENT_REFRESH_RETRY_DELAYS", (0.0, 0.0, 0.0)
+    )
     store = EncryptedTokenStore(tmp_path / "t.sqlite3", Fernet.generate_key().decode())
     await store.initialize()
     rotator = _FakeRotator(RuntimeError("connection reset"))
@@ -570,3 +577,67 @@ async def test_enrollment_poll_clears_map_slot_on_completion(tmp_path: Path) -> 
     # Let the done-callback run.
     await asyncio.sleep(0.05)
     assert ("T1", "U1", _BASE) not in mgr._login_polls  # type: ignore[attr-defined]
+
+
+async def test_transient_refresh_is_retried_promptly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A rotation whose response was lost is only replayable inside the server's
+    # short reuse-grace window, so a transient failure is retried at once.
+    monkeypatch.setattr(
+        "omnigent_slack.auth_manager._TRANSIENT_REFRESH_RETRY_DELAYS", (0.0, 0.0, 0.0)
+    )
+    store = EncryptedTokenStore(tmp_path / "t.sqlite3", Fernet.generate_key().decode())
+    await store.initialize()
+    rotator = _FakeRotator(RuntimeError("connection reset"))
+    mgr = AuthManager(store, rotator=rotator)  # type: ignore[arg-type]
+    await store.put("T1", "U1", _BASE, access_token="old", refresh_token="r0")
+
+    auth = await mgr.resolve_auth(_BASE, "T1:U1")
+    assert auth is not None
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def refresh(self, refresh_token: str):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("connection reset")
+            return _Pair("new-access", "r1")
+
+        async def revoke(self, token: str) -> None:
+            return None
+
+    flaky = _Flaky()
+    mgr._rotator = flaky  # type: ignore[assignment]
+    assert await auth.refresh(auth.access_token) == "new-access"
+    assert flaky.calls == 3
+    rec = await store.get("T1", "U1", _BASE)
+    assert rec is not None and rec.refresh_token == "r1"
+
+
+@respx.mock
+async def test_device_client_5xx_refresh_keeps_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A 503 from the token endpoint (server restart, DB failover) must not be
+    # mistaken for a dead grant: the stored refresh token survives.
+    from omnigent_slack.omnigent import TokenRefreshTransientError
+
+    monkeypatch.setattr(
+        "omnigent_slack.auth_manager._TRANSIENT_REFRESH_RETRY_DELAYS", (0.0, 0.0, 0.0)
+    )
+    store = EncryptedTokenStore(tmp_path / "t.sqlite3", Fernet.generate_key().decode())
+    await store.initialize()
+    mgr = AuthManager(store)
+    await store.put("T1", "U1", _BASE, access_token="old", refresh_token="still-good")
+    route = respx.post(f"{_BASE}/oauth/token").mock(return_value=httpx.Response(503))
+
+    auth = await mgr.resolve_auth(_BASE, "T1:U1")
+    assert auth is not None
+    with pytest.raises(TokenRefreshTransientError):
+        await auth.refresh(auth.access_token)
+    assert route.call_count == 4
+    rec = await store.get("T1", "U1", _BASE)
+    assert rec is not None and rec.refresh_token == "still-good"

@@ -118,23 +118,23 @@ def test_grace_replay_window_bounds(store: DeviceGrantStore) -> None:
     gid = _redeemed(store)
     r1, _ = _rotate(store, gid, "r0", now=2000)
     kwargs = {"successor_hash": _h(r1), "grace_seconds": 120}
-    assert store.match_grace_replay(_h("r0"), now_epoch_seconds=2120, **kwargs) is not None
-    assert store.match_grace_replay(_h("r0"), now_epoch_seconds=2121, **kwargs) is None
+    assert store.claim_grace_replay(_h("r0"), now_epoch_seconds=2120, **kwargs) is not None
+    assert store.claim_grace_replay(_h("r0"), now_epoch_seconds=2121, **kwargs) is None
     assert (
-        store.match_grace_replay(
+        store.claim_grace_replay(
             _h("r0"), successor_hash=_h("other"), now_epoch_seconds=2001, grace_seconds=120
         )
         is None
     )
     assert (
-        store.match_grace_replay(
+        store.claim_grace_replay(
             _h("r0"), successor_hash=_h(r1), now_epoch_seconds=2001, grace_seconds=0
         )
         is None
     )
     # Once the successor itself rotated, the old token is no longer replayable.
     _rotate(store, gid, r1, now=2010)
-    assert store.match_grace_replay(_h("r0"), now_epoch_seconds=2011, **kwargs) is None
+    assert store.claim_grace_replay(_h("r0"), now_epoch_seconds=2011, **kwargs) is None
 
 
 def test_roll_forward_recovers_rolled_back_rotation(store: DeviceGrantStore) -> None:
@@ -187,7 +187,7 @@ def test_concurrent_rotation_has_one_winner(store: DeviceGrantStore) -> None:
         results = list(pool.map(_attempt, range(4)))
     assert sum(r is not None for r in results) == 1
     assert (
-        store.match_grace_replay(
+        store.claim_grace_replay(
             _h("r0"), successor_hash=_h(r1), now_epoch_seconds=2001, grace_seconds=120
         )
         is not None
@@ -201,7 +201,7 @@ def test_revoke_clears_grace_state(store: DeviceGrantStore) -> None:
     assert store.get_by_prev_refresh_hash(_h("r0")) is None
     assert store.get_by_next_refresh_hash(_h(_succ(r1, gid))) is None
     assert (
-        store.match_grace_replay(
+        store.claim_grace_replay(
             _h("r0"), successor_hash=_h(r1), now_epoch_seconds=2001, grace_seconds=120
         )
         is None
@@ -486,3 +486,103 @@ def test_grace_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     for raw, expected in (("0", 0), ("30", 30), ("-5", 0), ("bogus", 120), ("99999", 600)):
         monkeypatch.setenv("OMNIGENT_REFRESH_REUSE_GRACE_SECONDS", raw)
         assert _refresh_reuse_grace_seconds() == expected
+
+
+def test_grace_replays_are_capped_per_rotation(store: DeviceGrantStore) -> None:
+    """A superseded token is answered at most N times per rotation."""
+    from omnigent.server.device_grant_store import MAX_GRACE_REPLAYS_PER_ROTATION
+
+    gid = _redeemed(store)
+    r1, _ = _rotate(store, gid, "r0", now=2000)
+    kwargs = {"successor_hash": _h(r1), "now_epoch_seconds": 2001, "grace_seconds": 120}
+    for _ in range(MAX_GRACE_REPLAYS_PER_ROTATION):
+        assert store.claim_grace_replay(_h("r0"), **kwargs) is not None
+    assert store.claim_grace_replay(_h("r0"), **kwargs) is None
+    # A new rotation re-arms the budget for its own previous token.
+    r2, _ = _rotate(store, gid, r1, now=2010)
+    assert (
+        store.claim_grace_replay(
+            _h(r1), successor_hash=_h(r2), now_epoch_seconds=2011, grace_seconds=120
+        )
+        is not None
+    )
+
+
+def test_replay_streak_warns_of_shared_token(
+    store: DeviceGrantStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Consecutive rotations that each needed a replay are flagged."""
+    import logging
+
+    gid = _redeemed(store)
+    token, now = "r0", 2000
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.device_grant_store"):
+        for _ in range(4):
+            new, rotated = _rotate(store, gid, token, now=now)
+            assert rotated is not None
+            assert (
+                store.claim_grace_replay(
+                    _h(token), successor_hash=_h(new), now_epoch_seconds=now + 1, grace_seconds=120
+                )
+                is not None
+            )
+            token, now = new, now + 100
+        _rotate(store, gid, token, now=now)
+    assert any("may be shared or stolen" in r.getMessage() for r in caplog.records)
+
+
+def test_streak_resets_after_clean_rotation(
+    store: DeviceGrantStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    gid = _redeemed(store)
+    token, now = "r0", 2000
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.device_grant_store"):
+        for i in range(6):
+            new, _ = _rotate(store, gid, token, now=now)
+            if i % 2 == 0:
+                store.claim_grace_replay(
+                    _h(token), successor_hash=_h(new), now_epoch_seconds=now + 1, grace_seconds=120
+                )
+            token, now = new, now + 100
+    assert not any("may be shared or stolen" in r.getMessage() for r in caplog.records)
+
+
+def test_replay_past_cap_revokes(app: TestClient) -> None:
+    """Hammering the superseded token beyond the replay budget is reuse."""
+    from omnigent.server.device_grant_store import MAX_GRACE_REPLAYS_PER_ROTATION
+
+    r0 = _device_refresh_token(app)
+    r1 = _refresh(app, r0).json()["refresh_token"]
+    for _ in range(MAX_GRACE_REPLAYS_PER_ROTATION):
+        assert _refresh(app, r0).json()["refresh_token"] == r1
+    over = _refresh(app, r0)
+    assert over.status_code == 400 and over.json()["error"] == "invalid_grant"
+    assert _refresh(app, r1).status_code == 400
+
+
+def test_grace_replay_on_aged_grant_says_expired(app: TestClient, clock: _Clock) -> None:
+    """Near the lifetime end a replay must not outlive the grant."""
+    r0 = _device_refresh_token(app)
+    clock.offset = _LIFETIME - 30
+    r1 = _refresh(app, r0)
+    assert r1.status_code == 200, r1.text
+    clock.offset = _LIFETIME + 5
+    replay = _refresh(app, r0)
+    assert replay.status_code == 400 and replay.json()["error"] == "expired_token"
+
+
+def test_concurrent_roll_forward_converges(app: TestClient, tmp_path: Path) -> None:
+    """Two requests presenting the same lost-commit successor both succeed
+    with the same new token."""
+    db = tmp_path / "test.db"
+    r0 = _device_refresh_token(app)
+    gid = _only_grant_id(db)
+    before = _grant_state(db, gid)
+    r1 = _refresh(app, r0).json()["refresh_token"]
+    _restore_grant_state(db, gid, before)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: _refresh(app, r1), range(2)))
+    assert [r.status_code for r in responses] == [200, 200], [r.text for r in responses]
+    assert len({r.json()["refresh_token"] for r in responses}) == 1

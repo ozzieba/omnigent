@@ -518,7 +518,10 @@ def _post_refresh_with_retry(
     deadline = time.monotonic() + timeout
     last_problem = ""
     for attempt in range(_REFRESH_ATTEMPTS):
-        remaining = max(1.0, deadline - time.monotonic())
+        remaining = deadline - time.monotonic()
+        if attempt > 0 and remaining <= 0:
+            break
+        remaining = max(1.0, remaining)
         try:
             resp = httpx.post(
                 f"{normalized}/oauth/token",
@@ -779,8 +782,10 @@ def _run_alert_hook(kind: str, normalized: str, message: str) -> None:
         argv = shlex.split(command)
         if not argv:
             return
+        from omnigent.runner.identity import strip_runner_auth_secrets
+
         env = {
-            **os.environ,
+            **strip_runner_auth_secrets(os.environ),
             "OMNIGENT_AUTH_ALERT_KIND": kind,
             "OMNIGENT_AUTH_ALERT_SERVER": normalized,
             "OMNIGENT_AUTH_ALERT_MESSAGE": message,

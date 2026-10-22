@@ -592,6 +592,10 @@ class SqlDeviceGrant(OmnigentBase):
     # Digest of the current token's deterministic successor, so a successor
     # whose rotation commit was lost (replica promotion) can be rolled forward.
     next_refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Grace replays answered for the current previous token, and how many
+    # consecutive rotations needed one (a sustained streak suggests sharing).
+    prev_replay_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    replay_streak: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),

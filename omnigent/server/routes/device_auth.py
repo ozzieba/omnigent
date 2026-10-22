@@ -659,7 +659,7 @@ def create_oauth_token_router(
         if rotated is None:
             # A concurrent refresh of the same token rotated it first; answer
             # this one idempotently with the same successor if it is eligible.
-            rotated = device_grant_store.match_grace_replay(
+            rotated = device_grant_store.claim_grace_replay(
                 presented_hash,
                 successor_hash=successor_hash,
                 now_epoch_seconds=now,
@@ -680,7 +680,7 @@ def create_oauth_token_router(
         stale = device_grant_store.get_by_prev_refresh_hash(presented_hash)
         if stale is not None:
             successor, successor_hash, _ = _successor(refresh_token, stale.id)
-            replay = device_grant_store.match_grace_replay(
+            replay = device_grant_store.claim_grace_replay(
                 presented_hash,
                 successor_hash=successor_hash,
                 now_epoch_seconds=now,
@@ -689,7 +689,11 @@ def create_oauth_token_router(
             if replay is not None and replay.user_id is not None:
                 if _aged_out(replay, now):
                     return _refused("expired_token", "grant_lifetime_exceeded", replay.id)
-                _logger.info("oauth/token: idempotent refresh replay on grant %s", replay.id)
+                _logger.warning(
+                    "oauth/token: answered a grace replay of the previous refresh token "
+                    "on grant %s (lost response or racing refresh)",
+                    replay.id,
+                )
                 return _token_response(replay, successor, now)
             # Revoke the whole grant so the attacker's rotated token dies too.
             # (Login grants don't rotate, so they never populate the prev hash.)
@@ -710,6 +714,17 @@ def create_oauth_token_router(
                 now_epoch_seconds=now,
                 max_lifetime_seconds=_grant_max_lifetime,
             )
+            if rolled is None:
+                # A concurrent request rolled the same successor forward first;
+                # answer this one with the identical token if still eligible.
+                rolled = device_grant_store.claim_grace_replay(
+                    presented_hash,
+                    successor_hash=successor_hash,
+                    now_epoch_seconds=now,
+                    grace_seconds=_reuse_grace,
+                )
+                if rolled is not None and rolled.user_id is not None:
+                    return _token_response(rolled, successor, now)
             if rolled is None or rolled.user_id is None:
                 return _refused("invalid_grant", "roll_forward_race", lost.id)
             _logger.warning(

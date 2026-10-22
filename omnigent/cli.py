@@ -11981,7 +11981,9 @@ def _accounts_login(server: str) -> None:
         refresh_token=body.get("refresh_token"),
         refresh_expires_at=(
             _time.time() + refresh_expires_in
-            if isinstance(refresh_expires_in, (int, float)) and refresh_expires_in > 0
+            if isinstance(refresh_expires_in, (int, float))
+            and not isinstance(refresh_expires_in, bool)
+            and refresh_expires_in > 0
             else None
         ),
     )

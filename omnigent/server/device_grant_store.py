@@ -26,10 +26,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import secrets
 from typing import cast
 
-from sqlalchemy import and_, delete, or_, update
+from sqlalchemy import and_, delete, func, or_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import InstrumentedAttribute, Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -43,6 +44,15 @@ from omnigent.db.db_models import (
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
 from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
 from omnigent.entities import DeviceGrant
+
+_logger = logging.getLogger(__name__)
+
+# A retried refresh of one superseded token is answered at most this many
+# times; a legitimate client needs one or two (lost response, racing refresh).
+MAX_GRACE_REPLAYS_PER_ROTATION = 5
+# Consecutive rotations that each needed a grace replay before the grant is
+# flagged as possibly shared or stolen (a healthy client almost never replays).
+REPLAY_STREAK_WARNING = 3
 
 
 def hash_secret(secret: str, key: bytes) -> str:
@@ -492,7 +502,7 @@ class DeviceGrantStore:
         reuse-detection lock: only the holder of the *current* refresh
         token can rotate it. A client presenting an already-rotated
         token will not match (rowcount 0) — the caller then checks the
-        reuse-grace window (:meth:`match_grace_replay`) and otherwise
+        reuse-grace window (:meth:`claim_grace_replay`) and otherwise
         revokes the grant as a theft signal.
 
         An absolute-lifetime clause (``approved_at > now - max_lifetime``)
@@ -516,6 +526,7 @@ class DeviceGrantStore:
             if row is None or row.refresh_token_hash != expected_hash:
                 return None
             displaced_prev = row.prev_refresh_token_hash
+            replay_streak = (row.replay_streak or 0) + 1 if (row.prev_replay_count or 0) > 0 else 0
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -535,49 +546,88 @@ class DeviceGrantStore:
                         prev_refresh_token_hash=expected_hash,
                         prev_rotated_at=now_epoch_seconds,
                         next_refresh_token_hash=next_hash,
+                        prev_replay_count=0,
+                        replay_streak=replay_streak,
                     )
                     .execution_options(synchronize_session=False)
                 ),
             )
             if result.rowcount == 0:
                 return None
+            if replay_streak >= REPLAY_STREAK_WARNING:
+                _logger.warning(
+                    "device grant %s: %d consecutive rotations needed a grace replay; "
+                    "the refresh token may be shared or stolen",
+                    grant_id,
+                    replay_streak,
+                )
             self._retire(session, grant_id, displaced_prev, now_epoch_seconds)
             session.expire(row)
             row = session.get(SqlDeviceGrant, (current_workspace_id(), grant_id))
             return _to_device_grant(row) if row is not None else None
 
-    def match_grace_replay(
+    def claim_grace_replay(
         self,
         refresh_token_hash: str,
         *,
         successor_hash: str,
         now_epoch_seconds: int,
         grace_seconds: int,
+        max_replays: int = MAX_GRACE_REPLAYS_PER_ROTATION,
     ) -> DeviceGrant | None:
-        """Return the grant if this is a retried refresh inside the grace window.
+        """Claim an idempotent replay of a just-superseded refresh token.
 
         Matches only a live grant whose *previous* token is the presented
         one, superseded at most ``grace_seconds`` ago, and whose current
         token is still that token's deterministic successor (no newer
-        rotation happened). The caller re-issues that same successor, so the
-        replay is idempotent and needs no write. Read-only.
+        rotation happened). The caller re-issues that same successor.
+        Each claim is counted (bounded by ``max_replays`` per rotation) so a
+        token that keeps needing replays is visible as possibly shared.
         """
         if grace_seconds <= 0:
             return None
-        with self._session("select_device_grant_refresh_grace_replay") as session:
-            row = (
-                session.query(SqlDeviceGrant)
-                .filter(
-                    SqlDeviceGrant.workspace_id == current_workspace_id(),
-                    SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
-                    SqlDeviceGrant.prev_refresh_token_hash == refresh_token_hash,
-                    SqlDeviceGrant.refresh_token_hash == successor_hash,
-                    SqlDeviceGrant.prev_rotated_at.isnot(None),
-                    SqlDeviceGrant.prev_rotated_at >= now_epoch_seconds - grace_seconds,
+        with self._session("claim_device_grant_refresh_grace_replay") as session:
+            for _ in range(3):
+                row = (
+                    session.query(SqlDeviceGrant)
+                    .filter(
+                        SqlDeviceGrant.workspace_id == current_workspace_id(),
+                        SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                        SqlDeviceGrant.prev_refresh_token_hash == refresh_token_hash,
+                        SqlDeviceGrant.refresh_token_hash == successor_hash,
+                        SqlDeviceGrant.prev_rotated_at.isnot(None),
+                        SqlDeviceGrant.prev_rotated_at >= now_epoch_seconds - grace_seconds,
+                    )
+                    .one_or_none()
                 )
-                .one_or_none()
-            )
-            return _to_device_grant(row) if row is not None else None
+                if row is None:
+                    return None
+                count = row.prev_replay_count or 0
+                if count >= max_replays:
+                    return None
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        update(SqlDeviceGrant)
+                        .where(
+                            and_(
+                                SqlDeviceGrant.workspace_id == current_workspace_id(),
+                                SqlDeviceGrant.id == row.id,
+                                SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                                SqlDeviceGrant.prev_refresh_token_hash == refresh_token_hash,
+                                SqlDeviceGrant.refresh_token_hash == successor_hash,
+                                func.coalesce(SqlDeviceGrant.prev_replay_count, 0) == count,
+                            )
+                        )
+                        .values(prev_replay_count=count + 1)
+                        .execution_options(synchronize_session=False)
+                    ),
+                )
+                if result.rowcount == 1:
+                    session.expire(row)
+                    return _to_device_grant(row)
+                session.expire_all()
+            return None
 
     def get_by_next_refresh_hash(self, refresh_token_hash: str) -> DeviceGrant | None:
         """Look up a live grant whose current token's successor is this one.
@@ -643,6 +693,7 @@ class DeviceGrantStore:
                         prev_refresh_token_hash=presented_hash,
                         prev_rotated_at=now_epoch_seconds,
                         next_refresh_token_hash=next_hash,
+                        prev_replay_count=0,
                     )
                     .execution_options(synchronize_session=False)
                 ),
@@ -731,6 +782,8 @@ class DeviceGrantStore:
                         prev_refresh_token_hash=None,
                         prev_rotated_at=None,
                         next_refresh_token_hash=None,
+                        prev_replay_count=None,
+                        replay_streak=None,
                     )
                 ),
             )

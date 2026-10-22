@@ -247,6 +247,7 @@ atomic single-use redemption, `purge_expired`. New table `device_grants`:
 | `user_id`            | bound Omnigent identity, set at approval           |
 | `refresh_token_hash` / `prev_refresh_token_hash` | current + prior digest (rotation + reuse detection) |
 | `prev_rotated_at` / `next_refresh_token_hash` | when the prior digest was superseded (grace window); digest of the current token's deterministic successor (lost-commit recovery) |
+| `prev_replay_count` / `replay_streak` | grace replays answered for the prior digest; consecutive rotations that needed one |
 | `created_at` / `expires_at` / `approved_at` / `last_polled_at` | TTL, absolute-lifetime clock, `slow_down` timing |
 
 ### Token claims and validation (`auth.py`, `device_auth.py`)
@@ -299,7 +300,7 @@ HS256 shape (so `_check_cookie` accepts them) plus four delegated-only claims:
 | 5 | Compromised Slack server acts as all users (inherent to delegation) | Reduced scope (no admin), short TTL + refresh rotation, per-grant revocation, **absolute grant lifetime (30 d) enforced on refresh** so even an un-revoked grant dies, and an `act`-claim audit trail. |
 | 6 | Confused deputy — user A's token used for user B | On the Slack side, token lookup is strictly keyed by acting `slack_user_id`; the thread `owner_user_id` gate drops non-owner follow-ups (`service.py`). |
 | 7 | Stale/leaked delegated token can't be revoked | Per-grant `grant_id` revocation denylist (`is_revoked`, checked every request) makes delegated-token revocation immediate — closes today's stateless-JWT gap for these higher-value tokens. |
-| 8 | Refresh-token theft | Rotation on every use + **reuse detection**: the just-superseded token's digest is retained in `prev_refresh_token_hash` and every older one in `device_grant_retired_refresh_tokens`; presenting any of them (a replay) revokes the whole grant, killing the attacker's freshly-rotated token too. The only exception is a retry of the just-superseded token within `OMNIGENT_REFRESH_REUSE_GRACE_SECONDS` (default 120 s, max 600 s, `0` = strict) while its successor is still unused: that returns the same successor, so a stolen token replayed inside the window obtains nothing the legitimate holder lacks, and the first later use of the other copy past the window revokes. |
+| 8 | Refresh-token theft | Rotation on every use + **reuse detection**: the just-superseded token's digest is retained in `prev_refresh_token_hash` and every older one in `device_grant_retired_refresh_tokens`; presenting any of them (a replay) revokes the whole grant, killing the attacker's freshly-rotated token too. The only exception is a retry of the just-superseded token within `OMNIGENT_REFRESH_REUSE_GRACE_SECONDS` (default 120 s, max 600 s, `0` = strict) while its successor is still unused: that returns the same successor (at most 5 replays per rotation), so a stolen token replayed inside the window obtains nothing the legitimate holder lacks. Residual risk: a thief whose refreshes stay within the window of the victim's can share the grant undetected; every replay is logged at WARNING and three consecutive rotations that each needed one log a "may be shared or stolen" warning. |
 | 9 | Transport interception | Require HTTPS for `verification_uri` and all token/bearer traffic; refuse the flow over plaintext except localhost dev. |
 | 10 | Open redirect on the consent login bounce | Reuse `_sanitize_return_to` (OIDC, `routes/auth.py`) / `sanitizeReturnTo` (accounts SPA). Verified both providers reject absolute / `//` targets. |
 | 11 | CSRF on approve/deny if `SameSite=none` is ever enabled | `_require_browser_origin` rejects a **missing** `Origin` on approve/deny (stricter than the shared `require_trusted_origin`, which fail-opens for non-browser clients). These routes are browser-only, so the CSRF defense no longer depends on the cookie's `SameSite`. |
@@ -463,7 +464,15 @@ Rotating (device) grants must survive the ways a refresh response gets lost:
   `next_refresh_token_hash` (written with the old token) and the lost rotation
   is rolled forward atomically.
 - **Theft.** The previous token after the window, or any older retired
-  token, revokes the grant family.
+  token, revokes the grant family. Clients must therefore never fall back to
+  an older stored token (e.g. one restored from a backup, or a stale copy in
+  another worker after two refreshes): that now revokes rather than failing.
+- **Limits.** Roll-forward looks exactly one rotation ahead. If a replica
+  promotion loses two consecutive rotations, the client's token is unknown
+  and it gets `invalid_grant` (not revoked; a re-login is needed). Clients
+  should retry a transiently failed refresh promptly (the Slack client
+  retries within seconds), since a lost response is only replayable inside
+  the grace window.
 
 ### Known limitation
 

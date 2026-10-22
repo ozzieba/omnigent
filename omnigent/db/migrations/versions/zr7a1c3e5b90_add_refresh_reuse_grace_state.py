@@ -1,6 +1,6 @@
 """Add refresh-token reuse-grace state to device grants.
 
-Additive only: two nullable columns on ``device_grants`` plus a new
+Additive only: four nullable columns on ``device_grants`` plus a new
 ``device_grant_retired_refresh_tokens`` table. Existing rows keep working
 unchanged (NULL means "no rotation recorded yet").
 
@@ -10,6 +10,8 @@ unchanged (NULL means "no rotation recorded yet").
 - ``next_refresh_token_hash``: digest of the current token's deterministic
   successor, so a successor whose rotation commit was lost (async replica
   promotion) is recognised and rolled forward.
+- ``prev_replay_count`` / ``replay_streak``: grace replays answered for the
+  current previous token, and consecutive rotations that needed one.
 - ``device_grant_retired_refresh_tokens``: digests of tokens older than the
   previous one, so replaying any of them revokes the grant family.
 
@@ -37,6 +39,8 @@ def upgrade() -> None:
         "device_grants",
         sa.Column("next_refresh_token_hash", sa.String(length=64), nullable=True),
     )
+    op.add_column("device_grants", sa.Column("prev_replay_count", sa.Integer(), nullable=True))
+    op.add_column("device_grants", sa.Column("replay_streak", sa.Integer(), nullable=True))
     op.create_index(
         "ix_device_grants_next_refresh_hash",
         "device_grants",
@@ -77,5 +81,7 @@ def downgrade() -> None:
     op.drop_index("ix_device_grants_next_refresh_hash", table_name="device_grants")
     # Batched so the downgrade also works on SQLite (no raw DROP COLUMN).
     with op.batch_alter_table("device_grants") as batch_op:
+        batch_op.drop_column("replay_streak")
+        batch_op.drop_column("prev_replay_count")
         batch_op.drop_column("next_refresh_token_hash")
         batch_op.drop_column("prev_rotated_at")
