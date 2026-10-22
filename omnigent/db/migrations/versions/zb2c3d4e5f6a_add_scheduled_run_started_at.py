@@ -1,7 +1,7 @@
 """Track accepted work for scheduled task runs.
 
 Revision ID: zb2c3d4e5f6a
-Revises: zb1c2d3e4f5a
+Revises: zr7a1c3e5b90
 Create Date: 2026-09-29 00:00:00.000000
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "zb2c3d4e5f6a"
-down_revision: str | None = "zb1c2d3e4f5a"
+down_revision: str | None = "zr7a1c3e5b90"
 branch_labels: str | None = None
 depends_on: str | None = None
 
