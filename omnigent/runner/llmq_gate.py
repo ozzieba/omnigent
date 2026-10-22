@@ -17,13 +17,28 @@ semantics: the turn waits for ``retry_after_seconds``.
 
 The gate is active only where the runner's environment names the controller
 (``LLMQ_CONTROLLER_URL``), its credential (``LLMQ_TOKEN_FILE``) and this host's
-llmq actor (``LLMQ_AGENT_ID``); otherwise :func:`GateConfig.from_env` returns
-``None`` and no turn is gated. See designs/CODEX_LLMQ_GATE_AND_TURBO.md.
+llmq actor (``LLMQ_AGENT_ID``) AND the launch's quota route is ``personal-llmq``
+(``OMNIGENT_QUOTA_ROUTE``; a ``work-vertex`` or unclassified launch is never gated);
+otherwise :func:`GateConfig.from_env` returns ``None`` and no turn is gated.
+See designs/CODEX_LLMQ_GATE_AND_TURBO.md.
+
+Reservation lifecycle (llmq has no "usage unmeasured" settlement, and a zero-token
+settlement would be stored as measured usage and feed its token-cost calibration):
+
+* the turn never reached the harness (spawn failure, rejected delivery, interrupt
+  before the first event) -> cancel the reservation, so the lease does not leak;
+* the turn ran and the harness reported real token usage -> settle with it;
+* the turn ran but usage is unknown -> leave the reservation alone. llmq keeps the
+  estimate and counts it until the lease expires, which is how it treats any
+  unfinished native turn. Releasing that estimate needs a coordinated llmq
+  "unmeasured completion" form.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
@@ -34,13 +49,17 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.host.project_attribution import PERSONAL_QUOTA_ROUTE, QUOTA_ROUTE_ENV_VAR
+from omnigent.model_fallbacks import CODEX_DEFAULT_MODEL
+
 _logger = logging.getLogger(__name__)
 
 #: Harness names whose turns run on the Codex subscription.
 CODEX_HARNESSES = frozenset({"codex", "codex-native"})
 #: llmq refusals decided on fresh evidence. Any other refusal fails open.
 REFUSAL_REASONS = frozenset({"credit_safety_margin", "quota_exhausted"})
-_DEFAULT_MODEL = "gpt-6.1-sol"
+#: What the Codex harness itself launches with when nothing names a model.
+_DEFAULT_MODEL = CODEX_DEFAULT_MODEL
 _DEFAULT_WORKSTREAM = "agent-infra"
 _DEFAULT_RECHECK_S = 30.0
 _DEFAULT_MAX_ADMISSION_DELAY_S = 5.0
@@ -58,7 +77,8 @@ class GateConfig:
         no restart.
     :param agent_id: This host's llmq actor, e.g. ``"fleet-p16v"``.
     :param workstream: llmq workstream the turns are booked under.
-    :param default_model: Model sent when the session names none.
+    :param default_model: Model sent when neither the session nor its agent spec
+        names one (the Codex harness's own launch default).
     :param recheck_seconds: How often a held turn asks again.
     :param max_admission_delay_seconds: Cap on honouring llmq's pacing delay
         before dispatching an admitted turn.
@@ -74,8 +94,15 @@ class GateConfig:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> GateConfig | None:
-        """Build the config, or ``None`` when the gate is not provisioned here."""
+        """Build the config, or ``None`` when the gate is not provisioned here.
+
+        Also ``None`` unless the launch's quota route is ``personal-llmq``: the
+        Codex sessions of a ``work-vertex`` (or unclassified) launch must never
+        be metered against the personal llmq.
+        """
         source: Mapping[str, str] = os.environ if env is None else env
+        if (source.get(QUOTA_ROUTE_ENV_VAR) or "").strip() != PERSONAL_QUOTA_ROUTE:
+            return None
         url = (source.get("LLMQ_CONTROLLER_URL") or "").strip().rstrip("/")
         token_file = (source.get("LLMQ_TOKEN_FILE") or "").strip()
         agent_id = (source.get("LLMQ_AGENT_ID") or "").strip()
@@ -108,7 +135,7 @@ class GateConfig:
         """The bearer token, or ``None`` when the file is unreadable or empty."""
         try:
             token = self.token_file.read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return None
         return token or None
 
@@ -215,6 +242,17 @@ def normalize_model(model: str | None, default: str) -> str:
     return value or default
 
 
+def effective_codex_model(model_override: str | None, spec_model: str | None, default: str) -> str:
+    """The Codex model slug llmq is asked about, resolved as the harness resolves it.
+
+    The per-turn ``/model`` override wins, then the agent spec's pinned model, then
+    the harness's launch default. The turn message's ``model`` field is NOT an
+    input: Omnigent fills it with the agent *name* (a display tag), which llmq
+    rejects as an unsupported native model.
+    """
+    return normalize_model(model_override or spec_model, default)
+
+
 def _finite(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -302,41 +340,198 @@ async def admit_codex_turn(
     return decision_from_payload(data)
 
 
+def llmq_usage(raw: object) -> dict[str, int] | None:
+    """Map an Omnigent ``response.completed`` usage object to llmq's native usage.
+
+    Omnigent reports the non-cached input in ``input_tokens`` and cache reads
+    separately; llmq's ``input_tokens`` is the whole turn input with
+    ``cached_input_tokens`` a subset of it. Returns ``None`` unless the harness
+    reported real consumption: an absent object, non-integers, or zero input and
+    output tokens all mean "not measured" (a turn that ran always read input), and
+    must never reach llmq as measured zeros.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+
+    def _count(name: str) -> int | None:
+        value = raw.get(name)
+        if value is None:
+            return 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    fresh, output, cached = (
+        _count("input_tokens"),
+        _count("output_tokens"),
+        _count("cache_read_input_tokens"),
+    )
+    if fresh is None or output is None or cached is None:
+        return None
+    total_input = fresh + cached
+    if total_input + output == 0:
+        return None
+    usage = {"input_tokens": total_input, "output_tokens": output}
+    if cached:
+        usage["cached_input_tokens"] = cached
+    return usage
+
+
+class TurnStreamTap:
+    """Watches a turn's SSE stream for dispatch and measured usage.
+
+    The runner feeds it every chunk of the turn's response while draining it.
+    ``dispatched`` becomes true once the harness produced its first event
+    (``response.created``); ``usage`` holds llmq-shaped usage once a
+    ``response.completed`` carried real token counts. Parsing is best-effort and
+    never raises: a tap that understands nothing leaves both unset, which makes the
+    reservation "ran, usage unknown".
+    """
+
+    _MAX_PENDING = 1 << 20
+
+    def __init__(self) -> None:
+        self.dispatched = False
+        self.usage: dict[str, int] | None = None
+        self._pending = ""
+
+    def feed(self, chunk: bytes | str) -> None:
+        text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk
+        self._pending += text
+        *lines, self._pending = self._pending.split("\n")
+        if len(self._pending) > self._MAX_PENDING:
+            self._pending = ""
+        for line in lines:
+            if line.startswith("data:"):
+                self._event(line[5:].strip())
+
+    def _event(self, payload: str) -> None:
+        if not payload.startswith("{"):
+            return
+        try:
+            event = json.loads(payload)
+        except ValueError:
+            return
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        if kind == "response.created":
+            self.dispatched = True
+        elif kind == "response.completed":
+            self.dispatched = True
+            response = event.get("response")
+            if isinstance(response, dict):
+                measured = llmq_usage(response.get("usage"))
+                if measured is not None:
+                    self.usage = measured
+
+
 async def settle_codex_turn(
     client: httpx.AsyncClient,
     config: GateConfig,
     decision: GateDecision,
     *,
     turn_key: str,
-    usage: Mapping[str, int] | None = None,
-) -> None:
-    """Settle the turn's reservation; zero usage keeps llmq's own estimate."""
+    usage: Mapping[str, int],
+) -> bool:
+    """Settle the turn's reservation with MEASURED usage.
+
+    There is deliberately no default usage: llmq stores whatever is sent as
+    measured tokens, so a placeholder would poison its calibration and zero the
+    charge once measured charging is on. Callers without real counts use
+    :func:`close_codex_turn`, which leaves the reservation alone instead.
+
+    :returns: Whether llmq accepted the settlement.
+    """
     if decision.reservation_id is None:
-        return
+        return False
+    return await _post_reservation(
+        client,
+        config,
+        "settlements",
+        {
+            "turn_key": turn_key,
+            "reservation_id": decision.reservation_id,
+            "usage": dict(usage),
+        },
+    )
+
+
+async def cancel_codex_turn(
+    client: httpx.AsyncClient,
+    config: GateConfig,
+    decision: GateDecision,
+    *,
+    turn_key: str,
+) -> bool:
+    """Release a reservation whose turn never reached the harness.
+
+    :returns: Whether llmq accepted the cancellation.
+    """
+    if decision.reservation_id is None:
+        return False
+    return await _post_reservation(
+        client,
+        config,
+        "cancellations",
+        {"turn_key": turn_key, "reservation_id": decision.reservation_id},
+    )
+
+
+async def _post_reservation(
+    client: httpx.AsyncClient,
+    config: GateConfig,
+    route: str,
+    payload: dict[str, object],
+) -> bool:
     bearer = config.bearer()
     if bearer is None:
-        return
-    payload = {
-        "turn_key": turn_key,
-        "reservation_id": decision.reservation_id,
-        "usage": dict(usage) if usage else {"input_tokens": 0, "output_tokens": 0},
-    }
+        return False
     try:
         resp = await client.post(
-            f"{config.controller_url}/v1/native-turns/settlements",
+            f"{config.controller_url}/v1/native-turns/{route}",
             json=payload,
             headers={"Authorization": f"Bearer {bearer}"},
             timeout=_REQUEST_TIMEOUT_S,
         )
     except httpx.HTTPError:
-        _logger.debug("llmq gate: settlement unreachable for %s", decision.reservation_id)
-        return
+        _logger.debug("llmq gate: %s unreachable for %s", route, payload.get("reservation_id"))
+        return False
     if resp.status_code >= 400:
         _logger.debug(
-            "llmq gate: settlement of %s answered HTTP %s",
-            decision.reservation_id,
+            "llmq gate: %s of %s answered HTTP %s",
+            route,
+            payload.get("reservation_id"),
             resp.status_code,
         )
+        return False
+    return True
+
+
+async def close_codex_turn(
+    client: httpx.AsyncClient,
+    config: GateConfig,
+    decision: GateDecision,
+    *,
+    turn_key: str,
+    tap: TurnStreamTap,
+) -> str:
+    """End an admitted turn's reservation according to what the stream showed.
+
+    :returns: ``"cancelled"`` (the turn never reached the harness),
+        ``"settled"`` (real usage reported), ``"kept"`` (the turn ran but its
+        usage is unknown, so llmq keeps its estimate until the lease expires), or
+        ``"none"`` when there was no reservation or llmq refused the call.
+    """
+    if decision.reservation_id is None:
+        return "none"
+    if not tap.dispatched:
+        ok = await cancel_codex_turn(client, config, decision, turn_key=turn_key)
+        return "cancelled" if ok else "none"
+    if tap.usage is not None:
+        ok = await settle_codex_turn(client, config, decision, turn_key=turn_key, usage=tap.usage)
+        return "settled" if ok else "none"
+    return "kept"
 
 
 StatusCallback = Callable[[GateDecision, bool], Awaitable[None]]
@@ -360,6 +555,9 @@ async def gate_codex_turn(
     for every refusal, for an unverified admission, and for the admission that
     releases a held turn (so the session's blocked state clears).
 
+    If the turn is interrupted (or anything raises) after llmq admitted it but
+    before this returns, the reservation is cancelled so its lease does not leak.
+
     :returns: The final decision and the turn key to settle with.
     """
     key = turn_key(session_id, turn_salt)
@@ -371,12 +569,18 @@ async def gate_codex_turn(
             client, config, turn_key=key, attempt=attempt, model=model, turbo=turbo
         )
         if decision.allow:
-            if decision.admission_delay_seconds > 0:
-                await sleep(
-                    min(decision.admission_delay_seconds, config.max_admission_delay_seconds)
-                )
-            if held or not decision.verified:
-                await on_status(decision, turbo)
+            try:
+                if decision.admission_delay_seconds > 0:
+                    await sleep(
+                        min(decision.admission_delay_seconds, config.max_admission_delay_seconds)
+                    )
+                if held or not decision.verified:
+                    await on_status(decision, turbo)
+            except BaseException:
+                # Admitted but never dispatched: release the lease, shielded so an
+                # interrupt (CancelledError) cannot abort the release itself.
+                await asyncio.shield(cancel_codex_turn(client, config, decision, turn_key=key))
+                raise
             return decision, key
         held = True
         await on_status(decision, turbo)

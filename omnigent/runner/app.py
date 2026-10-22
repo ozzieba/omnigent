@@ -100,9 +100,12 @@ from omnigent.runner.llmq_gate import (
     CODEX_HARNESSES,
     GateConfig,
     GateDecision,
+    TurnStreamTap,
+    close_codex_turn,
+    effective_codex_model,
     gate_codex_turn,
-    normalize_model,
-    settle_codex_turn,
+    turn_key,
+    unverified,
 )
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
@@ -7139,16 +7142,20 @@ def create_runner_app(
         return bool(envelope.snapshot.turbo) if envelope is not None else False
 
     async def _gate_codex_turn_for_session(
-        conv: str, harness_body: _JsonObject
+        conv: str, harness_body: _JsonObject, spec: AgentSpec | None
     ) -> tuple[GateDecision, str] | None:
         config = _llmq_gate_config
         if config is None:
             return None
         from omnigent._native_post_delivery import post_external_session_status
 
-        model = normalize_model(
-            cast(str | None, harness_body.get("model_override"))
-            or cast(str | None, harness_body.get("model")),
+        # The model llmq is asked about is the one the harness will run: the
+        # turn's /model override, else the agent spec's pinned Codex model, else
+        # the harness launch default. ``harness_body["model"]`` is the agent NAME
+        # (a display tag), so it is never an input.
+        model = effective_codex_model(
+            cast(str | None, harness_body.get("model_override")),
+            _codex_native_model_from_spec(spec),
             config.default_model,
         )
 
@@ -7198,17 +7205,42 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv},
             )
-            return None
+            # Fail open WITH the indicator: an unexpected fault is still an
+            # unverified admission the session must show (and it clears a
+            # "blocked" chip left by an earlier hold).
+            failed_open = unverified("gate_error")
+            try:
+                await _on_status(failed_open, await _read_session_turbo(conv))
+            except Exception:  # noqa: BLE001 — the indicator is best-effort too
+                _logger.debug("llmq gate: gate_error indicator failed", exc_info=True)
+            return failed_open, turn_key(conv, "gate-error")
 
-    def _schedule_llmq_settlement(conv: str, gate: tuple[GateDecision, str]) -> None:
+    def _schedule_llmq_close(
+        conv: str, gate: tuple[GateDecision, str], tap: TurnStreamTap
+    ) -> None:
+        """End the admitted turn's llmq reservation off the turn's own task.
+
+        Runs from the turn's ``finally``, so an interrupt (which cancels that task)
+        still releases or settles it; the work is a detached task for that reason.
+        """
         decision, key = gate
         config = _llmq_gate_config
         if config is None or decision.reservation_id is None:
             return
-        task = asyncio.create_task(
-            settle_codex_turn(_llmq_gate_client(), config, decision, turn_key=key),
-            name=f"llmq-settle-{conv}",
-        )
+
+        async def _close() -> None:
+            outcome = await close_codex_turn(
+                _llmq_gate_client(), config, decision, turn_key=key, tap=tap
+            )
+            _logger.info(
+                "llmq gate session=%s reservation %s (%s)",
+                conv,
+                outcome,
+                decision.reservation_id,
+                extra={"session_id": conv},
+            )
+
+        task = asyncio.create_task(_close(), name=f"llmq-close-{conv}")
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
 
@@ -7659,48 +7691,60 @@ def create_runner_app(
             )
 
         _llmq_gate: tuple[GateDecision, str] | None = None
+        _llmq_tap = TurnStreamTap()
         if harness_name in CODEX_HARNESSES:
-            _llmq_gate = await _gate_codex_turn_for_session(conv, harness_body)
+            _llmq_gate = await _gate_codex_turn_for_session(conv, harness_body, cached_spec)
         try:
-            response = await _stream_message_to_harness(
-                harness_body,
-                conv,
-                dispatch=ctx,
-            )
+            try:
+                response = await _stream_message_to_harness(
+                    harness_body,
+                    conv,
+                    dispatch=ctx,
+                )
+            finally:
+                _session_init_envelopes.pop(conv, None)
+            if isinstance(response, StreamingResponse):
+                await _drain_streaming_response(
+                    response,
+                    conv,
+                    observe=_llmq_tap.feed if _llmq_gate is not None else None,
+                )
+            else:
+                err_detail = "harness returned error response"
+                if hasattr(response, "body"):
+                    with contextlib.suppress(
+                        UnicodeDecodeError,
+                        AttributeError,
+                    ):
+                        err_detail = bytes(response.body).decode(
+                            "utf-8",
+                        )[:200]
+                _logger.error(
+                    "turn bg error for %s: %s",
+                    conv,
+                    err_detail,
+                    extra={"session_id": conv},
+                )
+                _on_proxy_stream_end(
+                    conv,
+                    error={"message": err_detail},
+                )
         finally:
-            _session_init_envelopes.pop(conv, None)
-        if isinstance(response, StreamingResponse):
-            await _drain_streaming_response(response, conv)
+            # Every exit (done, harness error, spawn failure, interrupt) ends the
+            # admitted reservation: cancel it when the harness was never reached,
+            # settle it when real usage was reported, else leave llmq's estimate.
             if _llmq_gate is not None:
-                _schedule_llmq_settlement(conv, _llmq_gate)
-        else:
-            err_detail = "harness returned error response"
-            if hasattr(response, "body"):
-                with contextlib.suppress(
-                    UnicodeDecodeError,
-                    AttributeError,
-                ):
-                    err_detail = bytes(response.body).decode(
-                        "utf-8",
-                    )[:200]
-            _logger.error(
-                "turn bg error for %s: %s",
-                conv,
-                err_detail,
-                extra={"session_id": conv},
-            )
-            _on_proxy_stream_end(
-                conv,
-                error={"message": err_detail},
-            )
+                _schedule_llmq_close(conv, _llmq_gate, _llmq_tap)
 
     async def _drain_streaming_response(
         response: StreamingResponse,
         session_id: str,
+        observe: Callable[[bytes | str], None] | None = None,
     ) -> None:
         try:
             async for _chunk in response.body_iterator:
-                pass
+                if observe is not None and isinstance(_chunk, (bytes, str)):
+                    observe(_chunk)
         except asyncio.CancelledError:
             # Identity guard (same generation-ownership class as
             # _on_proxy_stream_end and the _run_turn_bg finally floor): the drain

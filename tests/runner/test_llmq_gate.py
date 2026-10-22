@@ -7,6 +7,7 @@ flag, and dispatch once admitted. Settle reservations at turn end.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -17,9 +18,14 @@ import pytest
 from omnigent.runner.llmq_gate import (
     GateConfig,
     GateDecision,
+    TurnStreamTap,
     admit_codex_turn,
+    cancel_codex_turn,
+    close_codex_turn,
     decision_from_payload,
+    effective_codex_model,
     gate_codex_turn,
+    llmq_usage,
     normalize_model,
     settle_codex_turn,
     turn_key,
@@ -46,12 +52,16 @@ class Controller:
         self.answers = answers
         self.requests: list[dict[str, Any]] = []
         self.settlements: list[dict[str, Any]] = []
+        self.cancellations: list[dict[str, Any]] = []
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         if request.url.path.endswith("/settlements"):
             self.settlements.append(body)
             return httpx.Response(200, json={"settlement_id": "s", "status": "settled"})
+        if request.url.path.endswith("/cancellations"):
+            self.cancellations.append(body)
+            return httpx.Response(200, json={"settlement_id": "c", "status": "cancelled"})
         self.requests.append({**body, "_auth": request.headers.get("authorization")})
         answer = self.answers.pop(0)
         if isinstance(answer, Exception):
@@ -88,10 +98,18 @@ def test_gate_is_off_unless_the_runner_env_names_controller_token_and_actor(
 ) -> None:
     assert GateConfig.from_env({}) is None
     assert (
-        GateConfig.from_env({"LLMQ_CONTROLLER_URL": "http://x", "LLMQ_TOKEN_FILE": "/t"}) is None
+        GateConfig.from_env(
+            {
+                "OMNIGENT_QUOTA_ROUTE": "personal-llmq",
+                "LLMQ_CONTROLLER_URL": "http://x",
+                "LLMQ_TOKEN_FILE": "/t",
+            }
+        )
+        is None
     )
     cfg = GateConfig.from_env(
         {
+            "OMNIGENT_QUOTA_ROUTE": "personal-llmq",
             "LLMQ_CONTROLLER_URL": "http://100.87.142.18:17645/",
             "LLMQ_TOKEN_FILE": str(tmp_path / "tok"),
             "LLMQ_AGENT_ID": "fleet-p16v",
@@ -105,6 +123,39 @@ def test_gate_is_off_unless_the_runner_env_names_controller_token_and_actor(
     assert cfg.recheck_seconds == 12.0
     assert cfg.max_admission_delay_seconds == 5.0
     assert cfg.bearer() is None  # unreadable token file: the gate fails open
+
+
+@pytest.mark.parametrize("route", ["work-vertex", "", "personal", "PERSONAL-LLMQ", None])
+def test_gate_is_off_unless_the_launch_route_is_personal_llmq(
+    tmp_path: Path, route: str | None
+) -> None:
+    """A work-vertex (or unclassified) launch is never metered against personal llmq."""
+    env = {
+        "LLMQ_CONTROLLER_URL": "http://100.87.142.18:17645",
+        "LLMQ_TOKEN_FILE": str(tmp_path / "tok"),
+        "LLMQ_AGENT_ID": "fleet-p16v",
+    }
+    if route is not None:
+        env["OMNIGENT_QUOTA_ROUTE"] = route
+    assert GateConfig.from_env(env) is None
+    assert GateConfig.from_env({**env, "OMNIGENT_QUOTA_ROUTE": "personal-llmq"}) is not None
+
+
+def test_a_token_file_that_is_not_text_fails_open(tmp_path: Path) -> None:
+    token = tmp_path / "binary-token"
+    token.write_bytes(b"\xff\xfe\x00bad")
+    assert config(tmp_path, token_file=token).bearer() is None
+
+
+def test_the_model_asked_about_is_the_one_the_harness_runs() -> None:
+    # The turn's /model override wins, then the spec's pinned model, then the default.
+    assert effective_codex_model("gpt-6-astra", "gpt-6.1-sol", "d") == "gpt-6-astra"
+    assert effective_codex_model(None, "codex-subscription/gpt-6-astra", "d") == "gpt-6-astra"
+    assert effective_codex_model("", None, "gpt-6.1-sol") == "gpt-6.1-sol"
+    # The agent name that the server puts in the turn's ``model`` field is not an input,
+    # so there is nothing to pass it as: a session with no override and no spec model
+    # asks llmq about the default.
+    assert effective_codex_model(None, None, "gpt-6.1-sol") == "gpt-6.1-sol"
 
 
 def test_model_slugs_lose_catalog_prefixes() -> None:
@@ -394,31 +445,189 @@ async def test_verified_admission_posts_no_status_and_unverified_posts_one(
     assert statuses == expected
 
 
-# ----------------------------------------------------------------- settlement
+# ----------------------------------------------------------------- reservation lifecycle
+
+ADMITTED = GateDecision(allow=True, verified=True, reason="admitted", reservation_id="res-9")
+UNRESERVED = GateDecision(allow=True, verified=False, reason="llmq_unreachable")
+
+
+def sse(event: dict[str, Any]) -> str:
+    return f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+
+
+COMPLETED_WITH_USAGE = {
+    "type": "response.completed",
+    "response": {
+        "id": "resp_1",
+        "usage": {
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "total_tokens": 650,
+            "cache_read_input_tokens": 500,
+        },
+    },
+}
+
+
+def test_usage_is_mapped_to_llmq_shape_and_only_when_measured() -> None:
+    # Omnigent's input_tokens excludes cache reads; llmq's includes them.
+    assert llmq_usage(COMPLETED_WITH_USAGE["response"]["usage"]) == {  # type: ignore[index]
+        "input_tokens": 620,
+        "output_tokens": 30,
+        "cached_input_tokens": 500,
+    }
+    assert llmq_usage({"input_tokens": 7, "output_tokens": 0}) == {
+        "input_tokens": 7,
+        "output_tokens": 0,
+    }
+    # Not measured: absent, all zero (the Usage default), or malformed.
+    for unmeasured in (
+        None,
+        {},
+        "x",
+        {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0},
+        {"input_tokens": -1, "output_tokens": 5},
+        {"input_tokens": 1.5, "output_tokens": 5},
+        {"input_tokens": True, "output_tokens": 5},
+    ):
+        assert llmq_usage(unmeasured) is None, unmeasured
+
+
+def test_tap_sees_dispatch_and_usage_across_arbitrary_chunking() -> None:
+    stream = (
+        sse({"type": "response.created", "response": {"id": "resp_1"}})
+        + sse({"type": "response.output_text.delta", "delta": "hi"})
+        + sse(COMPLETED_WITH_USAGE)
+    ).encode()
+    for size in (1, 7, 64, len(stream)):
+        tap = TurnStreamTap()
+        for start in range(0, len(stream), size):
+            tap.feed(stream[start : start + size])
+        assert tap.dispatched is True
+        assert tap.usage == {"input_tokens": 620, "output_tokens": 30, "cached_input_tokens": 500}
+
+
+def test_tap_leaves_usage_unset_when_nothing_was_measured() -> None:
+    tap = TurnStreamTap()
+    assert (tap.dispatched, tap.usage) == (False, None)
+    tap.feed("data: not json\n\ndata: [DONE]\n\ndata: {}\n\n")
+    assert (tap.dispatched, tap.usage) == (False, None)
+    tap.feed(sse({"type": "response.created", "response": {"id": "r"}}))
+    tap.feed(
+        sse(
+            {
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": 0, "output_tokens": 0}},
+            }
+        )
+    )
+    assert (tap.dispatched, tap.usage) == (True, None)
 
 
 @pytest.mark.asyncio
-async def test_settlement_posts_zero_usage_for_a_reservation_and_skips_without_one(
-    tmp_path: Path,
-) -> None:
+async def test_settlement_carries_only_the_usage_it_is_given(tmp_path: Path) -> None:
     controller = Controller([])
     async with client_for(controller) as client:
-        await settle_codex_turn(
+        assert await settle_codex_turn(
             client,
             config(tmp_path),
-            GateDecision(allow=True, verified=True, reason="admitted", reservation_id="res-9"),
+            ADMITTED,
             turn_key="b" * 64,
+            usage={"input_tokens": 620, "output_tokens": 30, "cached_input_tokens": 500},
         )
-        await settle_codex_turn(
-            client,
-            config(tmp_path),
-            GateDecision(allow=True, verified=False, reason="llmq_unreachable"),
-            turn_key="b" * 64,
+        assert not await settle_codex_turn(
+            client, config(tmp_path), UNRESERVED, turn_key="b" * 64, usage={"input_tokens": 1}
         )
     assert controller.settlements == [
         {
             "turn_key": "b" * 64,
             "reservation_id": "res-9",
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {"input_tokens": 620, "output_tokens": 30, "cached_input_tokens": 500},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_never_reached_the_harness_is_cancelled(tmp_path: Path) -> None:
+    controller = Controller([])
+    tap = TurnStreamTap()
+    async with client_for(controller) as client:
+        outcome = await close_codex_turn(
+            client, config(tmp_path), ADMITTED, turn_key="c" * 64, tap=tap
+        )
+        none = await close_codex_turn(
+            client, config(tmp_path), UNRESERVED, turn_key="c" * 64, tap=tap
+        )
+    assert (outcome, none) == ("cancelled", "none")
+    assert controller.cancellations == [{"turn_key": "c" * 64, "reservation_id": "res-9"}]
+    assert controller.settlements == []
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_ran_with_measured_usage_is_settled(tmp_path: Path) -> None:
+    controller = Controller([])
+    tap = TurnStreamTap()
+    tap.feed(sse({"type": "response.created", "response": {"id": "r"}}))
+    tap.feed(sse(COMPLETED_WITH_USAGE))
+    async with client_for(controller) as client:
+        outcome = await close_codex_turn(
+            client, config(tmp_path), ADMITTED, turn_key="d" * 64, tap=tap
+        )
+    assert outcome == "settled"
+    assert controller.settlements[0]["usage"]["input_tokens"] == 620
+    assert controller.cancellations == []
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_ran_with_unknown_usage_is_never_settled_with_placeholder_zeros(
+    tmp_path: Path,
+) -> None:
+    """llmq would store {0, 0} as measured tokens (and zero the charge); keep its estimate."""
+    controller = Controller([])
+    tap = TurnStreamTap()
+    tap.feed(sse({"type": "response.created", "response": {"id": "r"}}))  # then interrupted
+    async with client_for(controller) as client:
+        outcome = await close_codex_turn(
+            client, config(tmp_path), ADMITTED, turn_key="e" * 64, tap=tap
+        )
+    assert outcome == "kept"
+    assert controller.settlements == [] and controller.cancellations == []
+
+
+@pytest.mark.asyncio
+async def test_interrupt_between_admission_and_dispatch_cancels_the_reservation(
+    tmp_path: Path,
+) -> None:
+    controller = Controller([admitted(admission_delay_seconds=3.0)])
+
+    async def on_status(decision: GateDecision, turbo: bool) -> None:
+        raise AssertionError("verified admissions post nothing")
+
+    async def read_turbo() -> bool:
+        return False
+
+    async def sleep(seconds: float) -> None:
+        raise asyncio.CancelledError  # the user interrupts during llmq's pacing delay
+
+    async with client_for(controller) as client:
+        with pytest.raises(asyncio.CancelledError):
+            await gate_codex_turn(
+                client,
+                config(tmp_path),
+                session_id="conv_a",
+                turn_salt="4",
+                model="gpt-6.1-sol",
+                read_turbo=read_turbo,
+                on_status=on_status,
+                sleep=sleep,
+            )
+    assert [c["reservation_id"] for c in controller.cancellations] == ["res-1"]
+    assert controller.cancellations[0]["turn_key"] == turn_key("conv_a", "4")
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_a_reservation_posts_nothing(tmp_path: Path) -> None:
+    controller = Controller([])
+    async with client_for(controller) as client:
+        assert not await cancel_codex_turn(client, config(tmp_path), UNRESERVED, turn_key="f" * 64)
+    assert controller.cancellations == []
