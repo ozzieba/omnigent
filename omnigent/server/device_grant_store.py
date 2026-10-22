@@ -30,7 +30,7 @@ import logging
 import secrets
 from typing import cast
 
-from sqlalchemy import and_, delete, func, or_, update
+from sqlalchemy import and_, case, delete, func, or_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import InstrumentedAttribute, Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -526,7 +526,6 @@ class DeviceGrantStore:
             if row is None or row.refresh_token_hash != expected_hash:
                 return None
             displaced_prev = row.prev_refresh_token_hash
-            replay_streak = (row.replay_streak or 0) + 1 if (row.prev_replay_count or 0) > 0 else 0
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -547,13 +546,23 @@ class DeviceGrantStore:
                         prev_rotated_at=now_epoch_seconds,
                         next_refresh_token_hash=next_hash,
                         prev_replay_count=0,
-                        replay_streak=replay_streak,
+                        # Evaluated against the committed row, so a replay
+                        # claimed just before this rotation is not missed.
+                        replay_streak=case(
+                            (
+                                func.coalesce(SqlDeviceGrant.prev_replay_count, 0) > 0,
+                                func.coalesce(SqlDeviceGrant.replay_streak, 0) + 1,
+                            ),
+                            else_=0,
+                        ),
                     )
                     .execution_options(synchronize_session=False)
                 ),
             )
             if result.rowcount == 0:
                 return None
+            session.expire(row)
+            replay_streak = row.replay_streak or 0
             if replay_streak >= REPLAY_STREAK_WARNING:
                 _logger.warning(
                     "device grant %s: %d consecutive rotations needed a grace replay; "
@@ -587,7 +596,9 @@ class DeviceGrantStore:
         if grace_seconds <= 0:
             return None
         with self._session("claim_device_grant_refresh_grace_replay") as session:
-            for _ in range(3):
+            # Each lost race means another claim succeeded, so this terminates
+            # once the budget is spent.
+            for _ in range(max_replays + 1):
                 row = (
                     session.query(SqlDeviceGrant)
                     .filter(
@@ -628,6 +639,37 @@ class DeviceGrantStore:
                     return _to_device_grant(row)
                 session.expire_all()
             return None
+
+    def grace_replay_budget_spent(
+        self,
+        refresh_token_hash: str,
+        *,
+        successor_hash: str,
+        now_epoch_seconds: int,
+        grace_seconds: int,
+        max_replays: int = MAX_GRACE_REPLAYS_PER_ROTATION,
+    ) -> bool:
+        """Return True if the replay was eligible but its budget is used up.
+
+        Lets the caller refuse an over-eager (but in-window) retry without
+        treating it as theft. Read-only.
+        """
+        if grace_seconds <= 0:
+            return False
+        with self._session("select_device_grant_refresh_grace_budget") as session:
+            row = (
+                session.query(SqlDeviceGrant)
+                .filter(
+                    SqlDeviceGrant.workspace_id == current_workspace_id(),
+                    SqlDeviceGrant.status == encode_device_grant_status("redeemed"),
+                    SqlDeviceGrant.prev_refresh_token_hash == refresh_token_hash,
+                    SqlDeviceGrant.refresh_token_hash == successor_hash,
+                    SqlDeviceGrant.prev_rotated_at.isnot(None),
+                    SqlDeviceGrant.prev_rotated_at >= now_epoch_seconds - grace_seconds,
+                )
+                .one_or_none()
+            )
+            return row is not None and (row.prev_replay_count or 0) >= max_replays
 
     def get_by_next_refresh_hash(self, refresh_token_hash: str) -> DeviceGrant | None:
         """Look up a live grant whose current token's successor is this one.

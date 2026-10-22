@@ -549,8 +549,8 @@ def test_streak_resets_after_clean_rotation(
     assert not any("may be shared or stolen" in r.getMessage() for r in caplog.records)
 
 
-def test_replay_past_cap_revokes(app: TestClient) -> None:
-    """Hammering the superseded token beyond the replay budget is reuse."""
+def test_replay_past_cap_is_refused_without_revoking(app: TestClient) -> None:
+    """Retries beyond the replay budget are refused, not treated as theft."""
     from omnigent.server.device_grant_store import MAX_GRACE_REPLAYS_PER_ROTATION
 
     r0 = _device_refresh_token(app)
@@ -559,7 +559,7 @@ def test_replay_past_cap_revokes(app: TestClient) -> None:
         assert _refresh(app, r0).json()["refresh_token"] == r1
     over = _refresh(app, r0)
     assert over.status_code == 400 and over.json()["error"] == "invalid_grant"
-    assert _refresh(app, r1).status_code == 400
+    assert _refresh(app, r1).status_code == 200
 
 
 def test_grace_replay_on_aged_grant_says_expired(app: TestClient, clock: _Clock) -> None:

@@ -695,6 +695,14 @@ def create_oauth_token_router(
                     replay.id,
                 )
                 return _token_response(replay, successor, now)
+            if replay is None and device_grant_store.grace_replay_budget_spent(
+                presented_hash,
+                successor_hash=successor_hash,
+                now_epoch_seconds=now,
+                grace_seconds=_reuse_grace,
+            ):
+                # In-window but over budget: refuse, but this is not theft.
+                return _refused("invalid_grant", "grace_replay_cap", stale.id)
             # Revoke the whole grant so the attacker's rotated token dies too.
             # (Login grants don't rotate, so they never populate the prev hash.)
             device_grant_store.revoke(stale.id)
