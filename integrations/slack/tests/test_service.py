@@ -848,10 +848,7 @@ async def test_turn_error_posts_separate_reply_and_keeps_answer(tmp_path: Path) 
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
-    for _ in range(50):
-        if slack.posts:
-            break
-        await asyncio.sleep(0.02)
+    await _wait_for_failure_post(slack)
     await service.shutdown()
 
     # The stream delivered the real answer, not the error.
@@ -1041,7 +1038,11 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_posts(slack, 1)
+    # Wait for the failure notice itself, not just "any post": the "Working on it…"
+    # ack is also a post, so ``_wait_for_posts(slack, 1)`` returned on the ack and
+    # ``shutdown()`` could cancel the turn before it streamed or posted the failure.
+    await _wait_for_stream_stop(slack)
+    await _wait_for_failure_post(slack)
     await service.shutdown()
 
     # Both deltas streamed live (across the reopened stream); nothing was lost.
@@ -1717,6 +1718,17 @@ async def _wait_for_posts(client: FakeSlackClient, count: int) -> None:
             return
         await asyncio.sleep(0.02)
     raise AssertionError(f"Timed out waiting for {count} posts")
+
+
+async def _wait_for_failure_post(client: FakeSlackClient) -> None:
+    # Wait for the generic failure reply specifically. The transient "Working on
+    # it…" ack also lands in ``client.posts``, so a bare ``len(posts)`` check can
+    # be satisfied before the turn has produced anything.
+    for _ in range(50):
+        if any("went wrong" in str(p.get("text", "")) for p in client.posts):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("Timed out waiting for the failure reply")
 
 
 async def _wait_for_ack_deleted(client: FakeSlackClient) -> None:
