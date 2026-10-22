@@ -739,7 +739,7 @@ async def test_kubernetes_profile_image_factory_is_digest_pinned_and_has_no_depl
     assert fake.image == image
     assert fake.env is None
     assert fake.secret_name is None
-    assert fake.service_account is None
+    assert fake.service_account == "omnigent-runner"
     assert fake.pvc_mounts is None
     assert fake.secret_mounts is None
 
@@ -3470,7 +3470,9 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
             return super().get(agent_id)
 
     store = _RecordingStore({builtin.id: builtin})
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    conv = SimpleNamespace(
+        labels={}, environment_runtime_ref=None, host_id="host_1", agent_id=builtin.id
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
@@ -3522,7 +3524,12 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
     monkeypatch.setattr(orchestration, "_run_managed_launch", _noop)
 
     tracker = ManagedLaunchTracker()
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin_agent_id("code-reviewer"))
+    conv = SimpleNamespace(
+        labels={},
+        environment_runtime_ref=None,
+        host_id="host_1",
+        agent_id=builtin_agent_id("code-reviewer"),
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
@@ -3555,7 +3562,12 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
 
     monkeypatch.setattr(orchestration, "_run_managed_launch", _capture)
 
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin_agent_id("code-reviewer"))
+    conv = SimpleNamespace(
+        labels={},
+        environment_runtime_ref=None,
+        host_id="host_1",
+        agent_id=builtin_agent_id("code-reviewer"),
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
