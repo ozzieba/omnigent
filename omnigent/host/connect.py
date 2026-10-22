@@ -2828,6 +2828,31 @@ class HostProcess:
                 models=[{"id": model.id, "displayName": model.id} for model in listing.models],
                 routable_models=[model.id for model in listing.models],
             )
+        if harness == "antigravity-native":
+            # ``agy models`` lists the account's offered ids without a turn.
+            # agy silently runs its default on an unknown ``--model``, so
+            # these exact ids are the only safe pins.
+            try:
+                from omnigent import antigravity_native_models
+
+                agy_models = await asyncio.to_thread(
+                    antigravity_native_models.list_agy_model_options
+                )
+            except Exception:  # noqa: BLE001 — no catalog, never a crash
+                _logger.warning("agy model catalog unavailable", exc_info=True)
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    models=[],
+                    error="the agy model listing failed — see the host log",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=agy_models,
+                routable_models=[str(row["id"]) for row in agy_models],
+            )
+
         if harness in ("opencode-native", "opencode"):
             # Pre-launch preview: the ambient `opencode models` CLI catalog,
             # enriched with the llmq-routed opencode-go models and their
@@ -3478,7 +3503,9 @@ class HostProcess:
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
         url = self._tunnel_url()
-        headers = self._build_connect_headers()
+        # Off the event loop: minting headers may refresh the stored login over
+        # HTTP (with retry backoff), which must not stall heartbeats.
+        headers = await asyncio.to_thread(self._build_connect_headers)
 
         _logger.info("Connecting to %s", url)
         # Build a verifying SSL context from a real CA bundle for wss:// — a bare
@@ -3565,7 +3592,7 @@ class HostProcess:
         try:
             from omnigent.resume_dispatch import _resolve_current_user_id
 
-            headers = self._build_connect_headers()
+            headers = await asyncio.to_thread(self._build_connect_headers)
             owner = await asyncio.to_thread(
                 _resolve_current_user_id, base_url=self._server_url, headers=headers
             )

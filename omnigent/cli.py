@@ -11972,12 +11972,20 @@ def _accounts_login(server: str) -> None:
 
     import time as _time
 
+    refresh_expires_in = body.get("refresh_token_expires_in")
     store_token(
         server_url=server,
         token=token,
         user_id=user_id,
         expires_at=_time.time() + expires_in,
         refresh_token=body.get("refresh_token"),
+        refresh_expires_at=(
+            _time.time() + refresh_expires_in
+            if isinstance(refresh_expires_in, (int, float))
+            and not isinstance(refresh_expires_in, bool)
+            and refresh_expires_in > 0
+            else None
+        ),
     )
     click.echo(f"Logged in as {user_id}.")
 

@@ -4590,7 +4590,7 @@ export function Composer({
   // the composer when switching back from Terminal or changing sessions.
   const isMobile = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobile || isCoarsePointer;
+  const isTouchPrimary = isMobile || isCoarsePointer;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
 
@@ -5214,8 +5214,9 @@ export function Composer({
     }
 
     // Touch-primary newline behavior outranks autocomplete and desktop submit
-    // preferences. Leave the event untouched so the textarea inserts it.
-    if (preventsKeyboardSubmit && e.key === "Enter") {
+    // preferences. Leave the event untouched so the textarea inserts it; only
+    // a hardware keyboard's Mod+Enter goes on to send.
+    if (isTouchPrimary && e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
       return;
     }
 
@@ -5229,11 +5230,12 @@ export function Composer({
         isComposing: e.nativeEvent.isComposing,
       },
       submitWithModEnter,
-      preventsKeyboardSubmit,
+      isTouchPrimary,
     );
-    // Plain Enter still completes an open suggestion. In Mod+Enter mode, the
-    // explicit send chord bypasses suggestions so the modifier has one meaning.
-    const shouldPreferSendOverCompletion = submitWithModEnter && shouldSubmitFromKeyboard;
+    // Plain Enter still completes an open suggestion. Where Mod+Enter is the
+    // send chord, it bypasses suggestions so the modifier has one meaning.
+    const shouldPreferSendOverCompletion =
+      (submitWithModEnter || isTouchPrimary) && shouldSubmitFromKeyboard;
 
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
@@ -5824,7 +5826,7 @@ export function Composer({
                     <span className="sr-only">{showInterruptButton ? "Interrupt" : "Send"}</span>
                   </Button>
                 </TooltipTrigger>
-                {!showInterruptButton && !preventsKeyboardSubmit && (
+                {!showInterruptButton && !isTouchPrimary && (
                   <KeyboardShortcutTooltipContent
                     label="Send"
                     keys={composerSendShortcutKeys(submitWithModEnter)}

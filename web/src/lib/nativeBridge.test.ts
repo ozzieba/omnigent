@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  acknowledgeNativeSharedText,
   getServerPicker,
   isAndroidShell,
   isElectronShell,
@@ -47,6 +48,7 @@ const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
 const androidSetColorScheme = vi.fn();
+const androidAcknowledgeSharedText = vi.fn();
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -109,8 +111,13 @@ function setIOS(on: boolean, withClickRouting = true, withServerPicker = false):
   }
 }
 
-/** Simulate running inside / outside the Android shell via the WebView bridge. */
-function setAndroid(on: boolean, withClickRouting = true): void {
+/**
+ * Simulate running inside / outside the Android shell via the WebView bridge.
+ * `withSharedTextAck` toggles the optional `acknowledgeSharedText` method, so
+ * tests can also stand in for a shell that predates the shared-text handoff
+ * protocol and therefore clears its payload on the first emit.
+ */
+function setAndroid(on: boolean, withClickRouting = true, withSharedTextAck = false): void {
   if (on) {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "android",
@@ -122,6 +129,9 @@ function setAndroid(on: boolean, withClickRouting = true): void {
             onNotificationActivated: (...args: unknown[]) =>
               androidOnNotificationActivated(...args),
           }
+        : {}),
+      ...(withSharedTextAck
+        ? { acknowledgeSharedText: (...args: unknown[]) => androidAcknowledgeSharedText(...args) }
         : {}),
     };
   } else {
@@ -591,5 +601,38 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+});
+
+describe("acknowledgeNativeSharedText", () => {
+  it("routes the acknowledgement through the Android bridge", () => {
+    setAndroid(true, true, true);
+
+    acknowledgeNativeSharedText();
+
+    expect(androidAcknowledgeSharedText).toHaveBeenCalledOnce();
+  });
+
+  it("is a no-op outside any native shell", () => {
+    setAndroid(false);
+
+    expect(() => acknowledgeNativeSharedText()).not.toThrow();
+    expect(androidAcknowledgeSharedText).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op under a shell that predates the shared-text handoff", () => {
+    setAndroid(true, true, false);
+
+    expect(() => acknowledgeNativeSharedText()).not.toThrow();
+    expect(androidAcknowledgeSharedText).not.toHaveBeenCalled();
+  });
+
+  it("swallows a throwing bridge rather than breaking the share intake", () => {
+    setAndroid(true, true, true);
+    androidAcknowledgeSharedText.mockImplementationOnce(() => {
+      throw new Error("bridge down");
+    });
+
+    expect(() => acknowledgeNativeSharedText()).not.toThrow();
   });
 });

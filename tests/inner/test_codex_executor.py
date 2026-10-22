@@ -3926,6 +3926,7 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
         ):
             pass
         model = fake_session.calls[0]["model"]
+        assert model == "gpt-6.1-sol"
         assert model == CODEX_DEFAULT_MODEL
         assert codex_spawn_model(model) == model, "not codex's own spelling"
 

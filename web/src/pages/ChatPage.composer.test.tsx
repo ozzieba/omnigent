@@ -297,6 +297,20 @@ describe("Composer send shortcut", () => {
     }
   });
 
+  it("sends on Ctrl+Enter from a hardware keyboard on a coarse pointer", () => {
+    const restorePointer = forceDesktopCoarsePointer();
+    const onSend = vi.fn();
+    try {
+      render(<Composer {...composerProps({ onSend })} />);
+      // Even over an open slash menu: the chord is the only send key here.
+      fireEvent.change(textarea(), { target: { value: "/des" } });
+      fireEvent.keyDown(textarea(), { key: "Enter", ctrlKey: true });
+      expect(onSend.mock.calls[0]?.[0]).toBe("/des");
+    } finally {
+      restorePointer();
+    }
+  });
+
   it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();

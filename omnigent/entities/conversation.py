@@ -473,6 +473,12 @@ class CompactionData(BaseModel):
         e.g. ``"openai/gpt-4o"``.
     :param token_count: Approximate token count of the summary
         text, for budget tracking, e.g. ``342``.
+    :param compacted_messages: Post-compaction context snapshot copied
+        from the vendor transcript, or ``None``.
+    :param window_id: Vendor context-window id of the snapshot, kept
+        verbatim for transcript rebuilds. Older Codex wrote an integer
+        (e.g. ``2``); current Codex writes a UUID string (e.g.
+        ``"01a15f09-4b04-71a2-86aa-c48f0333e697"``).
     """
 
     summary: str
@@ -480,7 +486,7 @@ class CompactionData(BaseModel):
     model: str | None = None
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
-    window_id: int | None = None
+    window_id: int | str | None = None
 
     @field_validator("compacted_messages")
     @classmethod

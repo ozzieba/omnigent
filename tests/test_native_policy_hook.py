@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import socket
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -12,6 +16,8 @@ from omnigent.native_policy_hook import (
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
     post_evaluate_with_retry,
+    read_live_relay_policy_config,
+    relay_refuses_connections,
 )
 
 
@@ -727,3 +733,75 @@ def test_policy_hook_reauth_returns_none_without_factory(
         "http://127.0.0.1:6767", {"Content-Type": "application/json"}
     )
     assert reauth() is None
+
+
+# ── stale tool_relay.json detection ─────────────────────────────────
+
+
+def test_relay_refuses_connections_detects_dead_loopback_port() -> None:
+    """
+    A bound-but-not-listening loopback port reads as a dead relay.
+
+    This is what a ``tool_relay.json`` from an exited runner points at; the
+    probe must report it so hooks stop retrying it for the whole budget.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        assert relay_refuses_connections(f"http://127.0.0.1:{port}") is True
+
+
+def test_relay_refuses_connections_accepts_listening_port() -> None:
+    """A listening relay port is live, so the hook keeps using the relay."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+        assert relay_refuses_connections(f"http://127.0.0.1:{port}/") is False
+
+
+@pytest.mark.parametrize("relay_url", ["", "not a url", "http://127.0.0.1", "http://[::1"])
+def test_relay_refuses_connections_is_inconclusive_for_unusable_urls(relay_url: str) -> None:
+    """
+    URLs the probe cannot check are not treated as stale.
+
+    Only a refused connect is proof of a dead relay; anything else keeps the
+    caller's existing relay-plus-retry behavior.
+    """
+    assert relay_refuses_connections(relay_url) is False
+
+
+def test_read_live_relay_policy_config_reports_stale_relay(tmp_path: Path) -> None:
+    """
+    A dead advertised relay is dropped, with a detail the hook can fail closed on.
+
+    The detail is what the TUI shows when there is no direct-server fallback,
+    so it must name the dead relay URL.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        (tmp_path / "tool_relay.json").write_text(
+            json.dumps({"url": url, "token": "tok", "session_id": "conv_a"})
+        )
+        relay, stale = read_live_relay_policy_config(tmp_path)
+    assert relay is None
+    assert stale is not None
+    assert f"tool relay at {url} is not listening" in stale
+
+
+def test_read_live_relay_policy_config_keeps_live_relay(tmp_path: Path) -> None:
+    """A listening relay is returned unchanged, with no stale detail."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        (tmp_path / "tool_relay.json").write_text(
+            json.dumps({"url": url, "token": "tok", "session_id": "conv_a"})
+        )
+        assert read_live_relay_policy_config(tmp_path) == ((url, "tok", "conv_a"), None)
+
+
+def test_read_live_relay_policy_config_without_relay_file(tmp_path: Path) -> None:
+    """No advertisement means no relay and nothing stale (first-call race)."""
+    assert read_live_relay_policy_config(tmp_path) == (None, None)

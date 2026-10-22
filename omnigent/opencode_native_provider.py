@@ -564,3 +564,66 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     result.setdefault("$schema", "https://opencode.ai/config.json")
 
     return result
+
+
+OPENCODE_OWNED_GEMMA_ROLE = "owned-gemma-p16v"
+OPENCODE_OWNED_GEMMA_MODEL = "p16v/gemma4:e2b"
+
+
+def project_owned_gemma_tool_config(
+    config: dict[str, object], *, bridge_dir: Path, policy_plugin: str | None = None
+) -> tuple[dict[str, object], dict[str, str]]:
+    """Pin an explicitly selected owned role to native read/edit/shell tools.
+
+    Unknown tools remain denied; native operations still use the policy ASK
+    gate. Reject extra MCP/plugin producers rather than silently dropping them.
+    """
+    if set(config) - {"$schema", "model", "provider", "mcp", "permission", "plugin"}:
+        raise ValueError("Owned Gemma role does not accept additional config producers")
+    role_home = bridge_dir / "owned-role-home"
+    if (
+        role_home.is_symlink()
+        or (role_home / ".opencode").exists()
+        or (role_home / ".opencode").is_symlink()
+        or (role_home.exists() and next(role_home.iterdir(), None))
+    ):
+        raise ValueError("Owned Gemma role requires an isolated config home")
+    if config.get("model") != OPENCODE_OWNED_GEMMA_MODEL:
+        raise ValueError("Owned Gemma role requires its exact provider/model")
+    mcp = config.get("mcp", {})
+    if not isinstance(mcp, dict) or set(mcp) - {"omnigent"}:
+        raise ValueError("Owned Gemma role does not accept additional MCP servers")
+    plugins = config.get("plugin", [])
+    expected_plugins = [policy_plugin] if policy_plugin is not None else []
+    if plugins != expected_plugins:
+        raise ValueError("Owned Gemma role does not accept additional plugins")
+    permission = config.get("permission", "ask")
+    if permission != "ask":
+        raise ValueError("Owned Gemma role requires the native ASK policy gate")
+    projected = dict(config)
+    projected["permission"] = {
+        "*": "deny",
+        "read": "ask",
+        "edit": "ask",
+        "bash": "ask",
+        "glob": "ask",
+        "grep": "ask",
+    }
+    from omnigent.opencode_native_bridge import xdg_data_home_for_bridge_dir
+
+    return projected, {
+        "OPENCODE_DB": str(
+            xdg_data_home_for_bridge_dir(bridge_dir) / "opencode" / "owned-role.db"
+        ),
+        "XDG_CACHE_HOME": str(role_home / ".cache"),
+        "XDG_STATE_HOME": str(role_home / ".state"),
+        "HOME": str(role_home),
+        "OPENCODE_TEST_HOME": str(role_home),
+        "OPENCODE_CONFIG_DIR": "",
+        "OPENCODE_TEST_MANAGED_CONFIG_DIR": "",
+        "OPENCODE_PERMISSION": json.dumps(projected["permission"]),
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
+        "OPENCODE_CONFIG_CONTENT": json.dumps(
+            {"model": projected["model"], "permission": projected["permission"]}
+        ),
+    }

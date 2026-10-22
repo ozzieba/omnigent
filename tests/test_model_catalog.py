@@ -990,6 +990,7 @@ def test_codex_default_model_names_a_concrete_variant() -> None:
     Databricks serving spelling — the default must be a dotted concrete
     variant codex serves.
     """
+    assert CODEX_DEFAULT_MODEL == "gpt-6.1-sol"
     assert not CODEX_DEFAULT_MODEL.startswith("databricks-")
     assert codex_spawn_model(CODEX_DEFAULT_MODEL) == CODEX_DEFAULT_MODEL
     # A bare family alias has no tier segment after the dotted version.

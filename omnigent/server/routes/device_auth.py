@@ -44,6 +44,10 @@ now that its server target is a fixed operator config rather than a
 user-supplied URL (which is why the secret was previously removed).
 
 Refresh tokens: short access tokens + rotating, revocable refresh tokens.
+Rotation is idempotent within a short reuse-grace window
+(``OMNIGENT_REFRESH_REUSE_GRACE_SECONDS``): a retried refresh of the
+just-superseded token gets the same successor back instead of revoking the
+grant. Replays after the window, or of any older token, revoke the grant.
 """
 
 from __future__ import annotations
@@ -60,8 +64,13 @@ import jwt
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from omnigent.entities import DeviceGrant
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.device_grant_store import (
+    DeviceGrantStore,
+    derive_successor_refresh_token,
+    hash_secret,
+)
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.slack_orchestrator_capability import (
     CLIENT_ID as SLACK_ORCHESTRATOR_CLIENT_ID,
@@ -156,6 +165,51 @@ def _grant_max_lifetime_seconds() -> int:
                 _GRANT_MAX_LIFETIME_SECONDS // 86400,
             )
     return _GRANT_MAX_LIFETIME_SECONDS
+
+
+# How long an aged-out grant row is kept before purge, so its client is told
+# ``expired_token`` (re-login) rather than an opaque ``invalid_grant``.
+_EXPIRED_GRANT_RETENTION_SECONDS = 7 * 24 * 3600
+
+# Reuse-grace window for rotating refresh tokens: a refresh retried with the
+# just-superseded token within this many seconds (a response lost to a network
+# blip, a crash or a DB failover) is answered idempotently instead of being
+# treated as theft. ``0`` disables the grace and restores strict single use.
+_REUSE_GRACE_ENV = "OMNIGENT_REFRESH_REUSE_GRACE_SECONDS"
+_DEFAULT_REUSE_GRACE_SECONDS = 120
+_MAX_REUSE_GRACE_SECONDS = 600
+
+
+def _refresh_reuse_grace_seconds() -> int:
+    """Return the reuse-grace window, honoring the env override.
+
+    Invalid values fall back to the default; values above the cap are
+    clamped so a typo cannot silently disable theft detection.
+    """
+    raw = os.environ.get(_REUSE_GRACE_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_REUSE_GRACE_SECONDS
+    try:
+        seconds = int(raw)
+    except ValueError:
+        _logger.warning(
+            "%s=%r is not an integer — using the %ds default",
+            _REUSE_GRACE_ENV,
+            raw,
+            _DEFAULT_REUSE_GRACE_SECONDS,
+        )
+        return _DEFAULT_REUSE_GRACE_SECONDS
+    if seconds < 0:
+        return 0
+    if seconds > _MAX_REUSE_GRACE_SECONDS:
+        _logger.warning(
+            "%s=%d exceeds the %ds cap — clamping",
+            _REUSE_GRACE_ENV,
+            seconds,
+            _MAX_REUSE_GRACE_SECONDS,
+        )
+        return _MAX_REUSE_GRACE_SECONDS
+    return seconds
 
 
 # user_code alphabet excludes easily-confused chars (0/O, 1/I/L).
@@ -440,8 +494,9 @@ def create_oauth_token_router(
     """
     cookie_secret, provider_name = _resolve_signing_config(auth_provider)
     _client_secret_ok = client_secret_ok or _make_client_secret_gate()
-    # Resolve grant max lifetime once at mount time (not on every refresh).
+    # Resolve grant max lifetime and reuse grace once at mount time.
     _grant_max_lifetime = _grant_max_lifetime_seconds()
+    _reuse_grace = _refresh_reuse_grace_seconds()
     router = APIRouter()
     # Throttle for the opportunistic grant purge (bounds the table without a
     # separate scheduler). Mutable one-field dict so the closures can update
@@ -462,7 +517,9 @@ def create_oauth_token_router(
         _last_purge["at"] = now_wall
         try:
             device_grant_store.purge_expired(
-                int(now_wall), max_lifetime_seconds=_grant_max_lifetime
+                int(now_wall),
+                max_lifetime_seconds=_grant_max_lifetime,
+                retention_seconds=_EXPIRED_GRANT_RETENTION_SECONDS,
             )
         except Exception:  # noqa: BLE001 — housekeeping must never fail a refresh
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
@@ -516,87 +573,178 @@ def create_oauth_token_router(
             return _handle_refresh_grant(str(form.get("refresh_token") or ""))
         return _oauth_error("unsupported_grant_type")
 
+    def _refresh_expires_in(grant: DeviceGrant, now: int) -> int | None:
+        """Seconds until the grant's absolute lifetime ends (``None`` if unknown)."""
+        if grant.approved_at is None:
+            return None
+        return max(0, grant.approved_at + _grant_max_lifetime - now)
+
+    def _aged_out(grant: DeviceGrant, now: int) -> bool:
+        return grant.approved_at is not None and now - grant.approved_at >= _grant_max_lifetime
+
+    def _refused(error: str, reason: str, grant_id: str | None) -> Response:
+        # One structured line per refusal so log-based alerting can key on it.
+        log = _logger.info if reason == "unknown_token" else _logger.warning
+        log(
+            "oauth/token: refresh refused reason=%s grant=%s error=%s",
+            reason,
+            grant_id or "-",
+            error,
+        )
+        return _oauth_error(error)
+
+    def _token_response(grant: DeviceGrant, refresh_token: str, now: int) -> Response:
+        assert grant.user_id is not None
+        content: dict[str, object] = {
+            "access_token": _issue_access_token(grant.id, grant.user_id, grant.client_id or ""),
+            "refresh_token": refresh_token,
+            "token_type": "Bearer",
+            "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+        }
+        # Lets unattended clients warn before the absolute lifetime ends.
+        refresh_expires_in = _refresh_expires_in(grant, now)
+        if refresh_expires_in is not None:
+            content["refresh_token_expires_in"] = refresh_expires_in
+        return JSONResponse(status_code=200, content=content)
+
+    def _successor(refresh_token: str, grant_id: str) -> tuple[str, str, str]:
+        """Return ``(successor, successor_hash, successor_of_successor_hash)``."""
+        successor = derive_successor_refresh_token(
+            refresh_token, grant_id=grant_id, key=cookie_secret
+        )
+        following = derive_successor_refresh_token(successor, grant_id=grant_id, key=cookie_secret)
+        return (
+            successor,
+            hash_secret(successor, cookie_secret),
+            hash_secret(following, cookie_secret),
+        )
+
     def _handle_refresh_grant(refresh_token: str) -> Response:
         if not refresh_token:
             return _oauth_error("invalid_request")
         # Opportunistic housekeeping so login-grant rows (one per login)
         # don't accumulate where no device-authorize purge runs.
         _maybe_purge()
+        now = int(time.time())
         presented_hash = hash_secret(refresh_token, cookie_secret)
         # A refresh token doesn't name its grant, so locate it by digest.
         # Only a live (redeemed, non-revoked) grant holds a matching hash.
         grant = device_grant_store.get_by_refresh_hash(presented_hash)
         if grant is None:
-            # Not the current token. If it matches a grant's *previous*
-            # token, a stale token was replayed — reuse/theft. Revoke the
-            # whole grant so the attacker's freshly-rotated token dies too.
-            # (Login grants don't rotate, so they never populate the prev
-            # hash and can't reach this revoke.)
-            stale = device_grant_store.get_by_prev_refresh_hash(presented_hash)
-            if stale is not None:
-                device_grant_store.revoke(stale.id)
-                _logger.warning(
-                    "oauth/token: refresh reuse detected on grant %s — revoked", stale.id
-                )
-            return _oauth_error("invalid_grant")
+            return _handle_non_current_refresh(refresh_token, presented_hash, now)
         # Refuse to refresh a grant past its absolute lifetime — the user
         # must re-consent. Checked before rotating so an aged grant simply
         # stops working (it is NOT reuse, so it must not revoke/oscillate).
-        if grant.approved_at is not None and (
-            int(time.time()) - grant.approved_at >= _grant_max_lifetime
-        ):
-            return _oauth_error("expired_token")
+        if _aged_out(grant, now):
+            return _refused("expired_token", "grant_lifetime_exceeded", grant.id)
         if grant.user_id is None:
-            return _oauth_error("invalid_grant")
+            return _refused("invalid_grant", "grant_without_user", grant.id)
 
         if _is_login_grant(grant.client_id):
             # First-party login grants do NOT rotate. The bearer is an
-            # unattended host/CLI, so a lost refresh response (network blip,
-            # crash between the server committing and the client persisting)
-            # must not brick the grant via reuse detection. The same refresh
-            # token stays valid for the grant lifetime; only the short-lived
-            # access token is renewed. Revocation + the absolute lifetime cap
-            # bound the exposure.
-            access_token = _issue_access_token(grant.id, grant.user_id, grant.client_id or "")
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "token_type": "Bearer",
-                    "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
-                },
-            )
+            # unattended host/CLI, so a lost refresh response must not brick
+            # the grant via reuse detection. Revocation + the absolute
+            # lifetime cap bound the exposure.
+            return _token_response(grant, refresh_token, now)
 
-        new_refresh = _mint_refresh_token()
+        successor, successor_hash, following_hash = _successor(refresh_token, grant.id)
         rotated = device_grant_store.rotate_refresh_token(
             grant.id,
             expected_hash=presented_hash,
-            new_hash=hash_secret(new_refresh, cookie_secret),
-            now_epoch_seconds=int(time.time()),
+            new_hash=successor_hash,
+            next_hash=following_hash,
+            now_epoch_seconds=now,
             max_lifetime_seconds=_grant_max_lifetime,
         )
         if rotated is None:
-            # Lost a concurrent rotation race, or the grant aged out between
-            # the check above and here — reject without revoking (this is not
-            # a reuse signal, so the grant must not be killed/oscillate).
-            return _oauth_error("invalid_grant")
+            # A concurrent refresh of the same token rotated it first; answer
+            # this one idempotently with the same successor if it is eligible.
+            rotated = device_grant_store.claim_grace_replay(
+                presented_hash,
+                successor_hash=successor_hash,
+                now_epoch_seconds=now,
+                grace_seconds=_reuse_grace,
+            )
+        if rotated is None:
+            # Lost a race outside the grace window, or the grant aged out
+            # between the check above and here — reject without revoking.
+            return _refused("invalid_grant", "rotation_race", grant.id)
         if rotated.user_id is None:
-            return _oauth_error("invalid_grant")
-        access_token = _issue_access_token(
-            rotated.id,
-            rotated.user_id,
-            rotated.client_id or "",
-        )
-        return JSONResponse(
-            status_code=200,
-            content={
-                "access_token": access_token,
-                "refresh_token": new_refresh,
-                "token_type": "Bearer",
-                "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
-            },
-        )
+            return _refused("invalid_grant", "grant_without_user", rotated.id)
+        return _token_response(rotated, successor, now)
+
+    def _handle_non_current_refresh(refresh_token: str, presented_hash: str, now: int) -> Response:
+        """Handle a refresh token that is not any live grant's current token."""
+        # 1. The just-superseded token: a retry inside the grace window gets
+        #    the same successor back; anything else is reuse and revokes.
+        stale = device_grant_store.get_by_prev_refresh_hash(presented_hash)
+        if stale is not None:
+            successor, successor_hash, _ = _successor(refresh_token, stale.id)
+            replay = device_grant_store.claim_grace_replay(
+                presented_hash,
+                successor_hash=successor_hash,
+                now_epoch_seconds=now,
+                grace_seconds=_reuse_grace,
+            )
+            if replay is not None and replay.user_id is not None:
+                if _aged_out(replay, now):
+                    return _refused("expired_token", "grant_lifetime_exceeded", replay.id)
+                _logger.warning(
+                    "oauth/token: answered a grace replay of the previous refresh token "
+                    "on grant %s (lost response or racing refresh)",
+                    replay.id,
+                )
+                return _token_response(replay, successor, now)
+            if replay is None and device_grant_store.grace_replay_budget_spent(
+                presented_hash,
+                successor_hash=successor_hash,
+                now_epoch_seconds=now,
+                grace_seconds=_reuse_grace,
+            ):
+                # In-window but over budget: refuse, but this is not theft.
+                return _refused("invalid_grant", "grace_replay_cap", stale.id)
+            # Revoke the whole grant so the attacker's rotated token dies too.
+            # (Login grants don't rotate, so they never populate the prev hash.)
+            device_grant_store.revoke(stale.id)
+            return _refused("invalid_grant", "reuse_after_grace_revoked", stale.id)
+        # 2. The successor of the current token: its rotation commit was lost
+        #    (e.g. an async replica promotion rolled it back). Roll it forward.
+        lost = device_grant_store.get_by_next_refresh_hash(presented_hash)
+        if lost is not None:
+            if _aged_out(lost, now):
+                return _refused("expired_token", "grant_lifetime_exceeded", lost.id)
+            successor, successor_hash, following_hash = _successor(refresh_token, lost.id)
+            rolled = device_grant_store.roll_forward_rotation(
+                lost.id,
+                presented_hash=presented_hash,
+                new_hash=successor_hash,
+                next_hash=following_hash,
+                now_epoch_seconds=now,
+                max_lifetime_seconds=_grant_max_lifetime,
+            )
+            if rolled is None:
+                # A concurrent request rolled the same successor forward first;
+                # answer this one with the identical token if still eligible.
+                rolled = device_grant_store.claim_grace_replay(
+                    presented_hash,
+                    successor_hash=successor_hash,
+                    now_epoch_seconds=now,
+                    grace_seconds=_reuse_grace,
+                )
+                if rolled is not None and rolled.user_id is not None:
+                    return _token_response(rolled, successor, now)
+            if rolled is None or rolled.user_id is None:
+                return _refused("invalid_grant", "roll_forward_race", lost.id)
+            _logger.warning(
+                "oauth/token: rolled forward a lost refresh rotation on grant %s", rolled.id
+            )
+            return _token_response(rolled, successor, now)
+        # 3. Any older token of a rotating grant: reuse, revoke the family.
+        retired = device_grant_store.get_by_retired_refresh_hash(presented_hash)
+        if retired is not None:
+            device_grant_store.revoke(retired.id)
+            return _refused("invalid_grant", "retired_token_reuse_revoked", retired.id)
+        return _refused("invalid_grant", "unknown_token", None)
 
     # ── Revocation ────────────────────────────────────────────────
 
@@ -729,7 +877,9 @@ def create_device_auth_router(
             _last_purge["at"] = now_wall
             try:
                 device_grant_store.purge_expired(
-                    int(now_wall), max_lifetime_seconds=_grant_max_lifetime
+                    int(now_wall),
+                    max_lifetime_seconds=_grant_max_lifetime,
+                    retention_seconds=_EXPIRED_GRANT_RETENTION_SECONDS,
                 )
             except Exception:  # housekeeping must never fail a request
                 _logger.exception("device grant purge failed")
@@ -994,9 +1144,13 @@ def create_device_auth_router(
         # outcome == "approved" → mint tokens, atomically single-use.
         assert grant is not None
         refresh_token = _mint_refresh_token()
+        first_successor = derive_successor_refresh_token(
+            refresh_token, grant_id=grant.id, key=cookie_secret
+        )
         redeemed = device_grant_store.redeem_approved(
             grant.id,
             refresh_token_hash=hash_secret(refresh_token, cookie_secret),
+            next_refresh_token_hash=hash_secret(first_successor, cookie_secret),
             now_epoch_seconds=now,
         )
         if redeemed is None or redeemed.user_id is None:

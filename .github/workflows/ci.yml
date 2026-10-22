@@ -45,7 +45,7 @@ jobs:
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:

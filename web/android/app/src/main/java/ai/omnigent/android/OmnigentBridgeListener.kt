@@ -18,12 +18,20 @@ import org.json.JSONObject
  * structural equivalent of the iOS `isMainFrame` + frame-origin check that a
  * raw `addJavascriptInterface` bridge cannot express.
  *
- * [BlobSaver] offloads writes to its own worker.
+ * [BlobSaver] offloads writes to its own worker. The two `shared*Received`
+ * acknowledgements are what let the shell retain an OS-share payload across
+ * page loads instead of dropping it into a page that may be mid-navigation —
+ * see `MainActivity.flushPendingSharedFiles` and [SharedTextHandoff].
+ *
+ * Both acknowledgement callbacks default to no-ops so a test (or any caller
+ * that only exercises notifications / blob saving) can construct this
+ * without wiring share retention.
  */
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
-    private val onSharedFilesAcknowledged: () -> Unit,
+    private val onSharedFilesAcknowledged: () -> Unit = {},
+    private val onSharedTextAcknowledged: () -> Unit = {},
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -98,6 +106,10 @@ class OmnigentBridgeListener(
 
             "sharedFilesReceived" -> {
                 onSharedFilesAcknowledged()
+            }
+
+            "sharedTextReceived" -> {
+                onSharedTextAcknowledged()
             }
         }
     }
