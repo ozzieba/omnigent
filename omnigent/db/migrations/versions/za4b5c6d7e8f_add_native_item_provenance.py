@@ -1,7 +1,7 @@
 """Add durable native source identity to conversation items.
 
 Revision ID: za4b5c6d7e8f
-Revises: za3b4c5d6e7f, gb1c2d3e4f5a
+Revises: zr7a1c3e5b90
 
 The unique index is built concurrently on PostgreSQL to avoid blocking writes
 to the large, active conversation_items table. The autocommit block commits
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "za4b5c6d7e8f"
-down_revision: str | Sequence[str] | None = ("za3b4c5d6e7f", "gb1c2d3e4f5a")
+down_revision: str | Sequence[str] | None = "zr7a1c3e5b90"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | None = None
 
