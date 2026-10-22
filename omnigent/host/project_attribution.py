@@ -72,13 +72,14 @@ def resolve_launch_attribution(
     if not is_allowed_quota_route(quota_route):
         raise ProjectAttributionError("project has no allowed quota_route")
     if quota_route == PERSONAL_QUOTA_ROUTE:
-        if not is_allowed_project_enum(project.name):
-            raise ProjectAttributionError(
-                f"project {project.name!r} is not an allowed personal-agent project"
-            )
-        return LaunchAttribution(quota_route=PERSONAL_QUOTA_ROUTE, project_enum=project.name)
+        project_enum = project.config.get("project_enum", project.name)
+        if not is_allowed_project_enum(project_enum):
+            raise ProjectAttributionError("project has no allowed personal project_enum")
+        if is_allowed_project_enum(project.name) and project_enum != project.name:
+            raise ProjectAttributionError("legacy personal name conflicts with project_enum")
+        return LaunchAttribution(quota_route=PERSONAL_QUOTA_ROUTE, project_enum=project_enum)
 
-    if is_allowed_project_enum(project.name):
+    if is_allowed_project_enum(project.name) or "project_enum" in project.config:
         raise ProjectAttributionError("personal project name cannot select the work route")
     return LaunchAttribution(quota_route=WORK_QUOTA_ROUTE, project_enum=None)
 
