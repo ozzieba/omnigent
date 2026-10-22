@@ -33,9 +33,9 @@ from tests.server.helpers import (
     echo_runner_client,
 )
 
-ROUTED_MODEL = "databricks-claude-opus-4-8"
-LLM_PICKED_MODEL = "databricks-claude-sonnet-4-6"
-GPT_MODEL = "databricks-gpt-5-5"
+ROUTED_MODEL = "databricks-claude-opus-5-5"
+LLM_PICKED_MODEL = "databricks-claude-sonnet-5-5"
+GPT_MODEL = "databricks-gpt-6-1-sol"
 GLM_MODEL = "databricks-glm-5-2"
 # The spelling the gateway serves GLM under; see ``_SERVABLE_ALIASES``.
 GLM_SERVABLE = "system.ai.glm-5-2"
@@ -45,14 +45,39 @@ _GATEWAY_HOST_ID = "bb22cc33dd44ee55ff66778899001122"
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _current_claude_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offer current Claude endpoints in the static candidate table.
+
+    Without a host-reported catalog, candidates come from the static table, and
+    the current-model policy only serves catalog-backed current targets. The
+    static Claude ladder carries only superseded ids, so a deployment supplies
+    its current Claude endpoints through ``routing.current_generation_models``;
+    mirror that here (the GPT entry is the shipped default, kept as is).
+    """
+    from omnigent.server import smart_routing
+
+    monkeypatch.setattr(
+        smart_routing,
+        "_CURRENT_GENERATION_MODELS",
+        {
+            **smart_routing._CURRENT_GENERATION_MODELS,
+            "claude": (ROUTED_MODEL, LLM_PICKED_MODEL),
+            "pi": (ROUTED_MODEL, LLM_PICKED_MODEL, GPT_MODEL, GLM_MODEL),
+        },
+    )
+
+
 async def _parent_and_child(
     client: httpx.AsyncClient,
     db_uri: str,
     *,
     agent_name: str,
     child_model_override: str | None = None,
+    harness: str | None = None,
 ) -> tuple[dict[str, Any], Any, SqlAlchemyConversationStore]:
-    agent = await create_test_agent(client, name=agent_name)
+    executor = {"type": "omnigent", "config": {"harness": harness}} if harness else None
+    agent = await create_test_agent(client, name=agent_name, executor=executor)
     resp = await client.post(
         "/v1/sessions",
         json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
@@ -156,10 +181,13 @@ async def test_another_spelling_of_the_routed_model_is_no_override(
         db_uri,
         agent_name="routing-spelling",
         child_model_override=GLM_SERVABLE,
+        # GLM only runs on the codex family, so the child must be on codex for
+        # the current-model policy to find it a catalog-backed target.
+        harness="codex",
     )
     caps = FakeCaps(
         routing_client=FakeRoutingClient(
-            RoutingResult(model=GLM_MODEL, rationale="delegate down", harness="claude_code")
+            RoutingResult(model=GLM_MODEL, rationale="delegate down", harness="codex")
         )
     )
     body = SessionEventInput(
@@ -1342,14 +1370,22 @@ async def test_turn_decision_is_not_applied_when_the_pane_cannot_speak_the_model
     conv, conv_store = await _claude_native_session(
         client, db_uri, agent_name="routing-honest-record"
     )
-    # The workspace moved ``opus`` on to the next generation, so ``/model``
-    # would land on opus-5 while the record claimed opus-4-8.
+    # The workspace moved ``opus`` on to the next generation, so ``/model opus``
+    # would land on opus-6 while the record claimed opus-5-5. The routing
+    # candidates (the runner's refreshed catalog) still list the routed id, which
+    # is what lets the current-model policy pass it through to the pane-spelling
+    # guard under test; the cached picker rows are what the pane can switch to.
     orchestration_module._model_options_cache[conv.id] = [
-        {"id": "opus", "model": "databricks-claude-opus-5"},
-        {"id": "sonnet", "model": "databricks-claude-sonnet-5"},
+        {"id": "opus", "model": "databricks-claude-opus-6"},
+        {"id": "sonnet", "model": "databricks-claude-sonnet-5-5"},
     ]
     try:
-        data = await _route_one_turn(conv, conv_store)
+        with patch.object(
+            orchestration_module,
+            "_native_turn_catalog",
+            AsyncMock(return_value=[ROUTED_MODEL, "databricks-claude-sonnet-5-5"]),
+        ):
+            data = await _route_one_turn(conv, conv_store)
     finally:
         orchestration_module._model_options_cache.pop(conv.id, None)
 
@@ -1532,9 +1568,11 @@ async def test_a_childs_second_spawn_cannot_pin_a_model_the_pane_rejects(
     finally:
         orchestration_module._model_options_cache.pop(child.id, None)
 
-    assert second.model == GPT_MODEL
-    assert second.applied is False
-    assert "Not applied" in second.rationale
+    # The pane's catalog has no current target for the pick, so the current-model
+    # policy declines the turn before any decision is recorded: ``second`` is
+    # still the first turn's record, and nothing new was pinned or forwarded.
+    assert second.model == ROUTED_MODEL
+    assert len(_routing_decisions(conv_store, child.id)) == 1
     refreshed = conv_store.get_conversation(child.id)
     assert refreshed is not None
     assert refreshed.model_override == ROUTED_MODEL
