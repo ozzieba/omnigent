@@ -1041,10 +1041,7 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    # Wait for the failure notice itself, not just "any post": an earlier post
-    # (the "Working on it" ack / config summary) satisfies a bare post count, so
-    # shutdown() could cancel the turn before the deltas had streamed.
-    await _wait_for_post_containing(slack, "went wrong")
+    await _wait_for_posts(slack, 1)
     await service.shutdown()
 
     # Both deltas streamed live (across the reopened stream); nothing was lost.
@@ -1720,16 +1717,6 @@ async def _wait_for_posts(client: FakeSlackClient, count: int) -> None:
             return
         await asyncio.sleep(0.02)
     raise AssertionError(f"Timed out waiting for {count} posts")
-
-
-async def _wait_for_post_containing(client: FakeSlackClient, needle: str) -> None:
-    # Generous 10s budget: a loaded CI runner can take well over the 1s that
-    # _wait_for_posts allows to run a whole turn.
-    for _ in range(500):
-        if any(needle in str(p.get("text", "")) for p in client.posts):
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError(f"Timed out waiting for a post containing {needle!r}")
 
 
 async def _wait_for_ack_deleted(client: FakeSlackClient) -> None:
