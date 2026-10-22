@@ -3052,11 +3052,34 @@ def _parse_external_conversation_item(
             f"Invalid data payload for external item type {item_type!r}: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    provenance = {
+        key: _optional_native_provenance(body.data, key)
+        for key in ("native_thread_id", "native_turn_id", "native_item_id")
+    }
+    if any(provenance.values()) and not all(provenance.values()):
+        raise OmnigentError(
+            "external_conversation_item native provenance requires thread, turn, and item ids",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return NewConversationItem(
         type=item_type,
         response_id=response_id.strip(),
         data=data,
+        **provenance,
     )
+
+
+def _optional_native_provenance(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 128:
+        raise OmnigentError(
+            f"external_conversation_item data.{key} must be a non-empty string "
+            "of at most 128 characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return value.strip()
 
 
 def _find_claude_native_subagent_child(

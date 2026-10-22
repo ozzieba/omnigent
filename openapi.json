@@ -1308,6 +1308,39 @@
             "title": "Id",
             "type": "string"
           },
+          "native_item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Item Id"
+          },
+          "native_thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Thread Id"
+          },
+          "native_turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Turn Id"
+          },
           "response_id": {
             "description": "The task/response ID this item belongs to.",
             "title": "Response Id",

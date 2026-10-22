@@ -3535,6 +3535,108 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert published[5][1]["item"]["type"] == "terminal_command"
 
 
+async def test_codex_forwarder_lost_ack_replay_is_idempotent_with_pending_upload(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive the Codex forwarder through the real event route and SQL store.
+
+    The first ASGI request commits, then the client loses its acknowledgement.
+    A later native replay uses the same stable source tuple. It must return
+    the existing row without draining the next queued upload or broadcasting
+    a second consumed event.
+    """
+    from omnigent import codex_native_forwarder as forwarder
+    from omnigent.runtime import pending_inputs
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    pending_inputs.reset_for_tests()
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    class _LoseFirstAcknowledgement:
+        """Route each POST normally, then drop only the first response."""
+
+        def __init__(self) -> None:
+            self.posts = 0
+            self.first_response_status: int | None = None
+
+        async def post(self, url: str, *, json: dict[str, Any], **kwargs: Any) -> httpx.Response:
+            response = await client.post(url, json=json, **kwargs)
+            self.posts += 1
+            if self.posts == 1:
+                self.first_response_status = response.status_code
+                raise httpx.ReadTimeout("simulated lost acknowledgement", request=response.request)
+            return response
+
+    forwarder_client = _LoseFirstAcknowledgement()
+    item = {
+        "id": "native-item-1",
+        "type": "userMessage",
+        "content": [{"type": "text", "text": "question"}],
+    }
+    params = {"threadId": "native-thread-1", "turnId": "native-turn-1"}
+    pending_inputs.record(
+        session_id,
+        [
+            {"type": "input_text", "text": "question"},
+            {"type": "input_image", "file_id": "upload-for-first-message"},
+        ],
+    )
+    try:
+        # The forwarder sees a transport failure after the route committed.
+        await forwarder._post_user_message(forwarder_client, session_id, params, item)
+        assert forwarder_client.first_response_status == 202
+        assert forwarder_client.posts == 1
+        assert pending_inputs.snapshot_for(session_id) == []
+
+        # Queue a new upload before reconnect replay. It belongs to the next
+        # message and must remain pending after the duplicate native item.
+        pending_inputs.record(
+            session_id,
+            [
+                {"type": "input_text", "text": "next question"},
+                {"type": "input_image", "file_id": "upload-for-next-message"},
+            ],
+        )
+        await forwarder._post_user_message(forwarder_client, session_id, params, item)
+
+        stored = await asyncio.to_thread(
+            SqlAlchemyConversationStore(db_uri).list_items, session_id
+        )
+        assert len(stored.data) == 1
+        persisted = stored.data[0]
+        assert (
+            persisted.native_thread_id,
+            persisted.native_turn_id,
+            persisted.native_item_id,
+        ) == ("native-thread-1", "native-turn-1", "native-item-1")
+        assert persisted.data.role == "user"
+        assert persisted.data.content[0] == {
+            "type": "input_image",
+            "file_id": "upload-for-first-message",
+        }
+        assert (
+            len([event for _, event in published if event["type"] == "session.input.consumed"])
+            == 1
+        )
+        assert pending_inputs.snapshot_for(session_id)[0]["content"][-1]["file_id"] == (
+            "upload-for-next-message"
+        )
+        assert forwarder_client.posts == 2
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 async def test_post_external_function_call_output_caps_oversized_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

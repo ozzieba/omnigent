@@ -795,6 +795,9 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
+    native_thread_id: str | None = None
+    native_turn_id: str | None = None
+    native_item_id: str | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -831,6 +834,9 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    native_thread_id: str | None = None
+    native_turn_id: str | None = None
+    native_item_id: str | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:

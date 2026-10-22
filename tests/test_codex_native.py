@@ -4210,6 +4210,9 @@ def test_forwarder_keeps_streaming_when_native_tui_answers_codex_elicitation(
                     "content": [{"type": "output_text", "text": "after approval"}],
                 },
                 "response_id": "codex_turn_123",
+                "native_thread_id": "thread_123",
+                "native_turn_id": "turn_123",
+                "native_item_id": "item_agent",
             },
         },
     ]
@@ -5973,6 +5976,9 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
                     "content": [{"type": "input_text", "text": "hello codex"}],
                 },
                 "response_id": "codex_turn_123",
+                "native_thread_id": "thread_123",
+                "native_turn_id": "turn_123",
+                "native_item_id": "item_user",
             },
         },
         {
@@ -5985,6 +5991,9 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
                     "content": [{"type": "output_text", "text": "hello from codex"}],
                 },
                 "response_id": "codex_turn_123",
+                "native_thread_id": "thread_123",
+                "native_turn_id": "turn_123",
+                "native_item_id": "item_agent",
             },
         },
     ]
