@@ -79,8 +79,7 @@ OMNIGENT_HOST_RUNTIME = RuntimeManifest(
             version="resolved by builder dependency installation",
             source="builder stage copied into host image",
             reason=(
-                "The image copies these binaries but does not pin their release in the "
-                "Dockerfile."
+                "The image copies these binaries but does not pin their release in the Dockerfile."
             ),
         ),
         RuntimeTool(
