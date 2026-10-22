@@ -106,7 +106,9 @@ jobs:
     runs-on: ubuntu-latest
     # Job-level cap (composite-action run steps can't set timeout-minutes):
     # ~30 min of tests + setup, replacing the old per-step 30-min backstop.
-    timeout-minutes: 35
+    # 60, not 35: shards ran 34-35 min (2050-2111 s) on the shared Forge runner and were
+    # killed at the cap before finishing.
+    timeout-minutes: 60
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
