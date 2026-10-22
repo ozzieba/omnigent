@@ -36,6 +36,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlPolicy,
     SqlProject,
+    SqlSessionGoal,
     SqlSessionPermission,
     SqlUserDailyCost,
     current_workspace_id,
@@ -74,6 +75,11 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
     parse_item_data,
+)
+from omnigent.entities.session_goal import (
+    SessionGoal,
+    SessionGoalConflict,
+    SetSessionGoalRequest,
 )
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.session_import.models import (
@@ -1296,6 +1302,65 @@ class SqlAlchemyConversationStore(ConversationStore):
             if parent_id is not None:
                 result[parent_id].append(child_id)
         return result
+
+    def get_session_goal(self, conversation_id: str) -> SessionGoal | None:
+        with self._conv_session("read_session_goal") as session:
+            row = session.get(SqlSessionGoal, (current_workspace_id(), conversation_id))
+            return self._session_goal_entity(row) if row is not None else None
+
+    @staticmethod
+    def _session_goal_entity(row: SqlSessionGoal) -> SessionGoal:
+        return SessionGoal.model_validate(
+            {name: getattr(row, name) for name in SessionGoal.model_fields}
+        )
+
+    def set_session_goal(
+        self,
+        conversation_id: str,
+        request: SetSessionGoalRequest,
+        updated_by: str | None,
+    ) -> SessionGoal:
+        with self._conv_session_immediate("update_session_goal") as session:
+            if session.get(SqlConversation, (current_workspace_id(), conversation_id)) is None:
+                raise ConversationNotFoundError(conversation_id)
+            self._lock_conversation(session, conversation_id)
+            row = session.get(SqlSessionGoal, (current_workspace_id(), conversation_id))
+            revision = row.revision if row is not None else 0
+            if revision != request.expected_revision:
+                raise SessionGoalConflict(conversation_id)
+            state = request.status or (row.status if row is not None else "paused")
+            evidence = request.completion_evidence
+            if "completion_evidence" not in request.model_fields_set and row is not None:
+                evidence = row.completion_evidence
+            if state == "completed":
+                if not evidence or not evidence.strip():
+                    raise ValueError("Completed goals require completion evidence")
+                if (
+                    row is not None
+                    and row.objective != request.objective
+                    and (
+                        request.status is None
+                        or "completion_evidence" not in request.model_fields_set
+                    )
+                ):
+                    raise ValueError(
+                        "Changed completed objectives need explicit status and evidence"
+                    )
+            now = now_epoch()
+            if row is None:
+                row = SqlSessionGoal(
+                    workspace_id=current_workspace_id(),
+                    session_id=conversation_id,
+                    created_at=now,
+                )
+                session.add(row)
+            row.objective = request.objective
+            row.status = state
+            row.revision = revision + 1
+            row.completion_evidence = evidence
+            row.updated_at = now
+            row.updated_by = updated_by
+            return self._session_goal_entity(row)
 
     def set_labels(
         self,
@@ -4248,6 +4313,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(subtree_ids),
+                )
+            )
+            ap_sess.execute(
+                delete(SqlSessionGoal).where(
+                    SqlSessionGoal.workspace_id == current_workspace_id(),
+                    SqlSessionGoal.session_id.in_(subtree_ids),
                 )
             )
             ap_sess.execute(
