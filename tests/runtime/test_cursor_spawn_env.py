@@ -45,6 +45,7 @@ def _make_spec(
     name: str = "test-cursor",
     auth: ApiKeyAuth | DatabricksAuth | None = None,
     permission_mode: str | None = None,
+    optimize_for: str | None = None,
 ) -> AgentSpec:
     """Build a minimal cursor :class:`AgentSpec` for the spawn-env tests."""
     config: dict[str, object] = {"harness": "cursor"}
@@ -52,6 +53,8 @@ def _make_spec(
         config["model"] = model
     if permission_mode is not None:
         config["permission_mode"] = permission_mode
+    if optimize_for is not None:
+        config["optimize_for"] = optimize_for
     return AgentSpec(
         spec_version=1,
         name=name,
@@ -68,9 +71,43 @@ def test_model_threads_into_env_var() -> None:
 
 
 def test_no_model_produces_no_model_env_var() -> None:
-    """A spec with no model omits ``HARNESS_CURSOR_MODEL`` (cursor's default applies)."""
+    """A spec with no model omits ``HARNESS_CURSOR_MODEL`` (the executor then refuses it)."""
     env = _build_cursor_spawn_env(_make_spec(model=None))
     assert "HARNESS_CURSOR_MODEL" not in env
+
+
+def test_no_model_and_no_optimize_for_sets_neither_env_var() -> None:
+    """No model and no ``optimize_for`` writes neither var, so the executor
+    refuses the session (no implicit Router default for unpinned specs)."""
+    env = _build_cursor_spawn_env(_make_spec(model=None))
+    assert "HARNESS_CURSOR_MODEL" not in env
+    assert "HARNESS_CURSOR_ROUTER_MODE" not in env
+
+
+def test_optimize_for_threads_into_router_mode_env_var() -> None:
+    """``executor.config.optimize_for`` is forwarded as ``HARNESS_CURSOR_ROUTER_MODE``."""
+    env = _build_cursor_spawn_env(_make_spec(model="auto-smart", optimize_for="balanced"))
+    assert env["HARNESS_CURSOR_MODEL"] == "auto-smart"
+    assert env["HARNESS_CURSOR_ROUTER_MODE"] == "balanced"
+
+
+def test_optimize_for_without_model_sets_only_router_mode() -> None:
+    """``optimize_for`` alone selects the Router (the executor maps it to auto-smart)."""
+    env = _build_cursor_spawn_env(_make_spec(model=None, optimize_for="cost"))
+    assert "HARNESS_CURSOR_MODEL" not in env
+    assert env["HARNESS_CURSOR_ROUTER_MODE"] == "cost"
+
+
+def test_blank_optimize_for_is_omitted() -> None:
+    """A blank ``optimize_for`` is treated as unset, never as a Router mode."""
+    env = _build_cursor_spawn_env(_make_spec(model=None, optimize_for="  "))
+    assert "HARNESS_CURSOR_ROUTER_MODE" not in env
+
+
+def test_unsupported_optimize_for_is_forwarded_for_executor_to_reject() -> None:
+    """Value validation lives in the executor; the builder forwards verbatim."""
+    env = _build_cursor_spawn_env(_make_spec(model=None, optimize_for="fastest"))
+    assert env["HARNESS_CURSOR_ROUTER_MODE"] == "fastest"
 
 
 def test_api_key_auth_sets_api_key_env_var() -> None:
