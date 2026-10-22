@@ -785,3 +785,302 @@ def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> Non
     assert refresh_stored_token("http://localhost:6767") == "fresh"
     entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
     assert entry["expires_at"] < time.time() + 4000
+
+
+# ── Refresh resilience, status file and alert hook ───────────────
+
+
+@pytest.fixture()
+def fast_retry(monkeypatch):
+    """No real sleeping between transient refresh retries."""
+    monkeypatch.setattr("omnigent.cli_auth._REFRESH_BACKOFF_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr("omnigent.cli_auth.time.sleep", lambda _s: None)
+
+
+@pytest.fixture()
+def alert_calls(monkeypatch):
+    """Capture alert-hook launches instead of spawning processes."""
+    calls: list[dict[str, object]] = []
+
+    def _fake_popen(argv, **kwargs):
+        calls.append({"argv": argv, "env": kwargs.get("env", {})})
+
+        class _P:
+            pid = 0
+
+        return _P()
+
+    monkeypatch.setenv(
+        "OMNIGENT_AUTH_ALERT_COMMAND", "/usr/local/bin/post-alert --channel blockers"
+    )
+    monkeypatch.setattr("omnigent.cli_auth.subprocess.Popen", _fake_popen)
+    return calls
+
+
+def _expired_entry(refresh_token: str = "refresh-1", **extra) -> None:
+    from omnigent.cli_auth import store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token=refresh_token,
+        **extra,
+    )
+
+
+def _entry(token_dir) -> dict:
+    import json
+
+    return json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
+
+
+def test_refresh_retries_transient_failures(token_dir, monkeypatch, fast_retry) -> None:
+    """A 503 and a connection error (DB failover, restart) are retried in-call."""
+    import httpx
+
+    from omnigent.cli_auth import load_refresh_status, refresh_stored_token
+
+    _expired_entry()
+    outcomes: list[object] = [
+        httpx.ConnectError("connection refused"),
+        503,
+        {"access_token": "fresh", "refresh_token": "refresh-2", "expires_in": 3600},
+    ]
+
+    def _fake_post(url, *, data=None, timeout=None):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if isinstance(outcome, int):
+            return httpx.Response(outcome, request=httpx.Request("POST", url))
+        return httpx.Response(200, json=outcome, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") == "fresh"
+    assert outcomes == []
+    assert _entry(token_dir)["refresh_token"] == "refresh-2"
+    status = load_refresh_status("http://localhost:6767")
+    assert status is not None and status["state"] == "ok"
+    assert status["consecutive_failures"] == 0
+
+
+def test_transient_failure_keeps_stored_credential(
+    token_dir, monkeypatch, fast_retry, alert_calls
+) -> None:
+    """Exhausted transient retries never touch the stored pair or alert at once."""
+    import httpx
+
+    from omnigent.cli_auth import load_refresh_status, refresh_stored_token
+
+    _expired_entry()
+    attempts = []
+
+    def _fake_post(url, *, data=None, timeout=None):
+        attempts.append(url)
+        return httpx.Response(500, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert len(attempts) == 3
+    entry = _entry(token_dir)
+    assert entry["refresh_token"] == "refresh-1" and entry["token"] == "stale"
+    status = load_refresh_status("http://localhost:6767")
+    assert status is not None and status["state"] == "unreachable"
+    assert status["consecutive_failures"] == 1
+    assert alert_calls == []
+
+
+def test_long_transient_outage_alerts_once(
+    token_dir, monkeypatch, fast_retry, alert_calls
+) -> None:
+    import httpx
+
+    from omnigent import cli_auth
+
+    _expired_entry()
+    monkeypatch.setattr(cli_auth, "_UNREACHABLE_ALERT_THRESHOLD", 2)
+
+    def _fake_post(url, *, data=None, timeout=None):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    for _ in range(4):
+        assert cli_auth.refresh_stored_token("http://localhost:6767") is None
+    assert [c["env"]["OMNIGENT_AUTH_ALERT_KIND"] for c in alert_calls] == ["refresh_unreachable"]
+
+
+def test_definitive_refusal_alerts_once_and_keeps_entry(
+    token_dir, monkeypatch, fast_retry, alert_calls, caplog
+) -> None:
+    """``invalid_grant`` is definitive: one alert with no token material,
+    a clear log line, a ``refused`` status, and the stored entry kept."""
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import load_refresh_status, refresh_stored_token
+
+    _expired_entry("secret-refresh-value")
+    posts = []
+
+    def _fake_post(url, *, data=None, timeout=None):
+        posts.append(url)
+        return httpx.Response(
+            400, json={"error": "expired_token"}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert refresh_stored_token("http://localhost:6767") is None
+        assert refresh_stored_token("http://localhost:6767") is None
+    # Definitive refusals are not retried in-call.
+    assert len(posts) == 2
+    assert _entry(token_dir)["refresh_token"] == "secret-refresh-value"
+    status = load_refresh_status("http://localhost:6767")
+    assert status is not None and status["state"] == "refused"
+    assert status["error"] == "expired_token" and status["http_status"] == 400
+    assert len(alert_calls) == 1
+    call = alert_calls[0]
+    assert call["argv"] == ["/usr/local/bin/post-alert", "--channel", "blockers"]
+    env = call["env"]
+    assert env["OMNIGENT_AUTH_ALERT_KIND"] == "refresh_refused"
+    assert env["OMNIGENT_AUTH_ALERT_SERVER"] == "http://localhost:6767"
+    assert "absolute lifetime" in env["OMNIGENT_AUTH_ALERT_MESSAGE"]
+    assert all("secret-refresh-value" not in str(v) for v in env.values())
+    assert "secret-refresh-value" not in (token_dir / "auth_refresh_status.json").read_text()
+    assert any(
+        r.levelno == logging.ERROR and "kind=refresh_refused" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_refusal_alert_rearms_after_success(
+    token_dir, monkeypatch, fast_retry, alert_calls
+) -> None:
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token
+
+    _expired_entry()
+    responses = [
+        (400, {"error": "invalid_grant"}),
+        (200, {"access_token": "fresh", "expires_in": 1}),
+        (400, {"error": "invalid_grant"}),
+    ]
+
+    def _fake_post(url, *, data=None, timeout=None):
+        code, body = responses.pop(0)
+        return httpx.Response(code, json=body, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert refresh_stored_token("http://localhost:6767") == "fresh"
+    assert refresh_stored_token("http://localhost:6767") is None
+    kinds = [c["env"]["OMNIGENT_AUTH_ALERT_KIND"] for c in alert_calls]
+    assert kinds == ["refresh_refused", "refresh_refused"]
+
+
+def test_refresh_records_grant_expiry_and_warns_ahead(
+    token_dir, monkeypatch, fast_retry, alert_calls
+) -> None:
+    """A grant inside the warning window flags ``expiring`` and alerts."""
+    import httpx
+
+    from omnigent.cli_auth import load_refresh_status, refresh_stored_token
+
+    _expired_entry()
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "fresh",
+                "refresh_token": "refresh-1",
+                "expires_in": 3600,
+                "refresh_token_expires_in": 2 * 86400,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") == "fresh"
+    entry = _entry(token_dir)
+    assert abs(entry["refresh_expires_at"] - (time.time() + 2 * 86400)) < 60
+    status = load_refresh_status("http://localhost:6767")
+    assert status is not None and status["state"] == "expiring"
+    assert [c["env"]["OMNIGENT_AUTH_ALERT_KIND"] for c in alert_calls] == ["refresh_expiring"]
+
+
+def test_refresh_far_from_expiry_is_ok(token_dir, monkeypatch, fast_retry, alert_calls) -> None:
+    import httpx
+
+    from omnigent.cli_auth import load_refresh_status, refresh_stored_token
+
+    _expired_entry()
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "fresh",
+                "expires_in": 3600,
+                "refresh_token_expires_in": 20 * 86400,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") == "fresh"
+    status = load_refresh_status("http://localhost:6767")
+    assert status is not None and status["state"] == "ok"
+    assert alert_calls == []
+
+
+def test_refresh_keeps_known_expiry_when_server_omits_it(token_dir, monkeypatch) -> None:
+    """Same (non-rotated) refresh token + no lifetime in the response keeps
+    the stored expiry; a rotated token without one drops it."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token
+
+    known = time.time() + 10 * 86400
+    _expired_entry(refresh_expires_at=known)
+
+    def _same(url, *, data=None, timeout=None):
+        return httpx.Response(
+            200, json={"access_token": "a1", "expires_in": 1}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", _same)
+    assert refresh_stored_token("http://localhost:6767") == "a1"
+    assert _entry(token_dir)["refresh_expires_at"] == pytest.approx(known)
+
+    def _rotated(url, *, data=None, timeout=None):
+        return httpx.Response(
+            200,
+            json={"access_token": "a2", "refresh_token": "refresh-2", "expires_in": 3600},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", _rotated)
+    assert refresh_stored_token("http://localhost:6767") == "a2"
+    assert "refresh_expires_at" not in _entry(token_dir)
+
+
+def test_alert_hook_start_failure_is_contained(token_dir, monkeypatch, fast_retry) -> None:
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token
+
+    _expired_entry()
+    monkeypatch.setenv("OMNIGENT_AUTH_ALERT_COMMAND", "/nonexistent/alert-hook")
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(
+            400, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") is None

@@ -68,9 +68,13 @@ _MEASURE_WINDOW_S = 35.0
 # Max cores an idle, connected daemon may consume. The bug measures
 # ~0.2 cores under this PATH; a daemon that caches binary resolutions
 # (or otherwise avoids rescanning PATH every 5s) measures ~0.005 cores,
-# with the 60s full refresh adding at most ~0.03. 0.07 sits between the
-# two with ~3x margin on each side.
-_MAX_IDLE_CORES = 0.07
+# with the 60s full refresh adding at most ~0.03. Process CPU time (not
+# wall time) inflates on a shared, oversubscribed CI host (cold dentry
+# cache + SMT/cache contention during the 3000-dir PATH walk: 0.085 seen on
+# the shared Forgejo runner), so 0.07 flaked. 0.12 still
+# sits well below the bug (~0.2, higher under load) and above the healthy
+# ceiling.
+_MAX_IDLE_CORES = 0.12
 
 # Seconds after the tunnel establishes before sampling starts, so
 # connect-time work (initial capability probe, registration) settles.

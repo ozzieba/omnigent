@@ -465,3 +465,49 @@ async def test_compaction_snapshot_persists_without_base64_payloads(
     assert source["media_type"] == "image/png"
     assert source["data"] == "[image/png content omitted from the compaction snapshot]"
     assert messages[1]["content"][0]["text"] == "I can see the screenshot."
+
+
+# ── compaction: vendor-terminal compaction boundary persisted by a forwarder ──
+
+
+@pytest.mark.parametrize("window_id", [2, "01a15f09-4b04-71a2-86aa-c48f0333e697"])
+async def test_codex_forwarder_compaction_event_persists(
+    client: httpx.AsyncClient,
+    window_id: int | str,
+) -> None:
+    """
+    The codex-native forwarder's compaction POST is stored, not rejected.
+
+    Current Codex writes a UUID-string ``window_id``; a 400 here means the
+    session never gets a compaction boundary and every turn reloads the
+    whole history.
+    """
+    agent = await create_test_agent(client)
+    sid = await _create_session(client, agent["id"])
+    compacted = [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"type": "compaction", "encrypted_content": "gAAAA_test"},
+    ]
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": "[Codex compaction — context was compacted in the terminal]",
+                "last_item_id": f"compact_boundary_{sid}",
+                "model": "unknown",
+                "token_count": 0,
+                "compacted_messages": compacted,
+                "window_id": window_id,
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = await client.get(f"/v1/sessions/{sid}/items", params={"limit": 10, "order": "desc"})
+    assert items.status_code == 200, items.text
+    stored = [item for item in items.json()["data"] if item["type"] == "compaction"]
+    assert len(stored) == 1, items.text
+    assert stored[0]["window_id"] == window_id
+    assert stored[0]["compacted_messages"] == compacted

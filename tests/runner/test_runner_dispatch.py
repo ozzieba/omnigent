@@ -7822,7 +7822,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
             assert request.url.params["include_items"] == "false"
-            assert request.url.params["include_liveness"] == "false"
+            assert request.url.params["include_liveness"] == "true"
             return httpx.Response(
                 200,
                 json={
@@ -7835,6 +7835,11 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "title": "auth flow",
                     "runner_id": "runner_1",
                     "host_id": "host_1",
+                    "runner_online": False,
+                    "host_online": True,
+                    "host_resumable": False,
+                    "active_response_id": "private-response-id",
+                    "pending_inputs": [{"content": "PRIVATE_QUEUED_INPUT"}],
                     "reasoning_effort": "high",
                     "parent_session_id": "conv_parent",
                     "sub_agent_name": "researcher",
@@ -7876,6 +7881,12 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     # Live connectivity folded in from the runners status endpoint —
     # None here would mean the best-effort status call was skipped.
     assert info["runner_online"] is True
+    # Snapshot liveness is independent of the best-effort runner lookup.
+    assert info["liveness_runner_online"] is False
+    assert info["host_online"] is True
+    assert info["host_resumable"] is False
+    assert info["active_response_present"] is True
+    assert info["pending_input_count"] == 1
     assert info["host_id"] == "host_1"
     assert info["configured_harnesses"] == {
         "codex-native": True,
@@ -7894,6 +7905,10 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     assert info["pending_elicitations"] == [{"id": "el_1"}, {"id": "el_2"}]
     # Metadata-only: the full transcript is never embedded.
     assert "items" not in info
+    assert "active_response_id" not in info
+    assert "pending_inputs" not in info
+    assert "private-response-id" not in output
+    assert "PRIVATE_QUEUED_INPUT" not in output
 
 
 @pytest.mark.asyncio

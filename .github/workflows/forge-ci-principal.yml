@@ -1,0 +1,36 @@
+name: Forge CI Principal
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/forge-ci-principal.yml
+      - .github/scripts/ci/forge_principal.py
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    name: Observe normal Actions principal
+    if: >-
+      github.server_url == 'https://forge.ozba.me' &&
+      github.repository == 'oz/omnigent' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: |
+            .github/scripts/ci
+            .python-version
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version-file: .python-version
+      - name: Read bounded principal and repository metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROBE_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python .github/scripts/ci/forge_principal.py

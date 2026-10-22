@@ -1490,6 +1490,111 @@ def test_build_codex_remote_args_resume_strips_permission_overrides() -> None:
     ]
 
 
+# Every argv spelling that makes codex 0.162.0 ``resume --remote`` exit 1
+# (verified against a live app-server and a persisted thread).
+_REMOTE_RESUME_REJECTED_ARGS = [
+    pytest.param(("-c", 'approval_policy="never"'), id="c-approval-policy"),
+    pytest.param(("-c", 'sandbox_mode="read-only"'), id="c-sandbox-mode"),
+    pytest.param(("-c", 'approvals_reviewer="user"'), id="c-approvals-reviewer"),
+    pytest.param(("-c", 'default_permissions=":workspace"'), id="c-default-permissions"),
+    pytest.param(("-c", " approval_policy = 'never'"), id="c-spaced-key"),
+    pytest.param(("-c", "sandbox_workspace_write.network_access=true"), id="c-dotted-sandbox"),
+    pytest.param(("-c", "permissions.workspace.network=true"), id="c-dotted-permissions"),
+    pytest.param(("--config", "approval_policy=never"), id="config-space"),
+    pytest.param(("--config=sandbox_mode=read-only",), id="config-equals"),
+    pytest.param(("-c=approval_policy=never",), id="c-equals"),
+    pytest.param(("-capproval_policy=never",), id="c-glued"),
+    pytest.param(("--dangerously-bypass-approvals-and-sandbox",), id="bypass"),
+    pytest.param(("--yolo",), id="yolo"),
+    pytest.param(("--approve-for-me",), id="approve-for-me"),
+    pytest.param(("--full-auto",), id="full-auto"),
+    pytest.param(("-s", "read-only"), id="s-space"),
+    pytest.param(("-sread-only",), id="s-glued"),
+    pytest.param(("-s=read-only",), id="s-equals"),
+    pytest.param(("--sandbox", "read-only"), id="sandbox-space"),
+    pytest.param(("--sandbox=read-only",), id="sandbox-equals"),
+    pytest.param(("-a", "never"), id="a-space"),
+    pytest.param(("-anever",), id="a-glued"),
+    pytest.param(("-a=never",), id="a-equals"),
+    pytest.param(("--ask-for-approval", "never"), id="ask-space"),
+    pytest.param(("--ask-for-approval=never",), id="ask-equals"),
+    pytest.param(("--add-dir", "/tmp"), id="add-dir-space"),
+    pytest.param(("--add-dir=/tmp",), id="add-dir-equals"),
+]
+
+
+@pytest.mark.parametrize("rejected", _REMOTE_RESUME_REJECTED_ARGS)
+@pytest.mark.parametrize("source", ["codex_args", "config_overrides"])
+def test_build_codex_remote_args_resume_strips_every_permission_spelling(
+    rejected: tuple[str, ...], source: str
+) -> None:
+    """
+    No spelling of a permission override reaches a ``resume --remote`` attach.
+
+    Codex exits with "Permission overrides are not supported when resuming a
+    remote task" on any of them, the pane dies, and the runner's terminal
+    auto-create loops ("Bridge closed"). The override may arrive in the
+    client-supplied launch args or, for ``-c`` values, in the app-server's
+    ``config_overrides``; both feed the same attach argv.
+    """
+    if source == "config_overrides":
+        if rejected[0] != "-c" or len(rejected) != 2:
+            pytest.skip("config_overrides carries bare -c values only")
+        codex_args: tuple[str, ...] = ()
+        overrides = (*_MODEL_PROVIDER_OVERRIDES, rejected[1])
+    else:
+        codex_args = ("--model", "gpt-5.5", *rejected, "-c", 'model_reasoning_effort="high"')
+        overrides = _MODEL_PROVIDER_OVERRIDES
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=codex_args,
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=overrides,
+    )
+
+    provider = [
+        "-c",
+        'model="catalog-databricks-openai-default"',
+        "-c",
+        'model_provider="omnigent_databricks"',
+    ]
+    if source == "config_overrides":
+        expected_tail: list[str] = []
+    else:
+        expected_tail = ["--model", "gpt-5.5", "-c", 'model_reasoning_effort="high"']
+    assert args == [
+        *provider,
+        *expected_tail,
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_x",
+    ]
+
+
+@pytest.mark.parametrize(
+    "kept",
+    [
+        pytest.param(("-p", "work"), id="profile"),
+        pytest.param(("--dangerously-bypass-hook-trust",), id="hook-trust"),
+        pytest.param(("-c", "features.terminal_resize_reflow=true"), id="c-feature"),
+        pytest.param(("-cmodel=gpt-5.5",), id="c-glued-model"),
+        pytest.param(("--config=model_reasoning_effort=high",), id="config-equals-model"),
+        pytest.param(
+            ("-c", 'notice.hide_full_access_warning="sandbox_mode"'), id="c-value-mentions-key"
+        ),
+    ],
+)
+def test_build_codex_remote_args_resume_keeps_non_permission_args(kept: tuple[str, ...]) -> None:
+    """Args codex accepts on ``resume --remote`` survive the permission strip."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=kept,
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+    )
+    assert args == [*kept, "resume", "--remote", "ws://127.0.0.1:9876", "thread_x"]
+
+
 def test_build_codex_remote_args_fresh_launch_keeps_permission_overrides() -> None:
     """A fresh (non-resume) launch still passes the permission args through."""
     args = codex_native_app_server.build_codex_remote_args(
@@ -11101,7 +11206,10 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
     ]
 
 
-def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:
+@pytest.mark.parametrize("window_id", [2, "01a15f09-4b04-71a2-86aa-c48f0333e697"])
+def test_rollout_records_includes_compacted_entry_from_compaction_item(
+    window_id: int | str,
+) -> None:
     """Compaction items emit a Compacted rollout record and discard prior items."""
     items: list[dict[str, Any]] = [
         {
@@ -11133,7 +11241,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
                     "encrypted_content": "gAAAA_encrypted",
                 },
             ],
-            "window_id": 2,
+            "window_id": window_id,
             "response_id": "compact_1",
         },
         {
@@ -11168,7 +11276,7 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
     compacted_records = [r for r in records if r["type"] == "compacted"]
     assert len(compacted_records) == 1
     cp = compacted_records[0]["payload"]
-    assert cp["window_id"] == 2
+    assert cp["window_id"] == window_id
     assert len(cp["replacement_history"]) == 2
     assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
     # Post-compaction message should still be present

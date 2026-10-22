@@ -3630,12 +3630,30 @@ def build_codex_remote_args(
     return [*attach_args, "resume", "--remote", remote_url, thread_id]
 
 
-# ``-c`` / ``--config`` keys that ``codex resume --remote`` treats as
-# permission overrides and rejects.
+# ``-c`` / ``--config`` key roots that ``codex resume --remote`` treats as
+# permission overrides and rejects; dotted sub-keys (``sandbox_workspace_write.
+# network_access``, ``permissions.<profile>.*``) count too.
 _REMOTE_RESUME_PERMISSION_CONFIG_KEYS = frozenset(
-    {"default_permissions", "approval_policy", "approvals_reviewer", "sandbox_mode"}
+    {
+        "default_permissions",
+        "approval_policy",
+        "approvals_reviewer",
+        "sandbox_mode",
+        "sandbox_workspace_write",
+        "permissions",
+    }
 )
 _CODEX_CONFIG_FLAGS = frozenset({"-c", "--config"})
+# Value-less switches a remote resume rejects. ``--yolo`` is an alias of the
+# bypass flag; ``--full-auto`` was removed from current Codex (unknown argument).
+_REMOTE_RESUME_PERMISSION_SWITCHES = frozenset(
+    {_CODEX_BYPASS_SANDBOX_FLAG, "--yolo", "--approve-for-me", "--full-auto"}
+)
+# Value-taking flags a remote resume rejects: the approval/sandbox flags, plus
+# ``--add-dir`` ("not supported with --remote", workspace roots are server-side).
+_REMOTE_RESUME_PERMISSION_VALUE_FLAGS = _CODEX_APPROVAL_SANDBOX_FLAGS | {"--add-dir"}
+# Short flags whose value may be glued on (``-sread-only``, ``-anever``).
+_REMOTE_RESUME_PERMISSION_SHORT_FLAGS = ("-s", "-a")
 
 
 def _strip_remote_resume_permission_overrides(args: list[str]) -> list[str]:
@@ -3647,19 +3665,22 @@ def _strip_remote_resume_permission_overrides(args: list[str]) -> list[str]:
     approval/sandbox/permission override. The remote app-server already
     holds the thread's permission profile, so the attaching TUI needs none.
 
-    Dropped:
+    Dropped (every spelling clap accepts):
 
-    - ``--dangerously-bypass-approvals-and-sandbox``.
-    - ``--sandbox`` / ``-s`` / ``--ask-for-approval`` / ``-a`` in both the
-      ``--flag value`` and ``--flag=value`` spellings. As in
-      :func:`_strip_approval_sandbox_flags`, the next token is consumed as
-      the value only when it does not start with ``-``.
-    - ``-c`` / ``--config`` overrides (``-c key=value`` or
-      ``--config=key=value``) whose key is in
+    - The switches in :data:`_REMOTE_RESUME_PERMISSION_SWITCHES`
+      (``--dangerously-bypass-approvals-and-sandbox``, ``--yolo``,
+      ``--approve-for-me``, ``--full-auto``).
+    - ``--sandbox`` / ``-s`` / ``--ask-for-approval`` / ``-a`` / ``--add-dir``
+      as ``--flag value``, ``--flag=value``, and for the short flags the
+      glued ``-svalue`` form. As in :func:`_strip_approval_sandbox_flags`, the
+      next token is consumed as the value only when it does not start with
+      ``-``.
+    - ``-c`` / ``--config`` overrides (``-c k=v``, ``-c=k=v``, ``-ck=v``,
+      ``--config k=v``, ``--config=k=v``) whose key root is in
       :data:`_REMOTE_RESUME_PERMISSION_CONFIG_KEYS`.
 
-    Everything else (model/provider ``-c`` overrides, the hook-trust
-    bypass flag, ...) passes through untouched.
+    Everything else (model/provider/feature ``-c`` overrides, ``--profile``,
+    the hook-trust bypass flag, ...) passes through untouched.
 
     :param args: Codex argv passthrough, e.g.
         ``["-c", 'default_permissions=":workspace"', "--sandbox", "read-only"]``.
@@ -3670,32 +3691,64 @@ def _strip_remote_resume_permission_overrides(args: list[str]) -> list[str]:
     n = len(args)
     while i < n:
         arg = args[i]
-        if arg == _CODEX_BYPASS_SANDBOX_FLAG:
+        if arg in _REMOTE_RESUME_PERMISSION_SWITCHES:
             i += 1
             continue
-        if arg in _CODEX_APPROVAL_SANDBOX_FLAGS:
+        if arg in _REMOTE_RESUME_PERMISSION_VALUE_FLAGS:
             if i + 1 < n and not args[i + 1].startswith("-"):
                 i += 2
             else:
                 i += 1
             continue
-        if any(arg.startswith(f"{flag}=") for flag in _CODEX_APPROVAL_SANDBOX_FLAGS):
+        if arg.startswith(tuple(f"{flag}=" for flag in _REMOTE_RESUME_PERMISSION_VALUE_FLAGS)):
+            i += 1
+            continue
+        if arg.startswith(_REMOTE_RESUME_PERMISSION_SHORT_FLAGS) and not arg.startswith("--"):
+            # Glued short value: ``-sread-only`` / ``-anever``.
             i += 1
             continue
         if arg in _CODEX_CONFIG_FLAGS and i + 1 < n:
-            if _config_override_key(args[i + 1]) in _REMOTE_RESUME_PERMISSION_CONFIG_KEYS:
+            if _is_remote_resume_permission_config(args[i + 1]):
                 i += 2
                 continue
-        elif arg.startswith("--config="):
-            if (
-                _config_override_key(arg[len("--config=") :])
-                in _REMOTE_RESUME_PERMISSION_CONFIG_KEYS
-            ):
-                i += 1
-                continue
+            cleaned.extend(args[i : i + 2])
+            i += 2
+            continue
+        glued = _glued_config_override(arg)
+        if glued is not None and _is_remote_resume_permission_config(glued):
+            i += 1
+            continue
         cleaned.append(arg)
         i += 1
     return cleaned
+
+
+def _glued_config_override(arg: str) -> str | None:
+    """
+    Return the override value of a single-token ``-c`` / ``--config`` arg.
+
+    :param arg: Codex argv token, e.g. ``"--config=sandbox_mode=read-only"``,
+        ``"-c=approval_policy=never"`` or ``"-capproval_policy=never"``.
+    :returns: The ``key=value`` part, e.g. ``"sandbox_mode=read-only"``, or
+        ``None`` when *arg* is not a glued config override.
+    """
+    if arg.startswith("--config="):
+        return arg[len("--config=") :]
+    if arg.startswith("-c") and not arg.startswith("--") and len(arg) > 2:
+        return arg[3:] if arg[2] == "=" else arg[2:]
+    return None
+
+
+def _is_remote_resume_permission_config(override: str) -> bool:
+    """
+    Whether a ``-c`` override sets a permission key a remote resume rejects.
+
+    :param override: Override value, e.g. ``'sandbox_workspace_write.network_access=true'``.
+    :returns: ``True`` when the key's first dotted segment is in
+        :data:`_REMOTE_RESUME_PERMISSION_CONFIG_KEYS`, e.g. ``True`` here.
+    """
+    root = _config_override_key(override).split(".", 1)[0].strip().strip("\"'")
+    return root in _REMOTE_RESUME_PERMISSION_CONFIG_KEYS
 
 
 def _config_override_key(override: str) -> str:

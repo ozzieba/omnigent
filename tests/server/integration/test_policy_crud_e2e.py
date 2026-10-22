@@ -89,7 +89,15 @@ def auth_app(
     :param tmp_path: Pytest temp dir for artifacts.
     :returns: A :class:`FastAPI` instance with auth and policy routes.
     """
+    from omnigent.policies.registry import load_registry
     from omnigent.server.auth import UnifiedAuthProvider
+
+    # The server populates the policy registry in its lifespan hook, but
+    # httpx.ASGITransport never runs lifespan. Without this the catalog
+    # is whatever an earlier test in the same pytest/xdist worker happened to
+    # leave in the process-global registry, so GET /v1/policy-registry
+    # returned [] whenever a registry test was the first one on its worker.
+    load_registry()
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(

@@ -457,6 +457,48 @@ def user_opencode_config_path() -> Path | None:
     return None
 
 
+def read_owned_gemma_auth_snapshot(bridge_dir: Path) -> bytes | None:
+    """Reject existing config/account state and remote auth config producers."""
+    for directory in (
+        xdg_data_home_for_bridge_dir(bridge_dir),
+        xdg_config_home_for_bridge_dir(bridge_dir),
+    ):
+        if directory.is_symlink() or (directory.exists() and next(directory.iterdir(), None)):
+            raise ValueError("Owned Gemma role requires fresh native config/account state")
+    try:
+        snapshot = user_opencode_auth_path().read_bytes()
+    except FileNotFoundError:
+        return None
+    try:
+        auth = json.loads(snapshot)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("Owned Gemma role requires known auth metadata") from exc
+    if not isinstance(auth, dict) or any(
+        not isinstance(entry, dict) or entry.get("type") not in ("api", "oauth")
+        for entry in auth.values()
+    ):
+        raise ValueError("Owned Gemma role rejects remote or unknown auth config producers")
+    return snapshot
+
+
+def seed_owned_gemma_auth(bridge_dir: Path, *, snapshot: bytes | None) -> Path | None:
+    """Seed the exact validated snapshot without rereading mutable user auth."""
+    if snapshot is None:
+        return None
+    dest_dir = xdg_data_home_for_bridge_dir(bridge_dir) / "opencode"
+    dest_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    dest = dest_dir / "auth.json"
+    fd, temporary = tempfile.mkstemp(prefix=".auth-", dir=dest_dir)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(snapshot)
+        os.replace(temporary, dest)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return dest
+
+
 def seed_opencode_auth(bridge_dir: Path) -> Path | None:
     """
     Copy the user's OpenCode ``auth.json`` into the per-session ``XDG_DATA_HOME``.

@@ -37,6 +37,7 @@ import queue
 import re
 import secrets
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
@@ -95,6 +96,12 @@ _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
 _FORKED_FROM_LINE_LIMIT = 200
 _TOOL_RELAY_FILE = "tool_relay.json"
+# ``tool_relay.json`` outlives the runner that wrote it. When the advertised
+# loopback port refuses connections, ``_call_relay_tool`` waits this long for
+# a fresh advertisement (a relay still starting, or a replacement runner)
+# before answering with a stale-relay error instead of a bare refusal.
+_TOOL_RELAY_STALE_WAIT_S = 5.0
+_TOOL_RELAY_STALE_POLL_S = 0.25
 # Shell-sourceable sibling of tool_relay.json so the curl-based hook
 # commands can discover the live relay without a JSON parser. Re-written
 # on every relay start, so hooks survive runner restarts (new port).
@@ -5408,6 +5415,10 @@ def _call_relay_tool(
     url = relay.get("url")
     if not isinstance(token, str) or not isinstance(url, str):
         return _mcp_error("active Omnigent tool relay is missing url/token")
+    live = _await_live_relay(bridge_dir, url, token)
+    if isinstance(live, str):
+        return _mcp_error(live)
+    url, token = live
     payload = json.dumps({"name": name, "arguments": arguments}).encode("utf-8")
     req = request.Request(
         f"{url}/tool",
@@ -5439,6 +5450,84 @@ def _call_relay_tool(
     if not isinstance(decoded, dict):
         return _mcp_error("Omnigent tool relay returned non-object JSON")
     return decoded
+
+
+def _await_live_relay(bridge_dir: Path, url: str, token: str) -> tuple[str, str] | str:
+    """
+    Return relay coordinates whose port listens, or the reason none do.
+
+    A refused loopback connect means no process holds the advertised port:
+    the advertisement is stale (left by an earlier runner whose replacement
+    could not start its relay) or the relay is still starting. Re-read the
+    advertisement for a bounded window so a relay that comes up, or a fresh
+    advertisement, is used; otherwise name the stale relay so the agent and
+    operator see why every tool call fails, instead of a bare refusal.
+
+    :param bridge_dir: Bridge directory holding ``tool_relay.json``.
+    :param url: Relay base URL from the current advertisement.
+    :param token: Relay bearer token from the current advertisement.
+    :returns: ``(url, token)`` to call, or the error text when the relay
+        stayed unreachable for :data:`_TOOL_RELAY_STALE_WAIT_S`.
+    """
+    from omnigent.native_policy_hook import relay_refuses_connections
+
+    deadline = time.monotonic() + _TOOL_RELAY_STALE_WAIT_S
+    while relay_refuses_connections(url):
+        if time.monotonic() >= deadline:
+            return (
+                f"Omnigent tool relay at {url} is not listening (stale {_TOOL_RELAY_FILE} "
+                "from an earlier runner; the current runner did not start its relay). "
+                "Tool calls cannot run until the session's runner restarts its relay; "
+                "resume or relaunch the session."
+            )
+        time.sleep(_TOOL_RELAY_STALE_POLL_S)
+        refreshed = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
+        new_url, new_token = refreshed.get("url"), refreshed.get("token")
+        if isinstance(new_url, str) and isinstance(new_token, str):
+            url, token = new_url, new_token
+    return url, token
+
+
+def materialize_symlinked_bridge_dir(bridge_dir: Path) -> Path | None:
+    """
+    Replace a symlinked bridge dir with a real, owner-only copy of its target.
+
+    Storage migrations have moved per-session bridge dirs elsewhere and left
+    symlinks behind. :func:`_ensure_secure_dir` rejects a symlinked bridge dir
+    (it holds bearer tokens), so the runner could not start the session's tool
+    relay and every tool call failed. Copy the target into a sibling temp dir,
+    swap it in for the symlink, and leave the target untouched as the
+    operator's rollback copy. Only the leaf is handled: a symlinked ancestor
+    is a host-layout problem for the operator.
+
+    :param bridge_dir: The session's bridge directory path.
+    :returns: The former symlink target when the dir was materialized, else
+        ``None`` (not a symlink, target not a directory, or the copy failed,
+        in which case the symlink is left in place).
+    """
+    if not bridge_dir.is_symlink():
+        return None
+    try:
+        target = bridge_dir.resolve(strict=True)
+    except OSError:
+        return None
+    if not target.is_dir():
+        return None
+    temp = bridge_dir.parent / f".{bridge_dir.name}.materialize-{os.getpid()}"
+    try:
+        if temp.is_symlink() or temp.exists():
+            shutil.rmtree(temp, ignore_errors=True)
+        shutil.copytree(target, temp, symlinks=True)
+        os.chmod(temp, 0o700)
+        for root, dirs, _files in os.walk(temp):
+            for name in dirs:
+                os.chmod(os.path.join(root, name), 0o700)
+        bridge_dir.unlink()
+        os.rename(temp, bridge_dir)
+    except OSError:
+        shutil.rmtree(temp, ignore_errors=True)
+        return None
+    return target
 
 
 def _mcp_error(message: str) -> _JsonObject:

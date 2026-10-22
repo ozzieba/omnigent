@@ -60,6 +60,14 @@ class OAuthError(RuntimeError):
     """A login step failed in a way the user must resolve."""
 
 
+class RefreshServerError(OAuthError):
+    """The token endpoint failed transiently (5xx / 429) — the grant may be fine."""
+
+
+# Token-endpoint statuses that say nothing about the grant itself.
+_TRANSIENT_REFRESH_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
 class AuthorizationPendingError(OAuthError):
     """The user has not yet finished — keep polling."""
 
@@ -383,6 +391,8 @@ class DeviceFlowClient:
             "/oauth/token",
             data={"grant_type": "refresh_token", "refresh_token": refresh_token},
         )
+        if response.status_code in _TRANSIENT_REFRESH_STATUSES:
+            raise RefreshServerError(f"Refresh failed transiently: HTTP {response.status_code}")
         if response.status_code != 200:
             raise OAuthError(f"Refresh failed: {_error_code(response) or response.status_code}")
         return _token_from_response(

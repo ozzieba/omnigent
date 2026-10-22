@@ -27,15 +27,21 @@ class OmnigentBridgeListenerTest {
     private lateinit var shadow: ShadowNotificationManager
 
     private val badgeId = 1
+    private var sharedFilesAcks = 0
+    private var sharedTextAcks = 0
 
     @Before
     fun setUp() {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         context = ApplicationProvider.getApplicationContext()
+        sharedFilesAcks = 0
+        sharedTextAcks = 0
         listener =
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
+                onSharedFilesAcknowledged = { sharedFilesAcks++ },
+                onSharedTextAcknowledged = { sharedTextAcks++ },
             )
         shadow =
             shadowOf(
@@ -131,5 +137,25 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"method":"unknownThing","count":5}""")
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
+    }
+
+    /**
+     * Without this route the shell can never learn that a text share landed,
+     * so [SharedTextHandoff] would retry to its bound on every page load.
+     */
+    @Test
+    fun `sharedTextReceived acknowledges the pending text share`() {
+        listener.handle("""{"method":"sharedTextReceived"}""")
+
+        assertEquals(1, sharedTextAcks)
+        assertEquals(0, sharedFilesAcks)
+    }
+
+    @Test
+    fun `sharedFilesReceived does not acknowledge the text share`() {
+        listener.handle("""{"method":"sharedFilesReceived"}""")
+
+        assertEquals(1, sharedFilesAcks)
+        assertEquals(0, sharedTextAcks)
     }
 }
