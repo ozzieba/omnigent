@@ -92,6 +92,38 @@ def test_compaction_data_valid() -> None:
     assert cd.token_count == 342
 
 
+@pytest.mark.parametrize("window_id", [2, "01a15f09-4b04-71a2-86aa-c48f0333e697"])
+def test_compaction_data_accepts_codex_window_id(window_id: int | str) -> None:
+    """
+    The codex-native forwarder's payload validates for both window_id shapes.
+
+    Current Codex writes a UUID-string window_id into its ``compacted`` rollout
+    record; rejecting it turned every codex compaction POST into a 400, so no
+    compaction boundary was stored and each turn reloaded the full history.
+    """
+    data = parse_item_data(
+        "compaction",
+        {
+            "summary": "[Codex compaction — context was compacted in the terminal]",
+            "last_item_id": "item_x",
+            "model": "unknown",
+            "token_count": 0,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+                {"type": "compaction", "encrypted_content": "gAAAA_test"},
+            ],
+            "window_id": window_id,
+        },
+    )
+    assert isinstance(data, CompactionData)
+    assert data.window_id == window_id
+    assert type(data.window_id) is type(window_id)
+
+
 def test_compaction_data_missing_field() -> None:
     with pytest.raises(ValidationError, match="last_item_id"):
         CompactionData(summary="s", model="m", token_count=1)  # type: ignore[call-arg]
