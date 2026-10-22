@@ -14,6 +14,7 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.entities.session_goal import SessionGoal, SetSessionGoalRequest
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
 # Label set on a fork of a session that had a working directory, or a
@@ -909,6 +910,22 @@ class ConversationStore(ABC):
             does not exist.
         """
         ...
+
+    def get_session_goal(self, conversation_id: str) -> SessionGoal | None:
+        """Read a durable goal without consulting or waking the runner.
+
+        Stores without goal support hold no goals, so message dispatch (which
+        reads the goal for every native Claude/OpenCode user message) keeps
+        working on them; :meth:`set_session_goal` still refuses.
+        """
+        del conversation_id
+        return None
+
+    def set_session_goal(
+        self, conversation_id: str, request: SetSessionGoalRequest, updated_by: str | None
+    ) -> SessionGoal:
+        """Compare-and-set the goal; storing a goal performs no execution."""
+        raise NotImplementedError("This store does not support durable session goals")
 
     @abstractmethod
     def set_labels(

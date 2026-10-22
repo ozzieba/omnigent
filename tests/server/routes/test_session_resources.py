@@ -125,6 +125,14 @@ class _ConversationStore:
         }
         self.appended_items: list[Any] = []
 
+    def get_session_goal(self, conversation_id: str) -> None:
+        """Report that no durable session goal is stored for any session.
+
+        :param conversation_id: Session identifier.
+        :returns: ``None``.
+        """
+        del conversation_id
+
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """Return the conversation or None."""
         return self._conversations.get(conversation_id)
