@@ -1527,6 +1527,7 @@ function HarnessConfigModal({
     setDraftModel(pickedModel);
     setDraftEffort(pickedEffort);
     setDraftPermission(permissionMode);
+    setDraftTurbo(turbo);
     setDraftApproval(approvalMode);
     setDraftCursor(cursorExecMode);
     setDraftAgySkip(agySkipMode);
@@ -3177,7 +3178,13 @@ export function NewChatLandingScreen() {
                   : defaultModelLabel(codexModelOptions),
               },
             ];
-      return [...modelRows, { label: "Approval", value: approvalValue }];
+      return [
+        ...modelRows,
+        { label: "Approval", value: approvalValue },
+        ...(isCodex && pickedTurbo && !smartRoutingHarnessSelected
+          ? [{ label: "Turbo", value: "On (paid credits allowed)" }]
+          : []),
+      ];
     }
     if (supportsCursorMode) {
       const modeValue =
@@ -3199,6 +3206,7 @@ export function NewChatLandingScreen() {
     return routingRow;
   }, [
     smartRoutingHarnessSelected,
+    pickedTurbo,
     supportsPermissionMode,
     supportsApprovalMode,
     supportsCursorMode,
@@ -4494,7 +4502,10 @@ export function NewChatLandingScreen() {
                 ? pickedEffort
                 : undefined,
             cost_control_mode_override: costControlOverride,
-            turbo: pickedTurbo || undefined,
+            turbo:
+              !smartRoutingHarnessSelected && nativeAgent?.harness === "codex-native" && pickedTurbo
+                ? true
+                : undefined,
             // Top-level Smart Routing sends the same "auto" sentinel the bundle
             // path does; the server tells them apart by the bound agent being a
             // native wrapper, and routes at create time (the terminal launches

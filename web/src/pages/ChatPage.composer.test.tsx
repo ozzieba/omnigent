@@ -2948,6 +2948,11 @@ describe("Turbo (per-session paid-credits switch, oz 2026-10-06)", () => {
     updateSessionMock.mockClear();
   });
 
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ turbo: false });
+  });
+
   it("shows the Turbo row beside the Model row for a Codex session and PATCHes the flag", async () => {
     useChatStore.setState({ conversationId: "conv_turbo", turbo: false });
     render(
@@ -2989,5 +2994,71 @@ describe("Turbo (per-session paid-credits switch, oz 2026-10-06)", () => {
     expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
     expect(screen.queryByTestId("composer-config-turbo")).toBeNull();
     expect(updateSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("shows a persistent Turbo chip in the composer while Turbo is on, without hovering", () => {
+    useChatStore.setState({ conversationId: "conv_turbo_on", turbo: true });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    const chip = screen.getByTestId("composer-turbo-chip");
+    expect(chip.textContent).toMatch(/turbo/i);
+    expect(chip.textContent).toMatch(/paid credits/i);
+  });
+
+  it("shows no Turbo chip while Turbo is off or on a non-Codex session", () => {
+    useChatStore.setState({ conversationId: "conv_turbo_off", turbo: false });
+    const codex = render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(screen.queryByTestId("composer-turbo-chip")).toBeNull();
+    codex.unmount();
+    useChatStore.setState({ conversationId: "conv_claude_on", turbo: true });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(screen.queryByTestId("composer-turbo-chip")).toBeNull();
+  });
+
+  it("also names Turbo in the gear's hover summary", async () => {
+    useChatStore.setState({ conversationId: "conv_turbo_tip", turbo: true });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const tip = await screen.findAllByTestId("composer-config-gear-tooltip");
+    expect(tip[0].textContent ?? "").toMatch(/Turbo: ?On \(paid credits allowed\)/);
   });
 });

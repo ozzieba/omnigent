@@ -5774,6 +5774,7 @@ export function Composer({
                 costRoutingEligible={costRoutingEligible}
                 harnessLabel={harnessLabel}
               />
+              <ComposerTurboChip showModels={showModels} modelPickerKind={modelPickerKind} />
               <ComposerConfigGear
                 harnessLabel={harnessLabel}
                 showModels={showModels}
@@ -6983,6 +6984,33 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
+}
+
+/**
+ * Persistent paid-credits indicator: a visible "Turbo" chip beside the model
+ * label whenever a Codex session has Turbo on. Turbo lets the llmq gate admit
+ * a turn that would spend credits, so it must be readable at a glance, not
+ * only in the gear's hover tooltip or the config modal. Renders nothing when
+ * Turbo is off or the session is not a Codex model-picker session.
+ */
+function ComposerTurboChip({
+  showModels,
+  modelPickerKind,
+}: {
+  showModels: boolean;
+  modelPickerKind: NativeModelPickerKind | null;
+}) {
+  const turbo = useChatStore((s) => s.turbo);
+  if (!showModels || modelPickerKind !== "codex" || !turbo) return null;
+  return (
+    <span
+      data-testid="composer-turbo-chip"
+      title="Turbo is on: this session may spend paid credits"
+      className="mr-1 shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs font-medium leading-none text-amber-700 dark:text-amber-400"
+    >
+      Turbo: paid credits
+    </span>
+  );
 }
 
 /**
