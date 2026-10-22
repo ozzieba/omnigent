@@ -2852,11 +2852,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             if _unset_harness_override:
                 overrides["harness_override"] = None
                 overrides_changed = True
-            if turbo is not None:
-                overrides["turbo"] = "on" if turbo else None
-                overrides_changed = True
             elif harness_override is not None:
                 overrides["harness_override"] = harness_override
+                overrides_changed = True
+            if turbo is not None:
+                overrides["turbo"] = "on" if turbo else None
                 overrides_changed = True
             if overrides_changed:
                 row.session_overrides = _encode_session_overrides(overrides)
