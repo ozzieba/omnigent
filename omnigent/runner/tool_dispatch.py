@@ -4733,6 +4733,15 @@ def _project_api_item(
                 max_chars=max_chars,
             ),
         }
+    if itype == "error":
+        result: _JsonObject = {"type": "error"}
+        source = item.get("source")
+        code = item.get("code")
+        if source in ("llm", "execution", "tool", "harness"):
+            result["source"] = source
+        if code in ("project_attribution_required", "RuntimeError"):
+            result["code"] = code
+        return result
     return {"type": itype}
 
 
