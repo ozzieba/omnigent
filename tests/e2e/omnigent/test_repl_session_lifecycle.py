@@ -512,6 +512,7 @@ from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStor
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 db_uri = os.environ["OMNIGENT_E2E_DB_URI"]
 artifact_location = Path(os.environ["OMNIGENT_E2E_ARTIFACT_LOCATION"])
 port = int(os.environ["OMNIGENT_E2E_PORT"])
@@ -521,6 +522,7 @@ file_store = SqlAlchemyFileStore(db_uri)
 conversation_store = SqlAlchemyConversationStore(db_uri)
 comment_store = SqlAlchemyCommentStore(db_uri)
 host_store = HostStore(db_uri)
+project_store = SqlAlchemyProjectStore(db_uri)
 artifact_store = _create_artifact_store(str(artifact_location))
 agent_cache = AgentCache(
     artifact_store=artifact_store,
@@ -543,6 +545,9 @@ app = create_app(
     agent_cache=agent_cache,
     runner_tunnel_tokens=None,
     host_store=host_store,
+    # Required for host launches: without a project store the server sends
+    # no trusted quota_route and the host daemon refuses the launch.
+    project_store=project_store,
 )
 uvicorn.run(app, host="127.0.0.1", port=port)
 """
