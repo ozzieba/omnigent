@@ -9395,3 +9395,116 @@ def test_inject_user_message_ignores_empty_capture_after_enter(
     # The first Enter was swallowed (draft still there behind two blank
     # reads); only a retry clears it.
     assert len(enters) == 2
+
+
+# ── stale tool_relay.json: probe, wait for a fresh advertisement, then explain ──
+
+
+def _dead_loopback_url() -> str:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
+def test_call_relay_tool_names_the_stale_relay_instead_of_a_bare_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead advertised port yields an actionable error, not "Connection refused"."""
+    from omnigent import claude_native_bridge as bridge
+
+    url = _dead_loopback_url()
+    (tmp_path / bridge._TOOL_RELAY_FILE).write_text(json.dumps({"url": url, "token": "t"}))
+    monkeypatch.setattr(bridge, "_TOOL_RELAY_STALE_WAIT_S", 0.3)
+    monkeypatch.setattr(bridge, "_TOOL_RELAY_STALE_POLL_S", 0.05)
+    result = bridge._call_relay_tool(tmp_path, "sys_os_read", {})
+    assert result["isError"] is True
+    message = json.loads(result["content"][0]["text"])["error"]
+    assert f"Omnigent tool relay at {url} is not listening" in message
+    assert "stale tool_relay.json" in message
+    assert "Connection refused" not in message
+
+
+def test_call_relay_tool_picks_up_a_fresh_advertisement_while_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement runner's advertisement written during the wait is used."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from omnigent import claude_native_bridge as bridge
+
+    class _Relay(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = json.dumps({"result": "ok", "path": self.path}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    httpd = HTTPServer(("127.0.0.1", 0), _Relay)
+    live_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        relay_file = tmp_path / bridge._TOOL_RELAY_FILE
+        relay_file.write_text(json.dumps({"url": _dead_loopback_url(), "token": "old"}))
+        monkeypatch.setattr(bridge, "_TOOL_RELAY_STALE_WAIT_S", 3.0)
+        monkeypatch.setattr(bridge, "_TOOL_RELAY_STALE_POLL_S", 0.05)
+
+        def _republish() -> None:
+            time.sleep(0.2)
+            relay_file.write_text(json.dumps({"url": live_url, "token": "new"}))
+
+        threading.Thread(target=_republish, daemon=True).start()
+        result = bridge._call_relay_tool(tmp_path, "sys_os_read", {"path": "/x"})
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert result == {"result": "ok", "path": "/tool"}
+
+
+def test_materialize_symlinked_bridge_dir_swaps_in_a_real_copy(tmp_path: Path) -> None:
+    from omnigent.claude_native_bridge import materialize_symlinked_bridge_dir
+
+    target = tmp_path / "migrated" / "conv_a"
+    (target / "codex-home").mkdir(parents=True)
+    (target / "state.json").write_text("{}")
+    (target / "codex-home" / "config.toml").write_text("x = 1\n")
+    link = tmp_path / "bridge" / "conv_a"
+    link.parent.mkdir()
+    link.symlink_to(target)
+
+    assert materialize_symlinked_bridge_dir(link) == target
+    assert not link.is_symlink() and link.is_dir()
+    assert (link / "state.json").read_text() == "{}"
+    assert (link / "codex-home" / "config.toml").read_text() == "x = 1\n"
+    assert oct(link.stat().st_mode & 0o777) == "0o700"
+    assert oct((link / "codex-home").stat().st_mode & 0o777) == "0o700"
+    # The target stays untouched as the rollback copy.
+    assert (target / "state.json").exists()
+
+
+def test_materialize_symlinked_bridge_dir_leaves_real_dirs_and_bad_links_alone(
+    tmp_path: Path,
+) -> None:
+    from omnigent.claude_native_bridge import materialize_symlinked_bridge_dir
+
+    real = tmp_path / "real"
+    real.mkdir()
+    assert materialize_symlinked_bridge_dir(real) is None
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "missing")
+    assert materialize_symlinked_bridge_dir(dangling) is None
+    assert dangling.is_symlink()
+    to_file = tmp_path / "to-file"
+    (tmp_path / "a-file").write_text("")
+    to_file.symlink_to(tmp_path / "a-file")
+    assert materialize_symlinked_bridge_dir(to_file) is None
+    assert to_file.is_symlink()

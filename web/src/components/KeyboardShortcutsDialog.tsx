@@ -120,17 +120,20 @@ function pinnedSessionShortcut(native: boolean): Shortcut {
 function shortcutGroupsFor(
   native: boolean,
   submitWithModEnter: boolean,
-  preventsKeyboardSubmit: boolean,
+  isTouchPrimary: boolean,
 ): ShortcutGroup[] {
+  // Touch-primary devices keep Enter as the newline key, so a hardware
+  // keyboard there sends with Mod+Enter whatever the preference says.
+  const modEnterSends = submitWithModEnter || isTouchPrimary;
   return SHORTCUT_GROUPS.map((group) => {
-    if (group.title === "In chats" && !preventsKeyboardSubmit) {
+    if (group.title === "In chats") {
       return {
         ...group,
         items: [
-          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
+          { label: "Send message", keys: composerSendShortcutKeys(modEnterSends) },
           {
             label: "New line in message",
-            keys: composerNewLineShortcutKeys(submitWithModEnter),
+            keys: composerNewLineShortcutKeys(modEnterSends),
           },
           ...group.items,
         ],
@@ -152,12 +155,8 @@ export function KeyboardShortcutsList() {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
-  const groups = shortcutGroupsFor(
-    isNativeShell(),
-    readSubmitWithModEnter(),
-    preventsKeyboardSubmit,
-  );
+  const isTouchPrimary = isMobileViewport || isCoarsePointer;
+  const groups = shortcutGroupsFor(isNativeShell(), readSubmitWithModEnter(), isTouchPrimary);
   return (
     <>
       {groups.map((group) => (

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -1655,6 +1656,62 @@ async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
     body = kwargs["json"]
     assert body["data"]["last_item_id"].startswith("compact_boundary_")
     assert "compacted_messages" not in body["data"]
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_retries_without_string_window_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A server that rejects a UUID window_id still gets the compaction boundary.
+
+    Current Codex writes a string window_id; servers whose schema only takes
+    an integer answer 400. The forwarder retries once without it instead of
+    dropping the whole compaction item.
+    """
+    import json as _json
+
+    thread_id = "thread_abc"
+    rollout = tmp_path / "codex-home" / "sessions" / "2026" / f"rollout-x-{thread_id}.jsonl"
+    rollout.parent.mkdir(parents=True)
+    history = [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+    ]
+    window_id = "01a15f09-4b04-71a2-86aa-c48f0333e697"
+    rollout.write_text(
+        _json.dumps(
+            {
+                "type": "compacted",
+                "payload": {"replacement_history": history, "window_id": window_id},
+            }
+        )
+        + "\n"
+    )
+    state = MagicMock(codex_home=str(tmp_path / "codex-home"), thread_id=thread_id)
+    monkeypatch.setattr(fwd, "read_bridge_state", lambda _bridge_dir: state)
+
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_codex"}]}
+    get_resp.raise_for_status = MagicMock()
+    rejected = MagicMock(status_code=400)
+    rejected.raise_for_status = MagicMock(side_effect=AssertionError("400 must be retried"))
+    accepted = MagicMock(status_code=202)
+    accepted.raise_for_status = MagicMock()
+    sent: list[dict[str, Any]] = []
+
+    async def _post(_url: str, *, json: dict[str, Any]) -> MagicMock:
+        sent.append(_json.loads(_json.dumps(json)))
+        return rejected if len(sent) == 1 else accepted
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+    client.post = _post
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex", bridge_dir=tmp_path)
+
+    assert [body["data"].get("window_id") for body in sent] == [window_id, None]
+    assert sent[1]["data"]["compacted_messages"] == history
+    accepted.raise_for_status.assert_called_once()
 
 
 def test_read_compacted_history_extracts_replacement_history_and_window_id(

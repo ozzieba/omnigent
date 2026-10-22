@@ -4884,7 +4884,7 @@ async def _session_get_info_via_rest(
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host and its reported harness readiness,
-    reasoning effort, effective model,
+    reasoning effort, effective model, explicit response activity and queued-input count,
     parent linkage, workspace / git branch, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
@@ -4912,7 +4912,7 @@ async def _session_get_info_via_rest(
     try:
         resp = await server_client.get(
             f"/v1/sessions/{raw_target}",
-            params={"include_items": "false", "include_liveness": "false"},
+            params={"include_items": "false", "include_liveness": "true"},
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -4926,6 +4926,19 @@ async def _session_get_info_via_rest(
     snap: _JsonObject = resp.json()
     pending_value = snap.get("pending_elicitations")
     pending = pending_value if isinstance(pending_value, list) else []
+    active_value = snap.get("active_response_id")
+    active_response_present: bool | None = None
+    if "active_response_id" in snap:
+        if active_value is None:
+            active_response_present = False
+        elif isinstance(active_value, str) and active_value:
+            active_response_present = True
+    input_value = snap.get("pending_inputs")
+    pending_input_count = (
+        len(input_value)
+        if isinstance(input_value, list) and all(isinstance(item, dict) for item in input_value)
+        else None
+    )
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
     snap_host_id = _optional_string(snap.get("host_id"))
@@ -4951,6 +4964,18 @@ async def _session_get_info_via_rest(
             "agent_name": public_agent_name(snap_agent_name),
             "runner_id": snap.get("runner_id"),
             "runner_online": runner_online,
+            # Snapshot liveness has no best-effort runner-status fallback.
+            "liveness_runner_online": (
+                snap.get("runner_online") if type(snap.get("runner_online")) is bool else None
+            ),
+            "host_online": (
+                snap.get("host_online") if type(snap.get("host_online")) is bool else None
+            ),
+            "host_resumable": (
+                snap.get("host_resumable") if type(snap.get("host_resumable")) is bool else None
+            ),
+            "active_response_present": active_response_present,
+            "pending_input_count": pending_input_count,
             "host_id": snap.get("host_id"),
             "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),

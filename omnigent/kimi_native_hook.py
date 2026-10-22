@@ -57,7 +57,7 @@ from omnigent.native_policy_hook import (
     hook_payload_to_evaluation_request,
     policy_hook_reauth,
     post_evaluate_with_retry,
-    read_relay_policy_config,
+    read_live_relay_policy_config,
     relay_policy_evaluate_url,
 )
 
@@ -140,8 +140,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             sys.stdout.write(json.dumps(out))
         return 0
 
-    # Prefer the relay; fall back to direct server call.
-    relay = read_relay_policy_config(bridge_dir)
+    # Prefer the relay; fall back to direct server call (also when the
+    # advertised relay port no longer listens — stale tool_relay.json).
+    relay, stale_relay = read_live_relay_policy_config(bridge_dir)
     if relay:
         relay_url, relay_token, _sid = relay
         url = relay_policy_evaluate_url(relay_url)
@@ -154,7 +155,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         config = read_hook_config(bridge_dir)
         ap_server_url = config.get("ap_server_url")
         if not isinstance(ap_server_url, str) or not ap_server_url:
-            return 0
+            return _fail_closed(stale_relay) if stale_relay else 0
         headers = _headers_from_config(config)
         session_component = _url_component(session_id)
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"

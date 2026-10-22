@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useChatStore } from "@/store/chatStore";
-import { onNativeSharedText } from "@/lib/nativeBridge";
+import { acknowledgeNativeSharedText, onNativeSharedText } from "@/lib/nativeBridge";
 
 /** Matches an OS-share hand-off URL fragment, e.g. `#shared-text=hello%20world`. */
 const SHARE_TEXT_PATTERN = /^#shared-text=(.*)$/;
@@ -17,14 +17,22 @@ const STORAGE_KEY = "omnigent:pendingShareText";
  * merges into an already-open banner the same way). A plain `setItem` would
  * silently discard the first, unconsumed share the moment the second
  * arrived -- the exact class of bug this module exists to prevent.
+ *
+ * :returns: True when the text is now durably stored. False means the write
+ *     did not happen -- an empty share, or `sessionStorage` being unavailable
+ *     (locked-down WebView, private browsing). Callers that must not claim
+ *     ownership of a share they failed to store check this; see
+ *     {@link receiveNativeSharedText}.
  */
-function persistPendingShareText(text: string): void {
-  if (text === "") return;
+function persistPendingShareText(text: string): boolean {
+  if (text === "") return false;
   try {
     const existing = window.sessionStorage.getItem(STORAGE_KEY);
     window.sessionStorage.setItem(STORAGE_KEY, existing ? `${existing}\n${text}` : text);
+    return true;
   } catch {
     // Storage unavailable: nothing further we can do here.
+    return false;
   }
 }
 
@@ -113,10 +121,18 @@ export function takePendingShareText(): void {
  * -- mirroring `shareFileIntake.ts`'s live-callback handling -- it applies
  * immediately when the new-chat composer is already current, rather than
  * relying solely on `useShareIntake`'s mount-time effect to notice it.
+ *
+ * Acknowledges the delivery back to the shell, but ONLY once the durable
+ * write succeeded. The shell re-delivers an unacknowledged share on every
+ * page load (`SharedTextHandoff`), which is what carries a signed-out share
+ * across the `/login` round trip -- the document that redirect lands on never
+ * mounts React, so nothing here runs to persist the first delivery. The
+ * acknowledgement means "it is in the durable slot", not "a callback ran".
  */
 export function receiveNativeSharedText(text: string): void {
   if (text === "") return;
-  persistPendingShareText(text);
+  if (!persistPendingShareText(text)) return;
+  acknowledgeNativeSharedText();
   if (useChatStore.getState().conversationId === null) {
     const merged = peekPendingShareText();
     if (merged !== null) useChatStore.getState().setPendingComposerText(merged);

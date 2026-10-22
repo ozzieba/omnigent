@@ -191,7 +191,9 @@ runs:
         # pty/subprocess children don't get SIGALRM. --max-worker-restart=0
         # fails the shard fast instead of letting loadscope requeue deadlock
         # the controller (the 2026-06-11 shard-2 wedge).
-        uv run pytest tests/e2e/ \
+        # CI job tokens must not admit real Copilot calls in this mock suite.
+        env -u COPILOT_GITHUB_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+          uv run pytest tests/e2e/ \
           -n "$WORKERS" \
           --dist=loadscope \
           --max-worker-restart=0 \

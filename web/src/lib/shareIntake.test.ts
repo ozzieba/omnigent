@@ -15,6 +15,7 @@ import { useChatStore } from "@/store/chatStore";
 
 type SharedTextCallback = (text: string) => void;
 const textSubscribers: SharedTextCallback[] = [];
+const acknowledgeNativeSharedText = vi.fn();
 
 vi.mock("@/lib/nativeBridge", () => ({
   onNativeSharedText: vi.fn((callback: SharedTextCallback) => {
@@ -24,6 +25,7 @@ vi.mock("@/lib/nativeBridge", () => ({
       if (i >= 0) textSubscribers.splice(i, 1);
     };
   }),
+  acknowledgeNativeSharedText: (...args: unknown[]) => acknowledgeNativeSharedText(...args),
 }));
 
 const {
@@ -44,6 +46,7 @@ function reset(): void {
   setHash("");
   window.sessionStorage.removeItem(STORAGE_KEY);
   textSubscribers.length = 0;
+  acknowledgeNativeSharedText.mockClear();
   useChatStore.setState({ conversationId: null, pendingComposerText: null });
 }
 
@@ -186,6 +189,90 @@ describe("receiveNativeSharedText", () => {
 
     expect(peekPendingShareText()).toBeNull();
     expect(useChatStore.getState().pendingComposerText).toBeNull();
+  });
+
+  // The shell keeps retrying an unacknowledged text share on every page load
+  // (SharedTextHandoff), which is the only thing that carries a signed-out
+  // share across /login. Without this acknowledgement the shell has no way to
+  // learn the share landed, so it would retry to its cap on every subsequent
+  // page load; the pre-fix shell instead dropped its copy on the first emit
+  // and lost the share outright.
+  it("acknowledges the delivery back to the shell once it is durably stored", () => {
+    useChatStore.setState({ conversationId: null });
+
+    receiveNativeSharedText("hello from native share");
+
+    expect(acknowledgeNativeSharedText).toHaveBeenCalledTimes(1);
+  });
+
+  it("acknowledges even when the share is held for a later new chat", () => {
+    // Held, not applied -- but the web layer DOES own it now (it is in the
+    // durable slot), so the shell must stop retrying.
+    useChatStore.setState({ conversationId: "conv_existing" });
+
+    receiveNativeSharedText("hello from native share");
+
+    expect(peekPendingShareText()).toBe("hello from native share");
+    expect(acknowledgeNativeSharedText).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT acknowledge when the durable write fails", () => {
+    // A locked-down WebView / private-browsing context: sessionStorage throws,
+    // so nothing survives the /login navigation here. Acknowledging would tell
+    // the shell to drop the only remaining copy.
+    // Spy on the prototype: jsdom's Storage is proxy-backed, so an own
+    // property planted on the instance is not what persistPendingShareText
+    // ends up calling.
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("storage disabled");
+    });
+    try {
+      useChatStore.setState({ conversationId: null });
+
+      receiveNativeSharedText("hello from native share");
+
+      expect(acknowledgeNativeSharedText).not.toHaveBeenCalled();
+    } finally {
+      setItem.mockRestore();
+    }
+  });
+
+  it("does not acknowledge an empty delivery", () => {
+    receiveNativeSharedText("");
+
+    expect(acknowledgeNativeSharedText).not.toHaveBeenCalled();
+  });
+
+  it("carries a share taken while signed out across the login round trip", () => {
+    // The real signed-out cold-share sequence, document by document.
+    //
+    // 1. First pinned-origin document: the session is dead, main.tsx sees
+    //    isLoginRedirectPending() and never mounts React, so NOTHING
+    //    subscribes and the shell's emit reaches no web code at all.
+    useChatStore.setState({ conversationId: null });
+    expect(textSubscribers).toHaveLength(0);
+    expect(peekPendingShareText()).toBeNull();
+
+    // 2. The /login document mounts React (App calls useShareIntake above the
+    //    route table), so the shell's RETRY finally reaches a subscriber,
+    //    which persists it durably and acknowledges.
+    const login = renderHook(() => useShareIntake());
+    expect(textSubscribers).toHaveLength(1);
+    textSubscribers[0]("shared while signed out");
+    expect(peekPendingShareText()).toBe("shared while signed out");
+    expect(acknowledgeNativeSharedText).toHaveBeenCalledTimes(1);
+
+    // 3. A successful login hard-navigates to return_to. Same tab, same
+    //    origin: the document (and every subscriber in it) is replaced, but
+    //    sessionStorage survives.
+    login.unmount();
+    expect(textSubscribers).toHaveLength(0);
+    useChatStore.setState({ pendingComposerText: null });
+
+    // 4. The authenticated document mounts and the text reaches the composer.
+    renderHook(() => useShareIntake());
+
+    expect(useChatStore.getState().pendingComposerText).toBe("shared while signed out");
   });
 });
 
