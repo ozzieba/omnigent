@@ -155,6 +155,16 @@ interface NativeShellApi {
    * shells / outside Android. Returns an unsubscribe.
    */
   onSharedText?: (callback: (text: string) => void) => () => void;
+  /**
+   * Tell the shell an `onSharedText` delivery has been durably taken over by
+   * the web layer (written to the `sessionStorage` slot `shareIntake.ts`
+   * carries shares in). Until this is called the shell keeps retrying
+   * delivery on every page load (bounded — see `SharedTextHandoff`), because
+   * the page it emitted into may never have mounted a subscriber at all: a
+   * share taken while signed out lands on a document that redirects to
+   * `/login` without mounting React. Absent on older shells.
+   */
+  acknowledgeSharedText?: () => void;
 }
 
 /** One OS-shared file, as delivered by the native shell's bridge. */
@@ -676,6 +686,21 @@ export function onNativeSharedText(callback: (text: string) => void): () => void
   } catch (err) {
     console.warn("[nativeBridge] native onSharedText failed:", err);
     return () => {};
+  }
+}
+
+/**
+ * Tell the native shell that the last `onNativeSharedText` delivery has been
+ * durably taken over — see {@link NativeShellApi.acknowledgeSharedText}. A
+ * no-op outside a shell that supports it.
+ */
+export function acknowledgeNativeSharedText(): void {
+  const native = nativeApi();
+  if (!native?.acknowledgeSharedText) return;
+  try {
+    native.acknowledgeSharedText();
+  } catch (err) {
+    console.warn("[nativeBridge] native acknowledgeSharedText failed:", err);
   }
 }
 
