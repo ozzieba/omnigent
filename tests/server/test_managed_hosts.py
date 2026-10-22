@@ -53,6 +53,7 @@ from omnigent.server.managed_hosts import (
     parse_sandbox_config,
     relaunch_managed_host,
     resolve_managed_agent_label,
+    resolve_profile_runtime_reference,
     resume_managed_host,
     terminate_managed_host,
 )
@@ -709,6 +710,77 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert fake.in_cluster is True
     assert fake.resources == {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}}
     assert fake.pod_ready_timeout_s == 300
+
+
+async def test_kubernetes_profile_image_factory_is_digest_pinned_and_has_no_deployment_mounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = "ghcr.io/oz/omnigent-host@sha256:" + "a" * 64
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc",
+            "kubernetes": {
+                "env": ["OPENAI_API_KEY"],
+                "secret_name": "harness-creds",
+                "pvc_mounts": [{"claim_name": "work", "mount_path": "/root/work"}],
+                "secret_mounts": [{"secret_name": "gcp", "mount_path": "/root/.config/gcp"}],
+                "image_catalog": {"omnigent-host@1": image},
+            },
+        }
+    )
+    assert cfg is not None
+    entry = cfg.default
+    assert entry.managed_host_images == {"omnigent-host@1": image}
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert entry.runtime_image_launcher_factory is not None
+    entry.runtime_image_launcher_factory(entry.managed_host_images["omnigent-host@1"])
+    assert fake.image == image
+    assert fake.env is None
+    assert fake.secret_name is None
+    assert fake.service_account == "omnigent-runner"
+    assert fake.pvc_mounts is None
+    assert fake.secret_mounts is None
+
+
+@pytest.mark.parametrize("image", ["ghcr.io/oz/omnigent-host:latest", "ghcr.io/x/y@sha256:ABC"])
+async def test_kubernetes_image_catalog_rejects_mutable_or_malformed_image(image: str) -> None:
+    with pytest.raises(ValueError, match="immutable @sha256"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc",
+                "kubernetes": {"image_catalog": {"omnigent-host@1": image}},
+            }
+        )
+
+
+async def test_profile_runtime_reference_requires_published_kubernetes_image() -> None:
+    image = "ghcr.io/oz/omnigent-host@sha256:" + "b" * 64
+    configured = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc",
+            "kubernetes": {"image_catalog": {"omnigent-host@1": image}},
+        }
+    )
+    assert configured is not None
+    assert (
+        resolve_profile_runtime_reference(
+            "workspace-readonly@1", deployment=configured, provider="kubernetes", managed=True
+        )
+        == "omnigent-host@1"
+    )
+    with pytest.raises(ValueError, match="not published"):
+        resolve_profile_runtime_reference(
+            "workspace-readonly@1",
+            deployment=parse_sandbox_config(
+                {"provider": "kubernetes", "server_url": "http://s.svc"}
+            ),
+            provider="kubernetes",
+            managed=True,
+        )
 
 
 def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1758,6 +1830,34 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     assert body["sandbox_provider"] is None
 
 
+async def test_environment_profile_api_reports_only_published_digest_image(
+    db_uri: str, tmp_path: Path
+) -> None:
+    image = "ghcr.io/oz/omnigent-host@sha256:" + "e" * 64
+    config = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc",
+            "kubernetes": {"image_catalog": {"omnigent-host@1": image}},
+        }
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/environment-profiles")
+    assert response.status_code == 200, response.text
+    profiles = response.json()["data"]
+    profile = next(p for p in profiles if p["reference"] == "workspace-readonly@2")
+    assert profile["managed_host_image"] == {
+        "reference": "omnigent-host@1",
+        "state": "available",
+        "image": image,
+        "reason": (
+            "Resolved from the operator-published Kubernetes image catalog; "
+            "image selection does not add credentials, env values, or mounts."
+        ),
+    }
+
+
 # ── launch_managed_host ─────────────────────────────────────
 
 
@@ -1816,6 +1916,40 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     assert resolved.host_id == result.host_id
     # Nothing was torn down on the success path.
     assert fake.terminated == []
+
+
+async def test_profile_managed_launch_passes_only_catalog_image(db_uri: str) -> None:
+    class KubernetesFakeLauncher(FakeSandboxLauncher):
+        provider: ClassVar[str] = "kubernetes"
+
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = KubernetesFakeLauncher(on_host_start=_register)
+    image = "ghcr.io/oz/omnigent-host@sha256:" + "c" * 64
+    image_args: list[str] = []
+    entry = ManagedSandboxConfig(
+        server_url="https://srv.example.com",
+        launcher_factory=lambda: fake,
+        runtime_image_launcher_factory=lambda exact_image: image_args.append(exact_image) or fake,
+        managed_host_images={"omnigent-host@1": image},
+        token_ttl_s=3600,
+        managed_launch_supported=True,
+        provider="kubernetes",
+    )
+    result = await launch_managed_host(
+        config=ManagedSandboxDeployment.single(entry),
+        owner=_OWNER,
+        host_store=host_store,
+        provider="kubernetes",
+        runtime_image_reference="omnigent-host@1",
+    )
+    assert image_args == [image]
+    assert result.host_id == fake.host_starts[0].host_id
 
 
 async def test_launch_threads_agent_name_only_to_a_classifying_launcher(db_uri: str) -> None:
@@ -3336,7 +3470,9 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
             return super().get(agent_id)
 
     store = _RecordingStore({builtin.id: builtin})
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    conv = SimpleNamespace(
+        labels={}, environment_runtime_ref=None, host_id="host_1", agent_id=builtin.id
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
@@ -3388,7 +3524,12 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
     monkeypatch.setattr(orchestration, "_run_managed_launch", _noop)
 
     tracker = ManagedLaunchTracker()
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin_agent_id("code-reviewer"))
+    conv = SimpleNamespace(
+        labels={},
+        environment_runtime_ref=None,
+        host_id="host_1",
+        agent_id=builtin_agent_id("code-reviewer"),
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
@@ -3421,7 +3562,12 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
 
     monkeypatch.setattr(orchestration, "_run_managed_launch", _capture)
 
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin_agent_id("code-reviewer"))
+    conv = SimpleNamespace(
+        labels={},
+        environment_runtime_ref=None,
+        host_id="host_1",
+        agent_id=builtin_agent_id("code-reviewer"),
+    )
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
@@ -3637,7 +3783,9 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         host_registry=None,
         tunnel_registry=None,
     )
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    conv = SimpleNamespace(
+        labels={}, environment_runtime_ref=None, host_id="host_1", agent_id=builtin.id
+    )
 
     engaged = await asyncio.gather(
         *(

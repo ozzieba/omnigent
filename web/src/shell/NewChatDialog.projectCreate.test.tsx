@@ -99,11 +99,24 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
 }));
 vi.mock("./CreateAgentDialog", () => ({
   CreateAgentDialog: (props: { onCreate: (input: unknown) => void }) => (
-    <button
-      type="button"
-      data-testid="test-create-pending"
-      onClick={() => props.onCreate({ name: "pending-bot", instructions: "hi" })}
-    />
+    <>
+      <button
+        type="button"
+        data-testid="test-create-pending"
+        onClick={() => props.onCreate({ name: "pending-bot", instructions: "hi" })}
+      />
+      <button
+        type="button"
+        data-testid="test-create-pending-profile"
+        onClick={() =>
+          props.onCreate({
+            name: "pending-bot",
+            instructions: "hi",
+            environmentProfile: "workspace-readonly@2",
+          })
+        }
+      />
+    </>
   ),
 }));
 // The projects list + config drive `project_id` resolution; the move helper is
@@ -433,6 +446,37 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
     await waitFor(() => expect(vi.mocked(showToast)).toHaveBeenCalledWith("bundled agent differs"));
+  });
+
+  it("creates a profiled custom agent on the selected managed sandbox", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+
+    // The managed sandbox is initially selected. Pick a non-default provider,
+    // then create a custom agent carrying its immutable environment revision.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-e2b"));
+    fireEvent.click(screen.getByTestId("test-create-pending-profile"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(vi.mocked(createBundledSession)).toHaveBeenCalled());
+    await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+    const [, metadata] = vi.mocked(createBundledSession).mock.calls[0];
+    expect(metadata).toEqual({
+      environment_profile: "workspace-readonly@2",
+      host_type: "managed",
+      sandbox_provider: "e2b",
+      workspace: null,
+      project_id: "proj_alpha",
+    });
+    expect(vi.mocked(launchRunner)).not.toHaveBeenCalled();
   });
 
   it("surfaces server mismatch warnings from the create response as toasts", async () => {

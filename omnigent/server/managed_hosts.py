@@ -148,6 +148,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, cast
 
 import click
@@ -516,6 +517,13 @@ class ManagedSandboxConfig:
     managed_launch_supported: bool = True
     provider: str | None = None
     host_config: dict[str, object] | None = None
+    # Operator-published immutable OCI image references accepted by the
+    # Kubernetes provider. Keys are stable catalog revisions; values must be
+    # digest-pinned and are never supplied by session clients.
+    managed_host_images: dict[str, str] = dataclass_field(default_factory=dict)
+    # The profile-image path deliberately builds an isolated Kubernetes
+    # launcher with no deployment env, harness Secret, PVC, or Secret mounts.
+    runtime_image_launcher_factory: Callable[[str], SandboxHostLauncher] | None = None
 
 
 @dataclass
@@ -636,6 +644,60 @@ class ManagedSandboxDeployment:
             for config in self.configs
             if config.managed_launch_supported and config.provider is not None
         )
+
+    def managed_host_image(self, reference: str) -> str | None:
+        """Resolve a server-configured image revision on Kubernetes only."""
+        kubernetes = self.for_provider("kubernetes")
+        if (
+            kubernetes is None
+            or not kubernetes.managed_launch_supported
+            or kubernetes.runtime_image_launcher_factory is None
+        ):
+            return None
+        return kubernetes.managed_host_images.get(reference)
+
+
+def resolve_profile_runtime_reference(
+    profile_reference: str | None,
+    *,
+    deployment: ManagedSandboxDeployment | None,
+    provider: str | None,
+    managed: bool,
+) -> str | None:
+    """Resolve a selected profile and verify its managed image is published.
+
+    The only image string is read from the deployment's operator-owned
+    Kubernetes catalog. Callers accept a profile id, never an image ref.
+    """
+    if profile_reference is None:
+        return None
+    from omnigent.server.environment_profiles import get_environment_profile
+
+    profile = get_environment_profile(profile_reference)
+    if profile is None:
+        raise ValueError(f"unknown environment profile revision {profile_reference!r}")
+    runtime_reference = profile.managed_host_image_reference
+    if not managed:
+        return runtime_reference
+    if runtime_reference is None:
+        raise ValueError(
+            f"environment profile {profile_reference!r} has no published "
+            "managed-host image reference"
+        )
+    selected = deployment.for_provider(provider) if deployment is not None else None
+    if selected is None or selected.provider != "kubernetes":
+        raise ValueError(
+            "this environment profile's managed image is available only on the Kubernetes provider"
+        )
+    if (
+        selected.runtime_image_launcher_factory is None
+        or runtime_reference not in selected.managed_host_images
+    ):
+        raise ValueError(
+            f"managed image revision {runtime_reference!r} is not published in the "
+            "server's Kubernetes image catalog"
+        )
+    return runtime_reference
 
 
 @dataclass
@@ -1256,6 +1318,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "secret_mounts",
                     "pod_ready_timeout_s",
                     "runtime_class",
+                    "image_catalog",
                 },
                 "sandbox.kubernetes",
             )
@@ -1279,6 +1342,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             ),
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
         )
+        launcher_factory, runtime_image_launcher_factory = launcher_factory
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     elif provider in community:
         # A provider contributed through the `omnigent.sandbox_providers`
@@ -1310,6 +1374,12 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         ),
         provider=provider,
         host_config=host_config,
+        managed_host_images=(
+            _parse_kubernetes_image_catalog(raw) if provider == "kubernetes" else {}
+        ),
+        runtime_image_launcher_factory=(
+            runtime_image_launcher_factory if provider == "kubernetes" else None
+        ),
     )
 
 
@@ -2046,6 +2116,46 @@ def _parse_provider_image(raw: dict[str, object], provider: str) -> str | None:
     return image.strip()
 
 
+def _parse_kubernetes_image_catalog(raw: dict[str, object]) -> dict[str, str]:
+    """Read operator-published immutable image revisions from server YAML.
+
+    The catalog is deliberately a mapping from a constrained ``name@revision``
+    id to a digest-pinned OCI image. Session requests can select only a profile
+    revision; they cannot add entries or supply image strings.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return {}
+    value = section.get("image_catalog")
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("server config 'sandbox.kubernetes.image_catalog' must be a mapping")
+    catalog: dict[str, str] = {}
+    for reference, image in value.items():
+        if (
+            not isinstance(reference, str)
+            or re.fullmatch(r"[a-z][a-z0-9-]*@[1-9][0-9]*", reference) is None
+        ):
+            raise ValueError(
+                "server config 'sandbox.kubernetes.image_catalog' keys must be immutable "
+                "name@revision references"
+            )
+        if not isinstance(image, str) or not image.strip():
+            raise ValueError(
+                f"server config 'sandbox.kubernetes.image_catalog.{reference}' "
+                "must be a digest-pinned OCI image"
+            )
+        image = image.strip()
+        if re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image) is None:
+            raise ValueError(
+                f"server config 'sandbox.kubernetes.image_catalog.{reference}' "
+                "must use an immutable @sha256:<64 lowercase hex> digest"
+            )
+        catalog[reference] = image
+    return catalog
+
+
 def _parse_provider_env(raw: dict[str, object], provider: str) -> list[str] | None:
     """
     Extract and validate provider env passthrough names.
@@ -2549,7 +2659,7 @@ def _kubernetes_launcher_factory(
     secret_mounts: list[dict[str, object]] | None,
     pod_ready_timeout_s: int | None,
     runtime_class: str | None,
-) -> Callable[[], SandboxHostLauncher]:
+) -> tuple[Callable[[], SandboxHostLauncher], Callable[[str], SandboxHostLauncher]]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
 
@@ -2606,7 +2716,32 @@ def _kubernetes_launcher_factory(
             runtime_class=runtime_class,
         )
 
-    return _build
+    def _build_profile_image(image_ref: str) -> SandboxHostLauncher:
+        """Build a catalog-image launcher without deployment credentials or mounts."""
+        from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
+
+        return KubernetesSandboxLauncher(
+            image=image_ref,
+            env=None,
+            namespace=namespace,
+            secret_name=None,
+            # Do not give profile-selected images a deployment-specific
+            # Kubernetes identity. The launcher disables token automounting;
+            # the host's short-lived bootstrap token remains the only session
+            # credential required for tunnel registration.
+            service_account="omnigent-runner",
+            node_selector=node_selector,
+            kubeconfig=kubeconfig,
+            in_cluster=in_cluster,
+            resources=resources,
+            pvc_mounts=None,
+            secret_mounts=None,
+            pod_ready_timeout_s=pod_ready_timeout_s,
+            runtime_class=runtime_class,
+            allow_process_env_fallbacks=False,
+        )
+
+    return _build, _build_profile_image
 
 
 def _select_provider_config(
@@ -2642,6 +2777,7 @@ async def launch_managed_host(
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
     provider: str | None = None,
+    runtime_image_reference: str | None = None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
@@ -2691,7 +2827,20 @@ async def launch_managed_host(
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
-    launcher = entry.launcher_factory()
+    if runtime_image_reference is None:
+        launcher = entry.launcher_factory()
+    else:
+        image = entry.managed_host_images.get(runtime_image_reference)
+        factory = entry.runtime_image_launcher_factory
+        if entry.provider != "kubernetes" or image is None or factory is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"managed image revision {runtime_image_reference!r} is not currently "
+                    "published for this Kubernetes provider"
+                ),
+            )
+        launcher = factory(image)
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
@@ -2727,6 +2876,7 @@ async def relaunch_managed_host(
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
     agent_name: str | None = None,
+    runtime_image_reference: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2765,7 +2915,21 @@ async def relaunch_managed_host(
         longer matches the configured launcher; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
-    launcher = _launcher_for_teardown(host, config)
+    entry = config.recorded(host.sandbox_provider)
+    if runtime_image_reference is None:
+        launcher = _launcher_for_teardown(host, config)
+    else:
+        image = entry.managed_host_images.get(runtime_image_reference)
+        factory = entry.runtime_image_launcher_factory
+        if entry.provider != "kubernetes" or image is None or factory is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"managed image revision {runtime_image_reference!r} is no longer "
+                    "published for this Kubernetes provider"
+                ),
+            )
+        launcher = factory(image)
     if launcher is None:
         raise HTTPException(
             status_code=400,

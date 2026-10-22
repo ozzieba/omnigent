@@ -123,6 +123,7 @@ describe("createSession", () => {
       terminalPending: false,
       sandboxStatus: null,
       environmentProfile: null,
+      environmentRuntimeRef: null,
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,

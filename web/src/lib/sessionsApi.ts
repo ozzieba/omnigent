@@ -147,6 +147,7 @@ interface SessionResponseWire {
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   environment_profile?: string | null;
+  environment_runtime_ref?: string | null;
   /**
    * Native-terminal CLI args the session launched with, e.g.
    * ``["--permission-mode", "plan"]``. Records only the LAUNCH flags —
@@ -322,6 +323,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     labels: wire.labels,
     workspace: wire.workspace ?? null,
     environmentProfile: wire.environment_profile ?? null,
+    environmentRuntimeRef: wire.environment_runtime_ref ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
     items: wire.items ?? [],
@@ -655,7 +657,7 @@ async function importLocalSessionsBuffered(
  * in the `metadata` form part.
  *
  * @param bundle - The agent bundle as a `File` (`.tar.gz`).
- * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
+ * @param metadata - Session-level metadata (host type/provider, workspace, labels, etc.).
  *   A `project_id` files the session into that project atomically at create
  *   and lets the server default-fill absent fields from the project config.
  * @returns The created session's id, plus any non-fatal project-consistency
@@ -665,8 +667,9 @@ export async function createBundledSession(
   bundle: File,
   metadata: {
     host_id?: string;
-    host_type?: string;
-    workspace?: string;
+    host_type?: "external" | "managed";
+    sandbox_provider?: string;
+    workspace?: string | null;
     project_id?: string;
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
@@ -707,6 +710,25 @@ export interface EnvironmentCapability {
   reason: string;
 }
 
+export interface RuntimeManifestTool {
+  id: string;
+  state: "included-in-image" | "not-included";
+  version: string;
+  source: string;
+  reason: string;
+}
+
+export interface RuntimeManifest {
+  id: string;
+  revision: number;
+  reference: string;
+  name: string;
+  scope: string;
+  /** Image inventory only; does not assert that a session uses the image. */
+  session_guarantee: boolean;
+  tools: RuntimeManifestTool[];
+}
+
 export interface EnvironmentProfile {
   id: string;
   revision: number;
@@ -714,6 +736,15 @@ export interface EnvironmentProfile {
   name: string;
   description: string;
   access: string;
+  workspace_access: "read-only" | "read-write";
+  runtime_manifest: RuntimeManifest | null;
+  managed_host_image_reference: string | null;
+  managed_host_image: {
+    reference: string | null;
+    state: "available" | "unavailable";
+    image: string | null;
+    reason: string;
+  };
   capabilities: EnvironmentCapability[];
 }
 

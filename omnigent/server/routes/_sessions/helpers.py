@@ -5302,6 +5302,7 @@ async def _provision_managed_sandbox(
     relaunch_host: Host | None,
     provider: str | None = None,
     agent_name: str | None = None,
+    runtime_image_reference: str | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -5351,6 +5352,7 @@ async def _provision_managed_sandbox(
                 repo=repo,
                 agent_name=agent_name,
                 on_stage=_on_stage,
+                runtime_image_reference=runtime_image_reference,
             )
         return await launch_managed_host(
             config=sandbox_config,
@@ -5360,6 +5362,7 @@ async def _provision_managed_sandbox(
             provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
+            runtime_image_reference=runtime_image_reference,
         )
     except HTTPException as exc:
         _logger.warning(
@@ -8986,6 +8989,7 @@ def _persist_stored_session_bundle(
     agent_bundle_location: str,
     agent_description: str | None,
     runner_id: str | None = None,
+    environment_runtime_ref: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -9023,6 +9027,7 @@ def _persist_stored_session_bundle(
             runner_id=runner_id,
             project_id=metadata.project_id,
             environment_profile=metadata.environment_profile,
+            environment_runtime_ref=environment_runtime_ref,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)

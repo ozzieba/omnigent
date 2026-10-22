@@ -388,6 +388,7 @@ class ConversationStore(ABC):
         conversation_id: str | None = None,
         project_id: str | None = None,
         environment_profile: str | None = None,
+        environment_runtime_ref: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -1523,6 +1524,7 @@ class ConversationStore(ABC):
         runner_id: str | None = None,
         project_id: str | None = None,
         environment_profile: str | None = None,
+        environment_runtime_ref: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
