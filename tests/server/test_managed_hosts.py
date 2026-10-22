@@ -766,9 +766,12 @@ async def test_profile_runtime_reference_requires_published_kubernetes_image() -
         }
     )
     assert configured is not None
-    assert resolve_profile_runtime_reference(
-        "workspace-readonly@1", deployment=configured, provider="kubernetes", managed=True
-    ) == "omnigent-host@1"
+    assert (
+        resolve_profile_runtime_reference(
+            "workspace-readonly@1", deployment=configured, provider="kubernetes", managed=True
+        )
+        == "omnigent-host@1"
+    )
     with pytest.raises(ValueError, match="not published"):
         resolve_profile_runtime_reference(
             "workspace-readonly@1",
@@ -1932,9 +1935,7 @@ async def test_profile_managed_launch_passes_only_catalog_image(db_uri: str) -> 
     entry = ManagedSandboxConfig(
         server_url="https://srv.example.com",
         launcher_factory=lambda: fake,
-        runtime_image_launcher_factory=lambda exact_image: (
-            image_args.append(exact_image) or fake
-        ),
+        runtime_image_launcher_factory=lambda exact_image: image_args.append(exact_image) or fake,
         managed_host_images={"omnigent-host@1": image},
         token_ttl_s=3600,
         managed_launch_supported=True,

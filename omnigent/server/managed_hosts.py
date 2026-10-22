@@ -681,7 +681,8 @@ def resolve_profile_runtime_reference(
         return runtime_reference
     if runtime_reference is None:
         raise ValueError(
-            f"environment profile {profile_reference!r} has no published managed-host image reference"
+            f"environment profile {profile_reference!r} has no published "
+            "managed-host image reference"
         )
     selected = deployment.for_provider(provider) if deployment is not None else None
     if selected is None or selected.provider != "kubernetes":
@@ -1374,9 +1375,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         provider=provider,
         host_config=host_config,
         managed_host_images=(
-            _parse_kubernetes_image_catalog(raw)
-            if provider == "kubernetes"
-            else {}
+            _parse_kubernetes_image_catalog(raw) if provider == "kubernetes" else {}
         ),
         runtime_image_launcher_factory=(
             runtime_image_launcher_factory if provider == "kubernetes" else None
