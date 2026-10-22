@@ -310,15 +310,20 @@ export function CreateAgentDialog({
             </p>
             {environmentProfiles.find((profile) => profile.reference === environmentProfile)
               ?.runtime_manifest ? (
-              <div className="rounded border px-2 py-1.5 text-xs" aria-label="Runtime image manifest">
+              <div
+                className="rounded border px-2 py-1.5 text-xs"
+                aria-label="Runtime image manifest"
+              >
                 <p className="font-medium">
-                  Image inventory: {environmentProfiles.find(
-                    (profile) => profile.reference === environmentProfile,
-                  )!.runtime_manifest!.reference}
+                  Image inventory:{" "}
+                  {
+                    environmentProfiles.find((profile) => profile.reference === environmentProfile)!
+                      .runtime_manifest!.reference
+                  }
                 </p>
                 <p className="text-muted-foreground">
-                  These are declared image contents; this profile does not guarantee that a
-                  session uses that image or grant tool access.
+                  These are declared image contents; this profile does not guarantee that a session
+                  uses that image or grant tool access.
                 </p>
                 <ul className="mt-1 flex flex-col gap-1">
                   {environmentProfiles
