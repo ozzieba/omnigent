@@ -766,7 +766,10 @@ def _codex_session_workspace(session_workspace: str | None) -> Path:
         session snapshot nor ``OMNIGENT_RUNNER_WORKSPACE``).
     """
     raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
-    return Path(raw.strip()).expanduser().resolve()
+    stripped = raw.strip()
+    if not stripped:
+        raise RuntimeError("Session workspace must not be empty after normalization.")
+    return Path(stripped).expanduser().resolve()
 
 
 def _pi_session_workspace(session_workspace: str | None) -> Path:
@@ -777,13 +780,19 @@ def _pi_session_workspace(session_workspace: str | None) -> Path:
     :returns: Workspace path for the terminal cwd.
     """
     raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
-    return Path(raw.strip()).expanduser().resolve()
+    stripped = raw.strip()
+    if not stripped:
+        raise RuntimeError("Session workspace must not be empty after normalization.")
+    return Path(stripped).expanduser().resolve()
 
 
 def _kiro_session_workspace(session_workspace: str | None) -> Path:
     """Resolve the cwd for a runner-owned Kiro terminal."""
     raw = session_workspace or _required_runner_env("OMNIGENT_RUNNER_WORKSPACE")
-    return Path(raw.strip()).expanduser().resolve()
+    stripped = raw.strip()
+    if not stripped:
+        raise RuntimeError("Session workspace must not be empty after normalization.")
+    return Path(stripped).expanduser().resolve()
 
 
 async def _kiro_native_launch_config(
