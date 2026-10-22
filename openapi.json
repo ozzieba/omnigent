@@ -48,6 +48,52 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AgentModelSelection": {
+        "description": "Parsed configuration intent; never an observed or served model.",
+        "properties": {
+          "declared_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Declared Model"
+          },
+          "resolution": {
+            "default": "UNKNOWN_UNREADABLE_SPEC",
+            "enum": [
+              "EXPLICIT_DECLARED",
+              "UNKNOWN_DEFAULT",
+              "UNKNOWN_OPAQUE_ROUTE",
+              "UNKNOWN_DYNAMIC_OR_PRIVATE_VALUE",
+              "UNKNOWN_UNREADABLE_SPEC"
+            ],
+            "title": "Resolution",
+            "type": "string"
+          },
+          "selection_authority": {
+            "const": "DECLARED_ONLY",
+            "default": "DECLARED_ONLY",
+            "title": "Selection Authority",
+            "type": "string"
+          },
+          "served_model": {
+            "title": "Served Model",
+            "type": "null"
+          },
+          "source_field": {
+            "const": "parsed_agent_spec.executor.model",
+            "default": "parsed_agent_spec.executor.model",
+            "title": "Source Field",
+            "type": "string"
+          }
+        },
+        "title": "AgentModelSelection",
+        "type": "object"
+      },
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
@@ -105,6 +151,9 @@
             "description": "Whether the MCP list can be edited through the session UI. Built-in template agents are read-only; session-scoped uploaded agents are editable.",
             "title": "Mcp Servers Editable",
             "type": "boolean"
+          },
+          "model_selection": {
+            "$ref": "#/components/schemas/AgentModelSelection"
           },
           "name": {
             "description": "Human-readable agent name, e.g. `\"research-agent\"`.",
