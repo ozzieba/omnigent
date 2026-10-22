@@ -579,10 +579,15 @@ async def test_a_turn_that_ran_with_measured_usage_is_settled(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_a_turn_that_ran_with_unknown_usage_is_never_settled_with_placeholder_zeros(
+async def test_a_turn_that_ran_with_unknown_usage_is_cancelled_never_settled_with_zeros(
     tmp_path: Path,
 ) -> None:
-    """llmq would store {0, 0} as measured tokens (and zero the charge); keep its estimate."""
+    """llmq would store {0, 0} as measured tokens (and zero the charge); cancel instead.
+
+    Deliberate under-reporting (oz: llmq is not a security boundary, fail open): a
+    pending estimate that is never measured would otherwise count against the
+    window until its lease expires.
+    """
     controller = Controller([])
     tap = TurnStreamTap()
     tap.feed(sse({"type": "response.created", "response": {"id": "r"}}))  # then interrupted
@@ -590,8 +595,9 @@ async def test_a_turn_that_ran_with_unknown_usage_is_never_settled_with_placehol
         outcome = await close_codex_turn(
             client, config(tmp_path), ADMITTED, turn_key="e" * 64, tap=tap
         )
-    assert outcome == "kept"
-    assert controller.settlements == [] and controller.cancellations == []
+    assert outcome == "released"
+    assert controller.settlements == []
+    assert controller.cancellations == [{"turn_key": "e" * 64, "reservation_id": "res-9"}]
 
 
 @pytest.mark.asyncio

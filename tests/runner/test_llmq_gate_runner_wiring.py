@@ -255,10 +255,11 @@ async def test_held_turn_dispatches_original_message_once_after_turbo(wired) -> 
     assert [r["attempt"] for r in llmq.seen] == [0, 1, 2]
     assert [r["turbo"] for r in llmq.seen] == [False, False, True]
     assert server.turbo_reads >= 3
-    # The harness reported no usage: the reservation is left alone, never settled with zeros.
-    assert len(state["closes"]) == 1 and state["closes"][0][1] == "kept"
+    # The harness reported no usage: the reservation is cancelled unmeasured (it must not
+    # keep counting as pending), never settled with zeros.
+    assert len(state["closes"]) == 1 and state["closes"][0][1] == "released"
     row = llmq.reservation(state["closes"][0][0])
-    assert row["status"] == "active"
+    assert row["status"] == "cancelled"
     assert "native_input_tokens" not in json.loads(row["metadata_json"])
 
 
@@ -340,7 +341,7 @@ def _reservations(llmq) -> list[sqlite3.Row]:
         return connection.execute("SELECT * FROM reservations").fetchall()
 
 
-async def test_interrupt_after_dispatch_keeps_the_estimate_and_never_settles_zeros(wired) -> None:
+async def test_interrupt_after_dispatch_cancels_unmeasured_and_never_settles_zeros(wired) -> None:
     llmq, server, state = wired
     llmq.publish(33)
     harness = BlockingHarness()
@@ -354,9 +355,9 @@ async def test_interrupt_after_dispatch_keeps_the_estimate_and_never_settles_zer
     rows = _reservations(llmq)
     assert len(rows) == 1 and len(harness.bodies) == 1
     # The turn ran (response.created was seen) with usage unknown: the close step ran
-    # on the interrupt, and left llmq's estimate in place rather than settling zeros.
-    assert state["closes"] == [(rows[0]["id"], "kept")]
-    assert rows[0]["status"] == "active" and rows[0]["actual_ppm"] is None
+    # on the interrupt, and cancelled the reservation unmeasured rather than settling zeros.
+    assert state["closes"] == [(rows[0]["id"], "released")]
+    assert rows[0]["status"] == "cancelled" and rows[0]["actual_ppm"] == 0
     assert "native_input_tokens" not in json.loads(rows[0]["metadata_json"])
 
 

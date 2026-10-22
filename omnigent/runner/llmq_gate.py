@@ -28,10 +28,9 @@ settlement would be stored as measured usage and feed its token-cost calibration
 * the turn never reached the harness (spawn failure, rejected delivery, interrupt
   before the first event) -> cancel the reservation, so the lease does not leak;
 * the turn ran and the harness reported real token usage -> settle with it;
-* the turn ran but usage is unknown -> leave the reservation alone. llmq keeps the
-  estimate and counts it until the lease expires, which is how it treats any
-  unfinished native turn. Releasing that estimate needs a coordinated llmq
-  "unmeasured completion" form.
+* the turn ran but usage is unknown -> cancel the reservation unmeasured. This is
+  deliberate under-reporting (llmq is not a security boundary and fails open), so
+  unmeasured estimates cannot pile up into false holds: see :func:`close_codex_turn`.
 """
 
 from __future__ import annotations
@@ -439,7 +438,7 @@ async def settle_codex_turn(
     There is deliberately no default usage: llmq stores whatever is sent as
     measured tokens, so a placeholder would poison its calibration and zero the
     charge once measured charging is on. Callers without real counts use
-    :func:`close_codex_turn`, which leaves the reservation alone instead.
+    :func:`close_codex_turn`, which cancels the reservation unmeasured instead.
 
     :returns: Whether llmq accepted the settlement.
     """
@@ -519,8 +518,8 @@ async def close_codex_turn(
     """End an admitted turn's reservation according to what the stream showed.
 
     :returns: ``"cancelled"`` (the turn never reached the harness),
-        ``"settled"`` (real usage reported), ``"kept"`` (the turn ran but its
-        usage is unknown, so llmq keeps its estimate until the lease expires), or
+        ``"settled"`` (real usage reported), ``"released"`` (the turn ran but its
+        usage is unknown, so the reservation was cancelled unmeasured), or
         ``"none"`` when there was no reservation or llmq refused the call.
     """
     if decision.reservation_id is None:
@@ -531,7 +530,26 @@ async def close_codex_turn(
     if tap.usage is not None:
         ok = await settle_codex_turn(client, config, decision, turn_key=turn_key, usage=tap.usage)
         return "settled" if ok else "none"
-    return "kept"
+    # The turn RAN but nothing measured it (every codex-native turn: its executor
+    # reports no usage). llmq has no "unmeasured completion" settlement, and a
+    # zero-token settlement would be stored as measured usage. Leaving the
+    # reservation pending is not neutral either: llmq counts every active
+    # reservation's estimate in the window's `pending` (engine.py `_pending_usage`,
+    # read by `_evaluate_window` as `global_available = capacity - used - pending`)
+    # until the 86,400 s lease expires, so unmeasured turns would pile up and make
+    # llmq answer `provider_window_exhausted` / pacing holds against a window the
+    # provider says is nearly empty. Cancel it instead.
+    #
+    # This under-reports on purpose: the cancelled turn's cost is not booked until
+    # the provider's own usedPercent shows it in the next receipt. oz's rule is
+    # that llmq is NOT a security boundary and fails OPEN with an indicator, so a
+    # spurious hold from our own estimates is the worse error than a slightly late
+    # count. The real 90% credit-safety margin is unaffected: it is read from the
+    # provider-reported usedPercent (codex_native_contract.py), not from reservations.
+    # llmq accepts the cancel because the gate never calls /activations, so the
+    # reservation is not marked dispatch-authorized (engine.NativeTurnDispatched).
+    ok = await cancel_codex_turn(client, config, decision, turn_key=turn_key)
+    return "released" if ok else "none"
 
 
 StatusCallback = Callable[[GateDecision, bool], Awaitable[None]]
