@@ -2995,6 +2995,7 @@ async def _persist_external_assistant_message(
     )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
     persisted = persisted_items[0]
+    session_live_state.persist_scheduled_run_started(session_id)
     _publish_external_assistant_message(
         session_id,
         persisted,
@@ -4669,6 +4670,12 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
         if isinstance(data, dict):
             data.pop("response_id", None)
     session_stream.publish(session_id, payload)
+    session_live_state.persist_scheduled_run_completion(
+        session_id,
+        "failed",
+        error_code="cancelled",
+        error="scheduled turn was interrupted",
+    )
 
 
 def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
