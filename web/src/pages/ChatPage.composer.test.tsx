@@ -1,4 +1,5 @@
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
@@ -26,6 +27,16 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
+// The Turbo switch PATCHes through the store's `updateSession`; spy on it so
+// the tests below assert the wire call without a network.
+const updateSessionMock = vi.fn(async (_id: string, updates: Record<string, unknown>) => ({
+  id: _id,
+  turbo: updates.turbo === true,
+}));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  updateSession: (...args: Parameters<typeof updateSessionMock>) => updateSessionMock(...args),
+}));
 vi.mock("@/hooks/useGithub", () => ({
   useGithubInfo: () => ({ data: undefined }),
 }));
@@ -2929,5 +2940,125 @@ describe("shouldQueueSend", () => {
     // The ordering guard outranks always-steer: draining must stay in order, so
     // a direct send can't overtake a still-queued earlier one.
     expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
+  });
+});
+
+describe("Turbo (per-session paid-credits switch, oz 2026-10-06)", () => {
+  beforeEach(() => {
+    updateSessionMock.mockClear();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ turbo: false });
+  });
+
+  it("shows the Turbo row beside the Model row for a Codex session and PATCHes the flag", async () => {
+    useChatStore.setState({ conversationId: "conv_turbo", turbo: false });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-model")).toBeTruthy();
+    const toggle = screen.getByTestId("composer-config-turbo");
+    expect(screen.getByTestId("composer-config-turbo-state").textContent).toBe("Off");
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(updateSessionMock).toHaveBeenCalledWith("conv_turbo", { turbo: true }),
+    );
+  });
+
+  it("does not offer Turbo on a non-Codex session", async () => {
+    useChatStore.setState({ conversationId: "conv_claude", turbo: false });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("composer-config-gear"));
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-turbo")).toBeNull();
+    expect(updateSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("shows a persistent Turbo chip in the composer while Turbo is on, without hovering", () => {
+    useChatStore.setState({ conversationId: "conv_turbo_on", turbo: true });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    const chip = screen.getByTestId("composer-turbo-chip");
+    expect(chip.textContent).toMatch(/turbo/i);
+    expect(chip.textContent).toMatch(/paid credits/i);
+  });
+
+  it("shows no Turbo chip while Turbo is off or on a non-Codex session", () => {
+    useChatStore.setState({ conversationId: "conv_turbo_off", turbo: false });
+    const codex = render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(screen.queryByTestId("composer-turbo-chip")).toBeNull();
+    codex.unmount();
+    useChatStore.setState({ conversationId: "conv_claude_on", turbo: true });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(screen.queryByTestId("composer-turbo-chip")).toBeNull();
+  });
+
+  it("also names Turbo in the gear's hover summary", async () => {
+    useChatStore.setState({ conversationId: "conv_turbo_tip", turbo: true });
+    render(
+      <Composer
+        {...composerProps({
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const tip = await screen.findAllByTestId("composer-config-gear-tooltip");
+    expect(tip[0].textContent ?? "").toMatch(/Turbo: ?On \(paid credits allowed\)/);
   });
 });

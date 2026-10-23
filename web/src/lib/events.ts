@@ -486,6 +486,7 @@ export interface SessionStatusEvent {
   blockedOn?: string;
   /** Numeric-only quota telemetry attached while admission is delayed. */
   quotaWait?: QuotaWaitInfo;
+  quotaGate?: QuotaGateInfo;
   /**
    * Structured failure detail; only present when `status === "failed"`.
    * Carries the optional `title` / `cause` / `remediation` fields when the
@@ -500,6 +501,21 @@ export interface QuotaWaitInfo {
   burstMultiplier?: number;
   /** Positive is above/ahead of the linear allowance; negative is below/behind. */
   linearScheduleDeltaPpm?: number;
+}
+
+/**
+ * Outcome of the runner's llmq admission for a Codex turn (`quota_gate` on a
+ * `session.status` edge). `blocked`: llmq refused on fresh evidence and the
+ * turn is held (`blockedOn` carries the sentence). `unverified`: the turn ran
+ * without a usable check; shown as a badge. `verified` clears both.
+ */
+export interface QuotaGateInfo {
+  state: "verified" | "unverified" | "blocked";
+  reason?: string;
+  message?: string;
+  resetsAt?: number;
+  turbo: boolean;
+  creditBearing: boolean;
 }
 
 /**
@@ -542,6 +558,16 @@ export interface SessionModelEvent {
   type: "session_model";
   conversationId: string;
   model: string;
+}
+
+/**
+ * `session.turbo` — the per-session Turbo switch changed (a PATCH from any
+ * surface), so every open client re-renders the Turbo control and chip.
+ */
+export interface SessionTurboEvent {
+  type: "session_turbo";
+  conversationId: string;
+  turbo: boolean;
 }
 
 /**
@@ -954,6 +980,7 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionTurboEvent
   | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent

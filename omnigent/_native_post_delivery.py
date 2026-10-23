@@ -182,6 +182,7 @@ async def post_external_session_status(
     response_id: str | None = None,
     blocked_on: str | None = None,
     quota_wait: dict[str, object] | None = None,
+    quota_gate: dict[str, object] | None = None,
     failure_code: str | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
@@ -231,6 +232,8 @@ async def post_external_session_status(
         data["blocked_on"] = blocked_on
     if quota_wait is not None:
         data["quota_wait"] = quota_wait
+    if quota_gate is not None:
+        data["quota_gate"] = quota_gate
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

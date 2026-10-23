@@ -48,6 +48,7 @@ import type {
   SessionTerminalActivityEvent,
   SessionStatusEvent,
   SessionModelEvent,
+  SessionTurboEvent,
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
@@ -594,6 +595,26 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ...(linearScheduleDeltaPpm !== undefined ? { linearScheduleDeltaPpm } : {}),
         };
       }
+      const rawQuotaGate = data.quota_gate;
+      let quotaGate: SessionStatusEvent["quotaGate"];
+      if (rawQuotaGate != null && typeof rawQuotaGate === "object") {
+        const gate = rawQuotaGate as Record<string, unknown>;
+        const state = gate.state;
+        if (state === "verified" || state === "unverified" || state === "blocked") {
+          const resetsAt =
+            typeof gate.resets_at === "number" && Number.isFinite(gate.resets_at)
+              ? gate.resets_at
+              : undefined;
+          quotaGate = {
+            state,
+            ...(typeof gate.reason === "string" && gate.reason ? { reason: gate.reason } : {}),
+            ...(typeof gate.message === "string" && gate.message ? { message: gate.message } : {}),
+            ...(resetsAt !== undefined ? { resetsAt } : {}),
+            turbo: gate.turbo === true,
+            creditBearing: gate.credit_bearing === true,
+          };
+        }
+      }
       return {
         type: "session_status",
         conversationId,
@@ -603,6 +624,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(quotaWait !== undefined ? { quotaWait } : {}),
+        ...(quotaGate !== undefined ? { quotaGate } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
     }
@@ -671,6 +693,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const model = data.model;
     if (typeof model !== "string" || !model) return null;
     return { type: "session_model", conversationId, model } satisfies SessionModelEvent;
+  }
+  if (eventType === "session.turbo") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const turbo = data.turbo;
+    if (typeof turbo !== "boolean") return null;
+    return { type: "session_turbo", conversationId, turbo } satisfies SessionTurboEvent;
   }
   if (eventType === "session.title") {
     const conversationId = data.conversation_id;
