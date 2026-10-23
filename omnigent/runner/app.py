@@ -100,7 +100,9 @@ from omnigent.runner.llmq_gate import (
     CODEX_HARNESSES,
     GateConfig,
     GateDecision,
+    TurnActivation,
     TurnStreamTap,
+    activate_codex_turn,
     close_codex_turn,
     effective_codex_model,
     gate_codex_turn,
@@ -7124,6 +7126,12 @@ def create_runner_app(
     _llmq_gate_config = GateConfig.from_env()
     _llmq_gate_http: httpx.AsyncClient | None = None
 
+    # Activation (a turn the harness started is recorded as dispatched) stays on
+    # until an llmq without the unmeasured settlement (pre-#1328) shows up: there,
+    # an activated unmeasured turn can be neither settled nor cancelled, so the
+    # runner stops activating rather than strand estimates for the lease.
+    _llmq_activation_enabled = True
+
     def _llmq_gate_client() -> httpx.AsyncClient:
         nonlocal _llmq_gate_http
         if _llmq_gate_http is None:
@@ -7215,13 +7223,43 @@ def create_runner_app(
                 _logger.debug("llmq gate: gate_error indicator failed", exc_info=True)
             return failed_open, turn_key(conv, "gate-error")
 
+    def _llmq_turn_tap(
+        gate: tuple[GateDecision, str] | None,
+    ) -> tuple[TurnStreamTap, TurnActivation | None]:
+        """The turn's stream tap, activating a verified reservation at dispatch.
+
+        Activation waits for the harness's first stream event (it accepted and
+        started the turn), so every earlier failure still cancels a reservation
+        llmq never saw dispatched. Unverified admissions carry no reservation and
+        never activate.
+        """
+        config = _llmq_gate_config
+        if (
+            gate is None
+            or config is None
+            or not _llmq_activation_enabled
+            or gate[0].reservation_id is None
+            or not gate[0].verified
+        ):
+            return TurnStreamTap(), None
+        decision, key = gate
+        activation = TurnActivation(
+            lambda: activate_codex_turn(_llmq_gate_client(), config, decision, turn_key=key)
+        )
+        return TurnStreamTap(on_dispatch=activation), activation
+
     def _schedule_llmq_close(
-        conv: str, gate: tuple[GateDecision, str], tap: TurnStreamTap
+        conv: str,
+        gate: tuple[GateDecision, str],
+        tap: TurnStreamTap,
+        activation: TurnActivation | None = None,
     ) -> None:
         """End the admitted turn's llmq reservation off the turn's own task.
 
         Runs from the turn's ``finally``, so an interrupt (which cancels that task)
         still releases or settles it; the work is a detached task for that reason.
+        A pending activation is awaited first, so the close knows whether llmq
+        recorded the dispatch.
         """
         decision, key = gate
         config = _llmq_gate_config
@@ -7229,9 +7267,17 @@ def create_runner_app(
             return
 
         async def _close() -> None:
+            activated = await activation.result() if activation is not None else False
             outcome = await close_codex_turn(
-                _llmq_gate_client(), config, decision, turn_key=key, tap=tap
+                _llmq_gate_client(),
+                config,
+                decision,
+                turn_key=key,
+                tap=tap,
+                activated=activated,
             )
+            if outcome in ("released", "retained"):
+                _disable_llmq_activation()
             _logger.info(
                 "llmq gate session=%s reservation %s (%s)",
                 conv,
@@ -7243,6 +7289,16 @@ def create_runner_app(
         task = asyncio.create_task(_close(), name=f"llmq-close-{conv}")
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
+
+    def _disable_llmq_activation() -> None:
+        nonlocal _llmq_activation_enabled
+        if _llmq_activation_enabled:
+            _llmq_activation_enabled = False
+            _logger.warning(
+                "llmq gate: the controller has no usage_unmeasured settlement "
+                "(ozzieba/chatgpt-playground#1328); reservations are no longer "
+                "activated, so unmeasured turns can still be released"
+            )
 
     async def _run_turn_bg(
         msg_body: _JsonObject,
@@ -7691,9 +7747,9 @@ def create_runner_app(
             )
 
         _llmq_gate: tuple[GateDecision, str] | None = None
-        _llmq_tap = TurnStreamTap()
         if harness_name in CODEX_HARNESSES:
             _llmq_gate = await _gate_codex_turn_for_session(conv, harness_body, cached_spec)
+        _llmq_tap, _llmq_activation = _llmq_turn_tap(_llmq_gate)
         try:
             try:
                 response = await _stream_message_to_harness(
@@ -7735,7 +7791,7 @@ def create_runner_app(
             # settle it with real usage when reported, else settle it unmeasured
             # at llmq's estimate (marked retained_estimate).
             if _llmq_gate is not None:
-                _schedule_llmq_close(conv, _llmq_gate, _llmq_tap)
+                _schedule_llmq_close(conv, _llmq_gate, _llmq_tap, _llmq_activation)
 
     async def _drain_streaming_response(
         response: StreamingResponse,
