@@ -155,6 +155,22 @@ describe("Turbo write ordering (R2-4)", () => {
     expect(useChatStore.getState().turbo).toBe(true);
   });
 
+  it("an older write that succeeds after the newest one failed shows the server's value", async () => {
+    // Off; the user flips On (A, slow) then Off (B). B fails first and rolls back
+    // to Off; A then lands and the server now holds On. Ignoring A's echo would
+    // show Off while paid credits are allowed.
+    bindConversationForTest("conv_seq_newest_fail_old_ok", { turbo: false });
+    const [a, b] = queuePatches(2);
+    const pa = useChatStore.getState().setTurbo(true);
+    const pb = useChatStore.getState().setTurbo(false);
+    b.reject(new Error("500"));
+    await expect(pb).rejects.toThrow("500");
+    expect(useChatStore.getState().turbo).toBe(false);
+    a.resolve({ id: "conv_seq_newest_fail_old_ok", turbo: true });
+    await pa;
+    expect(useChatStore.getState().turbo).toBe(true);
+  });
+
   it("the routing PATCH echo does not override a Turbo toggle made while it was in flight", async () => {
     bindConversationForTest("conv_seq_routing", { turbo: false });
     const [routing, turbo] = queuePatches(2);

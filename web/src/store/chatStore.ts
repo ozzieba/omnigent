@@ -1198,12 +1198,16 @@ let modelPickRevision = 0;
  *   newest answered write (a late echo of an older one never replaces it). A
  *   failed newest write rolls back to it, not to an older write's
  *   still-unconfirmed optimistic value.
+ * - `failedSeq`: the newest write that failed. While it is still the newest
+ *   (`failedSeq === seq`), an older write that then succeeds is the server's
+ *   value and is shown: the failed write left nothing newer to protect.
  */
 interface TurboWriteLedger {
   seq: number;
   inFlight: number;
   settled: boolean;
   settledSeq: number;
+  failedSeq: number;
 }
 const turboWrites = new Map<string, TurboWriteLedger>();
 
@@ -2350,7 +2354,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!conversationId) return;
     let ledger = turboWrites.get(conversationId);
     if (ledger === undefined) {
-      ledger = { seq: 0, inFlight: 0, settled: false, settledSeq: 0 };
+      ledger = { seq: 0, inFlight: 0, settled: false, settledSeq: 0, failedSeq: 0 };
       turboWrites.set(conversationId, ledger);
     }
     // The first write of a burst starts from the switch's current (settled)
@@ -2373,11 +2377,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ledger.settled = turbo;
         ledger.settledSeq = seq;
       }
-      if (ledger.seq === seq) patchSet({ turbo });
+      if (ledger.seq === seq || (ledger.failedSeq === ledger.seq && ledger.settledSeq === seq)) {
+        patchSet({ turbo });
+      }
     } catch (err) {
       // A newer write owns the switch now; this failure changes nothing the
       // user still asked for, so neither roll back nor report it.
       if (ledger.seq !== seq) return;
+      ledger.failedSeq = seq;
       patchSet({ turbo: ledger.settled });
       throw err;
     } finally {
