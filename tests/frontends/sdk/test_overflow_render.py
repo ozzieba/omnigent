@@ -74,6 +74,15 @@ pyte = pytest.importorskip("pyte")
 
 _DRIVER = Path(__file__).parent / "_overflow_render_driver.py"
 
+# Hang guard, not a pacing knob. The drain loop below returns as soon as the
+# child exits (EOF / EIO on the PTY), so a healthy run takes ~1-2s. The driver
+# is a cold ``python`` that imports omnigent_ui_sdk + prompt_toolkit + rich
+# before writing a single byte; on a CPU-saturated CI host (load avg ~28 on 24
+# cores) that start-up alone exceeded the previous 8s deadline, so the loop
+# gave up on a still-running child and the test asserted on a truncated (or
+# empty) capture. Keep the deadline far above any plausible loaded start-up.
+_DRAIN_TIMEOUT_S = 90.0
+
 
 def _spawn_driver_in_pty(cols: int, rows: int) -> tuple[int, int]:
     """
@@ -97,9 +106,10 @@ def _spawn_driver_in_pty(cols: int, rows: int) -> tuple[int, int]:
     return pid, parent_fd
 
 
-def _drain_pty(parent_fd: int, pid: int, timeout_s: float = 8.0) -> bytes:
+def _drain_pty(parent_fd: int, pid: int, timeout_s: float = _DRAIN_TIMEOUT_S) -> bytes:
     """
-    Read from the PTY until the child exits or the deadline expires.
+    Read from the PTY until the child exits (EOF), failing the test if the
+    hang-guard deadline expires first.
 
     :param parent_fd: Parent side of the PTY.
     :param pid: Child PID — used to short-circuit when the child exits.
@@ -107,6 +117,7 @@ def _drain_pty(parent_fd: int, pid: int, timeout_s: float = 8.0) -> bytes:
     :returns: Captured bytes.
     """
     captured: list[bytes] = []
+    timed_out = False
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         ready, _, _ = select.select([parent_fd], [], [], 0.5)
@@ -125,11 +136,21 @@ def _drain_pty(parent_fd: int, pid: int, timeout_s: float = 8.0) -> bytes:
             captured.append(data)
         except OSError:
             break
+    else:
+        timed_out = True
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, 9)
     with contextlib.suppress(ChildProcessError):
         os.waitpid(pid, 0)
     os.close(parent_fd)
+    if timed_out:
+        # Fail loudly instead of asserting on a truncated capture, which reads
+        # as a (misleading) product regression.
+        pytest.fail(
+            f"driver did not finish within {timeout_s:.0f}s "
+            f"(captured {sum(len(c) for c in captured)} bytes); "
+            f"host is likely starved of CPU"
+        )
     return b"".join(captured)
 
 

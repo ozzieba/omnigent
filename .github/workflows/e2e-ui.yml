@@ -196,8 +196,8 @@ jobs:
         # tmux: the claude-native render-parity test drives Claude Code
         # through a tmux pane, so `tmux` must be on PATH.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap tmux
+          for i in 1 2 3 4; do sudo apt-get -o Acquire::Retries=5 update && break; [ "$i" = 4 ] && exit 1; sleep $((i * 15)); done
+          sudo apt-get -o Acquire::Retries=5 install -y bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       # Fetch the prebuilt Codex-parity sidecar from the build-sidecar job
