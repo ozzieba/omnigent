@@ -25,13 +25,20 @@ See designs/CODEX_LLMQ_GATE_AND_TURBO.md.
 Reservation lifecycle (a zero-token settlement would be stored as measured usage
 and feed llmq's token-cost calibration, so it is never sent):
 
+* the harness started the turn (its first stream event) -> activate the
+  reservation (``/activations``), which records it as dispatched; after that llmq
+  refuses to cancel it. Activation is bookkeeping: it never holds or fails a turn
+  that is already running (see :func:`activate_codex_turn`);
 * the turn never reached the harness (spawn failure, rejected delivery, interrupt
-  before the first event) -> cancel the reservation, so the lease does not leak;
+  before the first event) -> cancel the reservation, so the lease does not leak
+  (it was never activated);
 * the turn ran and the harness reported real token usage -> settle with it;
 * the turn ran but usage is unknown -> settle it ``usage_unmeasured`` at llmq's own
   estimate (marked ``retained_estimate``; ozzieba/chatgpt-playground#1328). An llmq
-  without that form answers 422 and the reservation is cancelled instead. Any other
-  llmq fault leaves it for the lease to expire: see :func:`close_codex_turn`.
+  without that form answers 422: the reservation is then cancelled if it was not
+  activated, else left at its estimate for the lease (llmq's own conservative
+  charge for a dispatched turn). Any other llmq fault leaves it for the lease to
+  expire: see :func:`close_codex_turn`.
 
 Ledger throttling (pacing, share, window estimate) is waited out for at most
 ``LLMQ_MAX_ADMISSION_DELAY_SECONDS`` in total, then the turn runs with the
@@ -48,7 +55,7 @@ import math
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -157,6 +164,10 @@ class GateDecision:
     :param credit_bearing: The turn runs on paid credits (Turbo past the margin).
     :param retry_after_seconds: llmq's pacing hint on a non-fresh refusal.
     :param admission_delay_seconds: llmq's pacing delay on an admission.
+    :param model: The model the admission asked about; an activation repeats it
+        (llmq re-checks the reservation against the same model and Turbo flag).
+    :param turbo: The Turbo flag the admission carried.
+    :param attempt: The admission attempt that produced this decision.
     """
 
     allow: bool
@@ -167,6 +178,9 @@ class GateDecision:
     credit_bearing: bool = False
     retry_after_seconds: float | None = None
     admission_delay_seconds: float = 0.0
+    model: str | None = field(default=None, compare=False)
+    turbo: bool = field(default=False, compare=False)
+    attempt: int = field(default=0, compare=False)
 
     @property
     def state(self) -> str:
@@ -341,7 +355,119 @@ async def admit_codex_turn(
         data = resp.json()
     except ValueError:
         return unverified("llmq_invalid_response")
-    return decision_from_payload(data)
+    return replace(decision_from_payload(data), model=model, turbo=turbo, attempt=attempt)
+
+
+def _activation_id(reservation_id: str) -> str:
+    """A stable activation id per reservation, so a repeated call replays."""
+    return "omnigent-" + hashlib.sha256(reservation_id.encode()).hexdigest()[:32]
+
+
+async def activate_codex_turn(
+    client: httpx.AsyncClient,
+    config: GateConfig,
+    decision: GateDecision,
+    *,
+    turn_key: str,
+) -> bool | None:
+    """Mark an admitted turn's reservation dispatched (``/activations``).
+
+    Called once the harness has started the turn, so it is bookkeeping, not a
+    second gate: llmq records ``dispatched_at`` / ``dispatch_authorized_at`` (after
+    which it refuses to cancel the reservation, because the turn may have spent
+    tokens), and the result never holds or fails the running turn. The body
+    repeats the admission (llmq validates it as ``NativeTurnActivation``: the same
+    model and Turbo flag, so a credit-bearing Turbo admission re-checks as one).
+    Same fault policy as admission: 5 s timeout, no retry, any fault is logged.
+
+    :returns: ``True`` when llmq authorised the dispatch (``ready``), ``False``
+        when it answered not ready (e.g. its receipt went stale since the
+        admission; the reservation then stays cancellable), ``None`` when there
+        was nothing to activate or llmq could not be asked.
+    """
+    if decision.reservation_id is None or not decision.verified or decision.model is None:
+        return None
+    bearer = config.bearer()
+    if bearer is None:
+        return None
+    body = {
+        "turn_key": turn_key,
+        "agent_id": config.agent_id,
+        "workstream": config.workstream,
+        "harness": "codex",
+        "model": decision.model,
+        "attempt": decision.attempt,
+        "evidence": "controller",
+        "turbo": decision.turbo,
+        "reservation_id": decision.reservation_id,
+        "activation_id": _activation_id(decision.reservation_id),
+    }
+    try:
+        resp = await client.post(
+            f"{config.controller_url}/v1/native-turns/activations",
+            json=body,
+            headers={"Authorization": f"Bearer {bearer}"},
+            timeout=_REQUEST_TIMEOUT_S,
+        )
+    except httpx.HTTPError as exc:
+        _logger.warning(
+            "llmq gate: activation of %s unreachable (%s)",
+            decision.reservation_id,
+            type(exc).__name__,
+        )
+        return None
+    if resp.status_code != 200:
+        _logger.warning(
+            "llmq gate: activation of %s answered HTTP %s",
+            decision.reservation_id,
+            resp.status_code,
+        )
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    ready = data.get("ready") if isinstance(data, dict) else None
+    if not isinstance(ready, bool):
+        return None
+    if not ready:
+        _logger.info(
+            "llmq gate: activation of %s not ready (%s); the turn is already running",
+            decision.reservation_id,
+            data.get("reason"),
+        )
+    return ready
+
+
+class TurnActivation:
+    """Starts an admitted turn's activation once, when the harness starts the turn.
+
+    Use it as a :class:`TurnStreamTap` ``on_dispatch`` callback: the first call
+    schedules ``start`` as a task (the tap is fed synchronously, inside the event
+    loop); :meth:`result` awaits it before the reservation is closed, so the close
+    sees whether llmq recorded the dispatch.
+    """
+
+    def __init__(self, start: Callable[[], Awaitable[bool | None]]) -> None:
+        self._start = start
+        self._task: asyncio.Task[bool | None] | None = None
+
+    def __call__(self) -> None:
+        if self._task is None:
+            self._task = asyncio.get_running_loop().create_task(self._run())
+
+    async def _run(self) -> bool | None:
+        try:
+            return await self._start()
+        except Exception:  # noqa: BLE001 — activation is best-effort bookkeeping
+            _logger.warning("llmq gate: activation failed", exc_info=True)
+            return None
+
+    async def result(self) -> bool:
+        """Whether llmq authorised the dispatch (``False`` if never started)."""
+        if self._task is None:
+            return False
+        return await asyncio.shield(self._task) is True
 
 
 def llmq_usage(raw: object) -> dict[str, int] | None:
@@ -386,18 +512,19 @@ class TurnStreamTap:
 
     The runner feeds it every chunk of the turn's response while draining it.
     ``dispatched`` becomes true once the harness produced its first event
-    (``response.created``); ``usage`` holds llmq-shaped usage once a
-    ``response.completed`` carried real token counts. Parsing is best-effort and
-    never raises: a tap that understands nothing leaves both unset, which makes the
-    reservation "ran, usage unknown".
+    (``response.created``), and ``on_dispatch`` (if given) is called once at that
+    moment; ``usage`` holds llmq-shaped usage once a ``response.completed`` carried
+    real token counts. Parsing is best-effort and never raises: a tap that
+    understands nothing leaves both unset, which makes the reservation "never ran".
     """
 
     _MAX_PENDING = 1 << 20
 
-    def __init__(self) -> None:
+    def __init__(self, on_dispatch: Callable[[], None] | None = None) -> None:
         self.dispatched = False
         self.usage: dict[str, int] | None = None
         self._pending = ""
+        self._on_dispatch = on_dispatch
 
     def feed(self, chunk: bytes | str) -> None:
         text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk
@@ -414,20 +541,29 @@ class TurnStreamTap:
             return
         try:
             event = json.loads(payload)
-        except ValueError:
+        except (ValueError, RecursionError):
             return
         if not isinstance(event, dict):
             return
         kind = event.get("type")
-        if kind == "response.created":
-            self.dispatched = True
-        elif kind == "response.completed":
-            self.dispatched = True
+        if kind in ("response.created", "response.completed"):
+            self._mark_dispatched()
+        if kind == "response.completed":
             response = event.get("response")
             if isinstance(response, dict):
                 measured = llmq_usage(response.get("usage"))
                 if measured is not None:
                     self.usage = measured
+
+    def _mark_dispatched(self) -> None:
+        if self.dispatched:
+            return
+        self.dispatched = True
+        if self._on_dispatch is not None:
+            try:
+                self._on_dispatch()
+            except Exception:  # noqa: BLE001 — the tap never raises into the drain
+                _logger.warning("llmq gate: on_dispatch callback failed", exc_info=True)
 
 
 async def settle_codex_turn(
@@ -559,15 +695,20 @@ async def close_codex_turn(
     *,
     turn_key: str,
     tap: TurnStreamTap,
+    activated: bool = False,
 ) -> str:
     """End an admitted turn's reservation according to what the stream showed.
 
+    :param activated: llmq authorised the turn's dispatch (:func:`activate_codex_turn`
+        answered ready), so it will refuse a cancellation (HTTP 409).
     :returns: ``"cancelled"`` (the turn never reached the harness),
         ``"settled"`` (real usage reported), ``"estimated"`` (the turn ran but
         its usage is unknown, so llmq settled it at its estimate, marked
         ``retained_estimate``), ``"released"`` (the same, against an llmq without
-        that settlement form, so the reservation was cancelled instead), or
-        ``"none"`` when there was no reservation or llmq refused the call.
+        that settlement form, so the reservation was cancelled instead),
+        ``"retained"`` (the same, but the turn was activated, so it stays at its
+        estimate until the lease ends), or ``"none"`` when there was no
+        reservation or llmq refused the call.
     """
     if decision.reservation_id is None:
         return "none"
@@ -588,6 +729,16 @@ async def close_codex_turn(
     if status is not None and status < 400:
         return "estimated"
     if status == 422:
+        if activated:
+            # llmq refuses to cancel a dispatched turn (409: it may have spent
+            # tokens); without the unmeasured form its only remaining charge is
+            # the estimate held until the lease ends.
+            _logger.warning(
+                "llmq gate: %s ran unmeasured on an llmq without usage_unmeasured; "
+                "its estimate stays pending until the lease ends",
+                decision.reservation_id,
+            )
+            return "retained"
         # An llmq from before the `usage_unmeasured` form rejects the body. The
         # least-bad fallback there is to release the reservation (under-reporting
         # until the next receipt) rather than hold its estimate for the lease;
@@ -671,3 +822,80 @@ async def gate_codex_turn(
         )
         await sleep(max(1.0, min(wait, config.recheck_seconds)))
         attempt += 1
+
+
+# ----------------------------------------------------------------- turn attribution
+#
+# Which Codex turns were admitted BEFORE they started, per bridge directory, so the
+# codex-native forwarder can tell them from turns Codex starts by itself (goal-mode
+# continuations), which it admits at ``turn/started``
+# (:mod:`omnigent.runner.llmq_goal_gate`). The codex-native executor records every
+# turn it starts (the runner gated that dispatch); any other gate that knows Codex's
+# turn id (a ``UserPromptSubmit`` hook gets ``turn_id``) can record its turns too.
+
+#: One admitted Codex turn id per line.
+ADMITTED_TURNS_FILE = "llmq-admitted-turns"
+#: Present while an admitted ``turn/start`` is in flight (its turn id not known yet).
+TURN_START_PENDING_FILE = "llmq-turn-start-pending"
+_ADMITTED_TURNS_MAX_BYTES = 64 * 1024
+_ADMITTED_TURNS_KEEP = 256
+#: A pending marker older than this is a crashed start, not one in flight.
+TURN_START_PENDING_MAX_AGE_S = 60.0
+
+
+def mark_turn_start_pending(bridge_dir: Path) -> None:
+    """Record that an admitted ``turn/start`` is about to be sent (best-effort)."""
+    try:
+        (bridge_dir / TURN_START_PENDING_FILE).write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        _logger.debug("llmq gate: could not mark a pending turn start", exc_info=True)
+
+
+def clear_turn_start_pending(bridge_dir: Path) -> None:
+    """Drop the pending-start marker (best-effort)."""
+    try:
+        (bridge_dir / TURN_START_PENDING_FILE).unlink(missing_ok=True)
+    except OSError:
+        _logger.debug("llmq gate: could not clear a pending turn start", exc_info=True)
+
+
+def note_admitted_turn(bridge_dir: Path, turn_id: str) -> None:
+    """Record that Codex turn ``turn_id`` was admitted before it started.
+
+    Also clears the pending-start marker. Best-effort: never raises.
+    """
+    if turn_id and "\n" not in turn_id:
+        path = bridge_dir / ADMITTED_TURNS_FILE
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(turn_id + "\n")
+            if path.stat().st_size > _ADMITTED_TURNS_MAX_BYTES:
+                kept = path.read_text(encoding="utf-8").splitlines()[-_ADMITTED_TURNS_KEEP:]
+                tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+                tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                os.replace(tmp, path)
+        except OSError:
+            _logger.debug("llmq gate: could not record admitted turn %s", turn_id, exc_info=True)
+    clear_turn_start_pending(bridge_dir)
+
+
+def turn_admission_record(bridge_dir: Path, turn_id: str) -> str:
+    """What the bridge records about ``turn_id``.
+
+    :returns: ``"admitted"`` (recorded), ``"pending"`` (not recorded, but an
+        admitted ``turn/start`` is in flight, so it may be that one), or
+        ``"unknown"`` (nobody admitted it).
+    """
+    try:
+        recorded = (bridge_dir / ADMITTED_TURNS_FILE).read_text(encoding="utf-8")
+    except OSError:
+        recorded = ""
+    if turn_id in recorded.splitlines():
+        return "admitted"
+    try:
+        age = time.time() - float(
+            (bridge_dir / TURN_START_PENDING_FILE).read_text(encoding="utf-8").strip()
+        )
+    except (OSError, ValueError):
+        return "unknown"
+    return "pending" if age < TURN_START_PENDING_MAX_AGE_S else "unknown"
