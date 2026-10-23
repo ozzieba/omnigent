@@ -1198,14 +1198,44 @@ let modelPickRevision = 0;
  *   newest answered write (a late echo of an older one never replaces it). A
  *   failed newest write rolls back to it, not to an older write's
  *   still-unconfirmed optimistic value.
+ * - `failedSeq`: the newest write that failed. A failed reply does not prove the
+ *   server skipped the write (a lost 504 may follow an applied PATCH), so neither
+ *   local guess is trusted: once no write is in flight and that failure is still
+ *   the newest, the switch is read back from the server.
  */
 interface TurboWriteLedger {
   seq: number;
   inFlight: number;
   settled: boolean;
   settledSeq: number;
+  failedSeq: number;
 }
 const turboWrites = new Map<string, TurboWriteLedger>();
+
+/**
+ * Re-read a conversation's Turbo flag after its newest write failed.
+ *
+ * :param conversationId: conversation whose write failed.
+ * :param ledger: that conversation's write ledger.
+ * :param patchSet: setter pinned to the conversation.
+ * :returns: nothing; applies the server's value unless a newer write started.
+ */
+async function readBackTurbo(
+  conversationId: string,
+  ledger: TurboWriteLedger,
+  patchSet: (patch: { turbo: boolean }) => void,
+): Promise<void> {
+  const seq = ledger.seq;
+  try {
+    const session = await getSessionSlim(conversationId);
+    if (!session || ledger.seq !== seq || ledger.inFlight !== 0) return;
+    ledger.settled = session.turbo ?? false;
+    ledger.settledSeq = seq;
+    patchSet({ turbo: ledger.settled });
+  } catch {
+    // Keep the rollback; a later SSE or snapshot corrects it.
+  }
+}
 
 /**
  * Snapshot the Turbo ledger before a request whose reply carries `turbo`.
@@ -2350,7 +2380,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!conversationId) return;
     let ledger = turboWrites.get(conversationId);
     if (ledger === undefined) {
-      ledger = { seq: 0, inFlight: 0, settled: false, settledSeq: 0 };
+      ledger = { seq: 0, inFlight: 0, settled: false, settledSeq: 0, failedSeq: 0 };
       turboWrites.set(conversationId, ledger);
     }
     // The first write of a burst starts from the switch's current (settled)
@@ -2378,10 +2408,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // A newer write owns the switch now; this failure changes nothing the
       // user still asked for, so neither roll back nor report it.
       if (ledger.seq !== seq) return;
+      ledger.failedSeq = seq;
       patchSet({ turbo: ledger.settled });
       throw err;
     } finally {
       ledger.inFlight -= 1;
+      if (ledger.inFlight === 0 && ledger.failedSeq === ledger.seq) {
+        readBackTurbo(conversationId, ledger, patchSet).catch(() => undefined);
+      }
     }
   },
 

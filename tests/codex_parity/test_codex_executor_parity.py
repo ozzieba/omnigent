@@ -146,6 +146,8 @@ async def test_real_codex_usage_and_model_override_cross_boundary(
         "total_tokens": 18,
         "cache_read_input_tokens": 3,
         "model": "mock-model-override",
+        # One model response, so the context-window fill equals its total.
+        "context_tokens": 18,
     }
     assert sidecar.requests(min_count=1)[0]["body"]["model"] == "mock-model-override"
 
