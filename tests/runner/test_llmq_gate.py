@@ -935,3 +935,40 @@ async def test_an_activated_unmeasured_turn_is_never_cancelled_on_an_llmq_withou
         )
     assert outcome == "retained"
     assert controller.settlements == [] and controller.cancellations == []
+
+
+# ----------------------------------------------------------------- turn attribution
+
+
+def test_turn_attribution_records_admitted_turns_and_in_flight_starts(tmp_path: Path) -> None:
+    record = llmq_gate.turn_admission_record
+    assert record(tmp_path, "turn_a") == "unknown"
+    llmq_gate.mark_turn_start_pending(tmp_path)
+    assert record(tmp_path, "turn_a") == "pending"  # may be the start in flight
+    llmq_gate.note_admitted_turn(tmp_path, "turn_a")
+    assert record(tmp_path, "turn_a") == "admitted"
+    assert record(tmp_path, "turn_b") == "unknown"  # recording clears the pending marker
+    llmq_gate.mark_turn_start_pending(tmp_path)
+    llmq_gate.clear_turn_start_pending(tmp_path)
+    assert record(tmp_path, "turn_b") == "unknown"
+
+
+def test_a_stale_pending_start_is_not_waited_for(tmp_path: Path) -> None:
+    llmq_gate.mark_turn_start_pending(tmp_path)
+    (tmp_path / llmq_gate.TURN_START_PENDING_FILE).write_text(
+        str(llmq_gate.time.time() - llmq_gate.TURN_START_PENDING_MAX_AGE_S - 1)
+    )
+    assert llmq_gate.turn_admission_record(tmp_path, "turn_a") == "unknown"
+
+
+def test_turn_attribution_stays_bounded_and_never_raises(tmp_path: Path) -> None:
+    for n in range(3000):
+        llmq_gate.note_admitted_turn(tmp_path, f"019a-turn-{n:06d}")
+    path = tmp_path / llmq_gate.ADMITTED_TURNS_FILE
+    assert path.stat().st_size <= 64 * 1024 + 64
+    assert llmq_gate.turn_admission_record(tmp_path, "019a-turn-002999") == "admitted"
+    # An unwritable bridge dir is logged, not raised into the executor.
+    missing = tmp_path / "gone"
+    llmq_gate.mark_turn_start_pending(missing)
+    llmq_gate.note_admitted_turn(missing, "turn_x")
+    assert llmq_gate.turn_admission_record(missing, "turn_x") == "unknown"

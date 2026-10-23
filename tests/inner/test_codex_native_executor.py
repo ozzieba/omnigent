@@ -1575,3 +1575,67 @@ def test_resync_does_not_clobber_newer_forwarder_turn(tmp_path: Path) -> None:
     assert replace_active_turn_id_if_matches(tmp_path, "turn_newest", "turn_goal") is True
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id == "turn_goal"
+
+
+def test_a_started_turn_is_recorded_as_admitted_for_the_llmq_goal_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The runner gated this dispatch: record the Codex turn id so the forwarder's
+    goal-continuation gate does not admit it a second time (review D3b)."""
+    from omnigent.runner.llmq_gate import TURN_START_PENDING_FILE, turn_admission_record
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+            cwd=str(tmp_path),
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    assert [type(e) for e in _collect_turn_events(executor, "first")] == [TurnComplete]
+    assert turn_admission_record(tmp_path, "turn_1") == "admitted"
+    assert not (tmp_path / TURN_START_PENDING_FILE).exists()
+    # A steer into the active turn starts no new Codex turn: nothing new recorded.
+    assert [type(e) for e in _collect_turn_events(executor, "second")] == [TurnComplete]
+    assert turn_admission_record(tmp_path, "turn_steered") == "unknown"
+
+
+def test_a_failed_turn_start_leaves_no_pending_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.llmq_gate import TURN_START_PENDING_FILE
+
+    class _Rejecting(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/start":
+                raise CodexAppServerResponseError({"code": -32600, "message": "busy"})
+            return await super().request(method, params)
+
+    monkeypatch.setattr("omnigent.codex_native_app_server.CodexAppServerClient", _Rejecting)
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+            cwd=str(tmp_path),
+        ),
+    )
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "first")
+    assert [type(e) for e in events] == [ExecutorError]
+    assert not (tmp_path / TURN_START_PENDING_FILE).exists()

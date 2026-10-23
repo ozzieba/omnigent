@@ -56,6 +56,11 @@ from omnigent.reasoning_effort import (
     effort_for_model_switch,
     validate_effort,
 )
+from omnigent.runner.llmq_gate import (
+    clear_turn_start_pending,
+    mark_turn_start_pending,
+    note_admitted_turn,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -96,25 +101,36 @@ async def _start_codex_turn(
                     "Failed to mirror codex model switch into config.toml: model=%s",
                     switched_model,
                 )
-    response = await client.request(
-        "turn/start",
-        {
-            "threadId": state.thread_id,
-            "input": input_items,
-            "environments": [
-                {
-                    "environmentId": "local",
-                    "cwd": state.cwd or str(Path.cwd()),
-                }
-            ],
-        },
-    )
+    # The runner admitted this turn (llmq gate) before handing it to us: record
+    # its turn id so the forwarder does not admit it again as a turn Codex
+    # started by itself (goal continuation; see omnigent.runner.llmq_goal_gate).
+    mark_turn_start_pending(bridge_dir)
+    try:
+        response = await client.request(
+            "turn/start",
+            {
+                "threadId": state.thread_id,
+                "input": input_items,
+                "environments": [
+                    {
+                        "environmentId": "local",
+                        "cwd": state.cwd or str(Path.cwd()),
+                    }
+                ],
+            },
+        )
+    except BaseException:
+        clear_turn_start_pending(bridge_dir)
+        raise
     result = _json_object(response.get("result"))
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
     if isinstance(turn_id, str) and turn_id:
+        note_admitted_turn(bridge_dir, turn_id)
         update_active_turn_id(bridge_dir, turn_id)
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
+    else:
+        clear_turn_start_pending(bridge_dir)
 
 
 async def _steer_codex_turn(

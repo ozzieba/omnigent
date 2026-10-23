@@ -822,3 +822,80 @@ async def gate_codex_turn(
         )
         await sleep(max(1.0, min(wait, config.recheck_seconds)))
         attempt += 1
+
+
+# ----------------------------------------------------------------- turn attribution
+#
+# Which Codex turns were admitted BEFORE they started, per bridge directory, so the
+# codex-native forwarder can tell them from turns Codex starts by itself (goal-mode
+# continuations), which it admits at ``turn/started``
+# (:mod:`omnigent.runner.llmq_goal_gate`). The codex-native executor records every
+# turn it starts (the runner gated that dispatch); any other gate that knows Codex's
+# turn id (a ``UserPromptSubmit`` hook gets ``turn_id``) can record its turns too.
+
+#: One admitted Codex turn id per line.
+ADMITTED_TURNS_FILE = "llmq-admitted-turns"
+#: Present while an admitted ``turn/start`` is in flight (its turn id not known yet).
+TURN_START_PENDING_FILE = "llmq-turn-start-pending"
+_ADMITTED_TURNS_MAX_BYTES = 64 * 1024
+_ADMITTED_TURNS_KEEP = 256
+#: A pending marker older than this is a crashed start, not one in flight.
+TURN_START_PENDING_MAX_AGE_S = 60.0
+
+
+def mark_turn_start_pending(bridge_dir: Path) -> None:
+    """Record that an admitted ``turn/start`` is about to be sent (best-effort)."""
+    try:
+        (bridge_dir / TURN_START_PENDING_FILE).write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        _logger.debug("llmq gate: could not mark a pending turn start", exc_info=True)
+
+
+def clear_turn_start_pending(bridge_dir: Path) -> None:
+    """Drop the pending-start marker (best-effort)."""
+    try:
+        (bridge_dir / TURN_START_PENDING_FILE).unlink(missing_ok=True)
+    except OSError:
+        _logger.debug("llmq gate: could not clear a pending turn start", exc_info=True)
+
+
+def note_admitted_turn(bridge_dir: Path, turn_id: str) -> None:
+    """Record that Codex turn ``turn_id`` was admitted before it started.
+
+    Also clears the pending-start marker. Best-effort: never raises.
+    """
+    if turn_id and "\n" not in turn_id:
+        path = bridge_dir / ADMITTED_TURNS_FILE
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(turn_id + "\n")
+            if path.stat().st_size > _ADMITTED_TURNS_MAX_BYTES:
+                kept = path.read_text(encoding="utf-8").splitlines()[-_ADMITTED_TURNS_KEEP:]
+                tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+                tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                os.replace(tmp, path)
+        except OSError:
+            _logger.debug("llmq gate: could not record admitted turn %s", turn_id, exc_info=True)
+    clear_turn_start_pending(bridge_dir)
+
+
+def turn_admission_record(bridge_dir: Path, turn_id: str) -> str:
+    """What the bridge records about ``turn_id``.
+
+    :returns: ``"admitted"`` (recorded), ``"pending"`` (not recorded, but an
+        admitted ``turn/start`` is in flight, so it may be that one), or
+        ``"unknown"`` (nobody admitted it).
+    """
+    try:
+        recorded = (bridge_dir / ADMITTED_TURNS_FILE).read_text(encoding="utf-8")
+    except OSError:
+        recorded = ""
+    if turn_id in recorded.splitlines():
+        return "admitted"
+    try:
+        age = time.time() - float(
+            (bridge_dir / TURN_START_PENDING_FILE).read_text(encoding="utf-8").strip()
+        )
+    except (OSError, ValueError):
+        return "unknown"
+    return "pending" if age < TURN_START_PENDING_MAX_AGE_S else "unknown"
