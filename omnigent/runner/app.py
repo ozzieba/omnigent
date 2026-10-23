@@ -7847,8 +7847,10 @@ def create_runner_app(
         if entry is None and agent_id:
             entry = _spec_cache.get(agent_id)
         if entry is None and agent_id and spec_resolver is not None:
-            with contextlib.suppress(httpx.HTTPError, RuntimeError):
+            try:
                 entry = await spec_resolver(agent_id, conv)
+            except Exception:  # noqa: BLE001 — best-effort: the gate falls back to the default model
+                _logger.debug("llmq gate: spec lookup failed for %s", conv, exc_info=True)
         spec = _unwrap_resolved_spec(entry)
         return spec if isinstance(spec, AgentSpec) else None
 
