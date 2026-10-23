@@ -651,3 +651,25 @@ async def test_a_closed_gate_ignores_late_events(setup) -> None:
         gate.turn_finished("late")
         await gate.drain()
     assert codex.requests == [] and llmq.seen == [] and reservations(llmq) == []
+
+
+async def test_an_admission_in_flight_at_aclose_starts_no_hold_after_close(setup) -> None:
+    """The forwarder can stop while a refused continuation is still being admitted.
+
+    The gate must then neither pause the goal nor start a hold loop that outlives
+    it (on a closed client that loop would fault every re-check for good).
+    """
+    llmq, config, bridge = setup
+    llmq.publish(95)
+    codex, server = FakeCodex(), FakeServer()
+    gate = make_gate(llmq, config, [], attribution_wait_seconds=0.3)
+    mark_turn_start_pending(bridge)  # keeps the admission in flight for ~0.3 s
+    async with server.client() as ap:
+        start(gate, codex, ap, bridge, "t1")
+        await asyncio.sleep(0)
+        await gate.aclose()  # the forwarder stops mid-admission
+        leaked = [t for t in gate._waits if not t.done()]
+        for task in leaked:
+            task.cancel()
+    assert leaked == []
+    assert codex.calls("thread/goal/set") == []

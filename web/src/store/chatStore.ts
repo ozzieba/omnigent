@@ -1228,8 +1228,8 @@ async function readBackTurbo(
   const seq = ledger.seq;
   try {
     const session = await getSessionSlim(conversationId);
-    if (ledger.seq !== seq || ledger.inFlight !== 0) return;
-    ledger.settled = session?.turbo ?? false;
+    if (!session || ledger.seq !== seq || ledger.inFlight !== 0) return;
+    ledger.settled = session.turbo ?? false;
     ledger.settledSeq = seq;
     patchSet({ turbo: ledger.settled });
   } catch {

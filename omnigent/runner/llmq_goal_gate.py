@@ -332,6 +332,8 @@ class GoalContinuationGate:
         pending = list(self._tasks)
         if pending:
             await asyncio.wait(pending, timeout=2 * _CODEX_TIMEOUT_S + 1)
+        for task in list(self._waits):  # backstop: a wait started during the drain
+            task.cancel()
         if self._owns_http and self._http is not None:
             await self._http.aclose()
 
@@ -359,9 +361,9 @@ class GoalContinuationGate:
         model: str,
     ) -> None:
         try:
-            if await self._attributed(bridge_dir, turn_id):
+            if self._closed or await self._attributed(bridge_dir, turn_id):
                 return
-            if await _goal_status(codex, thread_id) != "active":
+            if self._closed or await _goal_status(codex, thread_id) != "active":
                 # Not a goal continuation (or the goal cannot be read): out of
                 # this gate's scope; such turns are left as they were.
                 return
@@ -456,6 +458,8 @@ class GoalContinuationGate:
         decision: GateDecision,
         turbo: bool,
     ) -> None:
+        if self._closed:
+            return  # the forwarder stopped while this turn was being admitted
         paused = await _codex_result(
             codex, "thread/goal/set", {"threadId": thread_id, "status": "paused"}
         )
@@ -470,6 +474,8 @@ class GoalContinuationGate:
                 await asyncio.wait_for(ended.wait(), self._interrupt_settle)
         await _post_status(server, session_id, decision, turbo)
         running = self._holds.get(session_id)
+        if self._closed:
+            return  # no hold may outlive the gate
         if running is None or running.done():
             self._holds[session_id] = self._spawn(
                 self._hold_loop(
