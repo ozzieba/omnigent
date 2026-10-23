@@ -230,6 +230,33 @@ def test_admission_answers_empty_object_and_records_an_activated_reservation(
     assert world.gates() == []  # verified, nothing to show or clear
 
 
+def test_an_admitted_prompt_is_recorded_for_the_goal_gate(world: World) -> None:
+    """The forwarder's goal-continuation gate must not admit a typed turn again.
+
+    The record must not clear the runner's pending-start marker: that marker
+    belongs to a runner ``turn/start`` that may be in flight.
+    """
+    from omnigent.runner.llmq_gate import (
+        ADMITTED_TURNS_FILE,
+        TURN_START_PENDING_FILE,
+        turn_admission_record,
+    )
+
+    (world.bridge / TURN_START_PENDING_FILE).write_text("0", encoding="utf-8")
+    assert json.loads(world.run()) == {}
+    assert (world.bridge / ADMITTED_TURNS_FILE).read_text(encoding="utf-8").split() == ["turn-1"]
+    assert turn_admission_record(world.bridge, "turn-1") == "admitted"
+    assert (world.bridge / TURN_START_PENDING_FILE).exists()
+
+
+def test_a_blocked_prompt_is_not_recorded_as_admitted(world: World) -> None:
+    from omnigent.runner.llmq_gate import ADMITTED_TURNS_FILE
+
+    world.admission = lambda r: httpx.Response(200, json=MARGIN)
+    assert json.loads(world.run())["decision"] == "block"
+    assert not (world.bridge / ADMITTED_TURNS_FILE).exists()
+
+
 def test_every_prompt_gets_a_fresh_turn_key(world: World) -> None:
     world.run()
     world.run(payload={"hook_event_name": "UserPromptSubmit", "turn_id": "turn-2"})

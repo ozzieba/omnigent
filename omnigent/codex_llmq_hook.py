@@ -327,6 +327,7 @@ async def _prompt_submit(
         REFUSAL_REASONS,
         gate_codex_turn,
         normalize_model,
+        note_admitted_turn,
         unverified,
     )
 
@@ -377,6 +378,11 @@ async def _prompt_submit(
                     "decision": "block",
                     "reason": held.decision.message(turbo=turbo) or held.decision.reason,
                 }
+            if turn_id is not None:
+                # The turn will run: tell the forwarder's goal-continuation gate it
+                # was admitted here (omnigent.runner.llmq_goal_gate), so a prompt
+                # typed while a goal is active is not admitted twice.
+                note_admitted_turn(bridge_dir, turn_id, clear_pending=False)
             if decision.reservation_id is not None:
                 state["open"] = {
                     "codex_turn_id": turn_id,
