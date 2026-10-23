@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import secrets
 import time
 from collections.abc import Callable
@@ -53,6 +54,7 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
+    session_stream,
     user_session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
@@ -184,6 +186,7 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionResponse,
     SessionSwitchAgentRequest,
+    SessionTurboEvent,
     UpdateSessionRequest,
 )
 from omnigent.server.slack_orchestrator_capability import (
@@ -226,6 +229,8 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.version import VERSION
+
+_turbo_log = logging.getLogger("omnigent.server.turbo")
 
 
 def register_core_routes(
@@ -2116,6 +2121,13 @@ def register_core_routes(
                     code=ErrorCode.NOT_FOUND,
                 )
 
+        # Turbo is a plain per-session convenience switch (oz 2026-10-07:
+        # not a security boundary), toggled at edit level like the model.
+        # Read the prior value only on a toggle so the change can be logged.
+        prior_turbo: bool | None = None
+        if body.turbo is not None:
+            prior_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            prior_turbo = prior_conv.turbo if prior_conv is not None else None
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2132,9 +2144,26 @@ def register_core_routes(
             _unset_subagent_routing_override=clear_subagent_routing,
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
+            turbo=body.turbo,
         )
         if updated is None:
             raise _session_not_found()
+        if body.turbo is not None and prior_turbo is not None and body.turbo != prior_turbo:
+            # The lightweight toggle log: one structured line plus the SSE
+            # event every open client renders the Turbo chip from.
+            _turbo_log.info(
+                "turbo session=%s user=%s %s->%s",
+                session_id,
+                user_id,
+                "on" if prior_turbo else "off",
+                "on" if body.turbo else "off",
+            )
+            session_stream.publish(
+                session_id,
+                SessionTurboEvent(
+                    type="session.turbo", conversation_id=session_id, turbo=body.turbo
+                ).model_dump(),
+            )
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).

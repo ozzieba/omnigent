@@ -26,6 +26,8 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     model_override: str | None = None
     harness_override: str | None = None
     cost_control_mode_override: str | None = None
+    # Per-session Turbo at launch; the runner re-reads it per turn.
+    turbo: bool = False
     terminal_launch_args: list[str] | None = None
     external_session_id: str | None = None
     parent_session_id: str | None = None
@@ -77,6 +79,7 @@ def build_runner_session_init_payload(
             model_override=conversation.model_override,
             harness_override=conversation.harness_override,
             cost_control_mode_override=conversation.cost_control_mode_override,
+            turbo=conversation.turbo,
             terminal_launch_args=conversation.terminal_launch_args,
             external_session_id=conversation.external_session_id,
             parent_session_id=conversation.parent_conversation_id,

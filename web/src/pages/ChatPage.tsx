@@ -67,6 +67,7 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { useAppName } from "@/lib/branding";
@@ -112,7 +113,7 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retrySession } from "@/lib/sessionsApi";
-import type { QuotaWaitInfo } from "@/lib/events";
+import type { QuotaGateInfo, QuotaWaitInfo } from "@/lib/events";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   composerAttachmentKey,
@@ -3129,6 +3130,24 @@ function useAgentTurnActive(): boolean {
  * `WORKING_MESSAGES` by wall-clock `tick`. Background-task counts belong to
  * `BackgroundTaskPill`, not this shimmer.
  */
+/**
+ * The config-summary row for the llmq gate's state, or `null` when there is
+ * nothing to show (no gate, or the last check was verified).
+ */
+export function quotaGateSummaryRow(
+  gate: QuotaGateInfo | null | undefined,
+): { label: string; value: string } | null {
+  if (!gate || gate.state === "verified") return null;
+  if (gate.state === "blocked") {
+    return {
+      label: "Quota",
+      value: gate.message ?? "Held: Codex quota at the credit-safety margin",
+    };
+  }
+  const reason = (gate.reason ?? "llmq unavailable").replace(/_/g, " ");
+  return { label: "Quota", value: `Unverified (${reason})` };
+}
+
 export function quotaWaitLabel(quota: QuotaWaitInfo): string {
   const parts = [
     quota.admissionDelaySeconds !== undefined
@@ -5773,6 +5792,7 @@ export function Composer({
                 costRoutingEligible={costRoutingEligible}
                 harnessLabel={harnessLabel}
               />
+              <ComposerTurboChip showModels={showModels} modelPickerKind={modelPickerKind} />
               <ComposerConfigGear
                 harnessLabel={harnessLabel}
                 showModels={showModels}
@@ -6534,6 +6554,11 @@ function SessionConfigModal({
               />
             </ConfigRow>
           )}
+          {showModels && modelPickerKind === "codex" && (
+            <ConfigRow label="Turbo" description={TURBO_DESCRIPTION}>
+              <TurboSwitch testId="composer-config-turbo" componentId="chat.composer.turbo" />
+            </ConfigRow>
+          )}
           {showEffort && (
             <ConfigRow label="Effort" description="Reasoning depth vs. speed">
               <Select
@@ -6673,6 +6698,39 @@ function SessionConfigModal({
  *   requests re-open (bare ``/model`` submits route here now that the composer
  *   trigger is a read-only label). ``0`` / omitted means never requested.
  */
+/** Shown beside the Turbo controls: what the switch allows, in one line. */
+export const TURBO_DESCRIPTION =
+  "Let this session's Codex turns use paid credits past the subscription margin";
+
+/**
+ * The per-session Turbo switch (oz, 2026-10-06), right next to the model
+ * selector. Writes through the store immediately (optimistic, rolled back on a
+ * failed PATCH) rather than through the modal's Save: it is a plain session
+ * flag, not part of the launch config.
+ */
+function TurboSwitch({ testId, componentId }: { testId: string; componentId: string }) {
+  const turbo = useChatStore((s) => s.turbo);
+  const setTurbo = useChatStore((s) => s.setTurbo);
+  return (
+    <div className="flex items-center gap-2">
+      <Switch
+        checked={turbo}
+        onCheckedChange={(checked) => {
+          void setTurbo(checked).catch(() => {
+            // The store already rolled the switch back; nothing to surface here.
+          });
+        }}
+        aria-label="Turbo"
+        data-testid={testId}
+        componentId={componentId}
+      />
+      <span className="text-sm text-muted-foreground" data-testid={`${testId}-state`}>
+        {turbo ? "On: paid credits allowed" : "Off"}
+      </span>
+    </div>
+  );
+}
+
 function ComposerConfigGear({
   harnessLabel,
   showModels,
@@ -6815,6 +6873,8 @@ function useSessionConfigSummary({
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const turbo = useChatStore((s) => s.turbo);
+  const quotaGate = useChatStore((s) => s.quotaGate);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
   const rows: { label: string; value: string }[] = [];
@@ -6825,6 +6885,15 @@ function useSessionConfigSummary({
       value: routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default"),
     });
   }
+  // Turbo is a Codex session's paid-credits allowance; surface it whenever it
+  // is on so the gear summary says so before the user opens the modal.
+  if (showModels && modelPickerKind === "codex" && turbo) {
+    rows.push({ label: "Turbo", value: "On (paid credits allowed)" });
+  }
+  // The llmq gate's indicator (oz 2026-10-07, "fail open but with an indicator"):
+  // a held turn or an unverified one is named next to the Turbo state.
+  const gateRow = quotaGateSummaryRow(modelPickerKind === "codex" ? quotaGate : null);
+  if (showModels && gateRow) rows.push(gateRow);
   // Suppress Effort while routing is on: the router picks the model and its
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
@@ -6938,6 +7007,33 @@ function useResolvedComposerModel(
     effectiveModel,
     modelLabel,
   };
+}
+
+/**
+ * Persistent paid-credits indicator: a visible "Turbo" chip beside the model
+ * label whenever a Codex session has Turbo on. Turbo lets the llmq gate admit
+ * a turn that would spend credits, so it must be readable at a glance, not
+ * only in the gear's hover tooltip or the config modal. Renders nothing when
+ * Turbo is off or the session is not a Codex model-picker session.
+ */
+function ComposerTurboChip({
+  showModels,
+  modelPickerKind,
+}: {
+  showModels: boolean;
+  modelPickerKind: NativeModelPickerKind | null;
+}) {
+  const turbo = useChatStore((s) => s.turbo);
+  if (!showModels || modelPickerKind !== "codex" || !turbo) return null;
+  return (
+    <span
+      data-testid="composer-turbo-chip"
+      title="Turbo is on: this session may spend paid credits"
+      className="mr-1 shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs font-medium leading-none text-amber-700 dark:text-amber-400"
+    >
+      Turbo: paid credits
+    </span>
+  );
 }
 
 /**

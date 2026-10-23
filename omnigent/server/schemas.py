@@ -1516,6 +1516,9 @@ class _SessionCreateRequestBase(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+    # Per-session Turbo (oz 2026-10-06): Codex turns may run on paid credits
+    # past llmq's credit-safety margin. ``None`` / ``False`` start it off.
+    turbo: bool | None = None
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> Self:
@@ -2149,6 +2152,7 @@ class SessionResponse(BaseModel):
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    turbo: bool = False
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -2293,6 +2297,8 @@ class UpdateSessionRequest(BaseModel):
     permission_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    # Per-session Turbo. ``True`` / ``False`` set it; omitted leaves it.
+    turbo: bool | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
@@ -2902,6 +2908,34 @@ class _SSEEventBase(BaseModel):
 # ── Session-scoped events (session.*) ──────────────────────────────
 
 
+class QuotaGateInfo(BaseModel):
+    """
+    Outcome of the runner's llmq admission check for a Codex turn.
+
+    Attached to a ``session.status`` edge by the runner's pre-turn gate
+    (:mod:`omnigent.runner.llmq_gate`). ``blocked`` means llmq refused on
+    fresh evidence and the turn is held (the session's ``blocked_on`` carries
+    the sentence); ``unverified`` means the turn ran without a usable check
+    (llmq unreachable, stale receipt, ...), which the UI shows as a badge;
+    ``verified`` clears both.
+
+    :param state: ``"verified"``, ``"unverified"`` or ``"blocked"``.
+    :param reason: llmq's reason slug or the gate's fault, e.g.
+        ``"credit_safety_margin"``, ``"receipt_stale"``, ``"llmq_unreachable"``.
+    :param message: The sentence shown to the user, when there is one.
+    :param resets_at: Earliest quota reset reported with a refusal (epoch s).
+    :param turbo: The session's Turbo flag at the time of the check.
+    :param credit_bearing: The turn runs on paid credits (Turbo past the margin).
+    """
+
+    state: Literal["verified", "unverified", "blocked"]
+    reason: str | None = Field(default=None, max_length=200)
+    message: str | None = Field(default=None, max_length=600)
+    resets_at: float | None = None
+    turbo: bool = False
+    credit_bearing: bool = False
+
+
 class QuotaWaitInfo(BaseModel):
     """Safe numeric telemetry for a quota-delayed turn."""
 
@@ -2984,6 +3018,7 @@ class SessionStatusEvent(_SSEEventBase):
     background_tasks: list[BackgroundTaskInfo] | None = None
     blocked_on: str | None = None
     quota_wait: QuotaWaitInfo | None = None
+    quota_gate: QuotaGateInfo | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):
@@ -3055,6 +3090,25 @@ class SessionModelEvent(_SSEEventBase):
     type: Literal["session.model"]
     conversation_id: str
     model: str
+
+
+class SessionTurboEvent(_SSEEventBase):
+    """
+    Per-session Turbo switch changed (``PATCH /v1/sessions/{id}`` with
+    ``turbo``), so every open surface re-renders the Turbo control and chip.
+
+    :param type: Always ``"session.turbo"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param turbo: The switch's new state.
+
+    Category: **transient** (SSE-only). The server also writes ``turbo``
+    on the conversation (served on the snapshot), so on reconnect clients
+    restore the state from the snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.turbo"]
+    conversation_id: str
+    turbo: bool
 
 
 class SessionTitleEvent(_SSEEventBase):
@@ -4552,6 +4606,7 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionTurboEvent
     | SessionTitleEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
