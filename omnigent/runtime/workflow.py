@@ -1931,6 +1931,11 @@ def _build_cursor_spawn_env(
     harness falls back to an inherited ``CURSOR_API_KEY`` — a ``DatabricksAuth``
     profile does not apply to cursor and is ignored.
 
+    Model selection: ``executor.model`` maps to ``HARNESS_CURSOR_MODEL`` and the
+    optional ``executor.config.optimize_for`` (``cost`` / ``balanced`` /
+    ``intelligence``) maps to ``HARNESS_CURSOR_ROUTER_MODE``. A spec with
+    neither is refused by the cursor executor (no implicit Router default).
+
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path, threaded as
         ``HARNESS_CURSOR_BUNDLE_DIR``.
@@ -1941,6 +1946,14 @@ def _build_cursor_spawn_env(
     model = _resolve_spec_model(spec)
     if model is not None:
         env["HARNESS_CURSOR_MODEL"] = model
+    # Explicit Cursor Router optimization (``cost`` / ``balanced`` /
+    # ``intelligence``). There is deliberately NO implicit default: an
+    # unpinned spec without this key still fails fast in the executor
+    # (``_resolve_model``). Value validation also lives there, so a typo
+    # surfaces as a clear turn error rather than being silently dropped here.
+    optimize_for = spec.executor.config.get("optimize_for")
+    if optimize_for is not None and str(optimize_for).strip():
+        env["HARNESS_CURSOR_ROUTER_MODE"] = str(optimize_for).strip()
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the cursor subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CURSOR_CWD`` in ``omnigent/inner/cursor_harness.py``.

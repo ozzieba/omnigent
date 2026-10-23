@@ -225,6 +225,22 @@ class PolicySummary(BaseModel):
     description: str | None = None
 
 
+class AgentModelSelection(BaseModel):
+    """Parsed configuration intent; never an observed or served model."""
+
+    declared_model: str | None = None
+    source_field: Literal["parsed_agent_spec.executor.model"] = "parsed_agent_spec.executor.model"
+    selection_authority: Literal["DECLARED_ONLY"] = "DECLARED_ONLY"
+    resolution: Literal[
+        "EXPLICIT_DECLARED",
+        "UNKNOWN_DEFAULT",
+        "UNKNOWN_OPAQUE_ROUTE",
+        "UNKNOWN_DYNAMIC_OR_PRIVATE_VALUE",
+        "UNKNOWN_UNREADABLE_SPEC",
+    ] = "UNKNOWN_UNREADABLE_SPEC"
+    served_model: None = None
+
+
 class AgentObject(BaseModel):
     """
     API representation of a registered agent.
@@ -294,6 +310,7 @@ class AgentObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     harness: str | None = None
+    model_selection: AgentModelSelection = Field(default_factory=AgentModelSelection)
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
@@ -1390,6 +1407,9 @@ class _SessionCreateRequestBase(BaseModel):
         provision on, e.g. ``"modal"`` — one of the names ``GET /v1/info``
         reports in ``sandbox_providers``. Only valid with
         ``host_type: "managed"``; ``None`` takes the server's first.
+    :param environment_profile: Optional immutable server-published profile
+        revision. A managed Kubernetes image, when selected by that profile,
+        is resolved from the server's image catalog.
     :param workspace: Where the session works. For external hosts:
         an absolute path on the host where the runner should start,
         e.g. ``"/Users/corey/universe/src/foo"``. Required when
@@ -1486,6 +1506,7 @@ class _SessionCreateRequestBase(BaseModel):
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
     sandbox_provider: str | None = None
+    environment_profile: str | None = Field(default=None, min_length=3, max_length=128)
     workspace: str | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
@@ -2097,6 +2118,8 @@ class SessionResponse(BaseModel):
         snapshots independently of lifecycle status.
     :param environment_profile: Immutable server-published profile revision
         selected when this session was created, e.g. ``workspace-readonly@1``.
+    :param environment_runtime_ref: Immutable managed-host runtime image catalog
+        revision resolved by the server, or ``None`` when no managed image was selected.
     :param environment_capabilities: Public capability catalog for the
         selected environment profile. This lets agents inspect the actual
         interfaces and authorization state available to their session.
@@ -2148,6 +2171,7 @@ class SessionResponse(BaseModel):
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     environment_profile: str | None = None
+    environment_runtime_ref: str | None = None
     environment_capabilities: list[dict[str, Any]] = Field(default_factory=list)
     git_branch: str | None = None
     archived: bool = False

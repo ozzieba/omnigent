@@ -3293,6 +3293,7 @@ dev = [
     { name = "respx" },
     { name = "ruff" },
     { name = "sqlalchemy-cloudflare-d1" },
+    { name = "structlog-config" },
 ]
 lint = [
     { name = "grpcio-tools" },
@@ -3317,6 +3318,7 @@ test = [
     { name = "pytest-xdist" },
     { name = "respx" },
     { name = "sqlalchemy-cloudflare-d1" },
+    { name = "structlog-config" },
 ]
 
 [package.metadata]
@@ -3434,6 +3436,7 @@ dev = [
     { name = "respx", specifier = ">=0.21,<1" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "sqlalchemy-cloudflare-d1", specifier = "==0.3.10" },
+    { name = "structlog-config", git = "https://github.com/ozzieba/structlog-config?rev=13799e0f64f8a3bc1c750a933b0df9c1bc73cd27" },
 ]
 lint = [
     { name = "grpcio-tools", specifier = ">=1.68,<=1.81.1" },
@@ -3458,6 +3461,7 @@ test = [
     { name = "pytest-xdist", specifier = ">=3.6" },
     { name = "respx", specifier = ">=0.21,<1" },
     { name = "sqlalchemy-cloudflare-d1", specifier = "==0.3.10" },
+    { name = "structlog-config", git = "https://github.com/ozzieba/structlog-config?rev=13799e0f64f8a3bc1c750a933b0df9c1bc73cd27" },
 ]
 
 [[package]]
@@ -5694,15 +5698,11 @@ wheels = [
 [[package]]
 name = "structlog-config"
 version = "0.14.0"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/ozzieba/structlog-config?rev=13799e0f64f8a3bc1c750a933b0df9c1bc73cd27#13799e0f64f8a3bc1c750a933b0df9c1bc73cd27" }
 dependencies = [
     { name = "orjson" },
     { name = "pytest-plugin-utils" },
     { name = "structlog" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/36/5f/759bf3d1f48b9271bf1748dc2ee6e3f1e812e5994e223e41be4b984fec58/structlog_config-0.14.0.tar.gz", hash = "sha256:9d52c73795931e4f1ec9562a7a17a761b0b1092632a73fdb456afaa8ca2f91f1", size = 29884, upload-time = "2026-05-07T21:10:41.233Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/38/5a/b6b60005d4edaabd276c87984ad2d09699be7d5f60dc65c4f07e2c12f22b/structlog_config-0.14.0-py3-none-any.whl", hash = "sha256:b07030d5cb8b563fca0ee353d2c79061cd0fefd6092f1c31715ebd156a0b9d63", size = 37640, upload-time = "2026-05-07T21:10:42.131Z" },
 ]
 
 [[package]]

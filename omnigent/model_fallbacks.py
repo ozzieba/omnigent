@@ -29,7 +29,7 @@ class StaticModelFallback:
 #: sort servable ids. It never invents picker rows: ids absent from the live
 #: listing are simply not ranked by it.
 _CODEX_ARM_PREFERENCE = StaticModelFallback(
-    model_ids=("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5"),
+    model_ids=("gpt-6.1-sol", "gpt-6-luna"),
     owner="Databricks model discovery (omnigent.databricks_model_discovery)",
     provenance="Omnigent's release-curated Codex arm ordering",
     discovery_gap="a workspace listing ranks models by neither recency nor capability",
@@ -118,8 +118,8 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     "current_generation_gpt": StaticModelFallback(
         model_ids=(
             "databricks-glm-5-2",
-            "databricks-gpt-5-6-luna",
-            "databricks-gpt-5-6-sol",
+            "databricks-gpt-6-luna",
+            "databricks-gpt-6-1-sol",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
         provenance="the external router's own current arms, offered so a pick keeps its endpoint",
@@ -141,9 +141,9 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         discovery_gap="the router's arm menu is part of its request contract, not a catalog",
     ),
     "family_fallbacks": StaticModelFallback(
-        model_ids=("claude-sonnet-5", "gpt-5-6-luna"),
+        model_ids=("claude-sonnet-5-5", "gpt-6-luna"),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="one arm per family (claude, gpt), both frozen members of the task_v1 menus",
+        provenance="one current fallback arm per family (claude, gpt), requiring a catalog match",
         discovery_gap="a workspace that serves no endpoint for the picked arm needs a pinned one",
     ),
     "pi_excluded": StaticModelFallback(
@@ -166,6 +166,105 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         discovery_gap="codex's bundled catalog carries no entry for a gateway-only arm to clone",
     ),
 }
+
+# External task_v1 menus remain wire labels; only catalog-backed current targets
+# may be selected for serving. None means no qualified same-role replacement.
+SMART_ROUTING_SUPERSESSIONS: dict[str, str | None] = {
+    record.model_ids[0]: record.model_ids[1]
+    for record in (
+        StaticModelFallback(
+            model_ids=("gpt-5-4-mini", "gpt-6-luna"),
+            owner="Smart routing current-candidate policy",
+            provenance="Current-model mandate; primary vendor role and price review, October 2026",
+            discovery_gap="Catalog and request-shape compatibility require runtime admission",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-5-4", "gpt-6-1-sol"),
+            owner="Smart routing current-candidate policy",
+            provenance="Current-model mandate; primary vendor role and price review, October 2026",
+            discovery_gap="Catalog and request-shape compatibility require runtime admission",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-5-5", "gpt-6-1-sol"),
+            owner="Smart routing current-candidate policy",
+            provenance="Current-model mandate; primary vendor role and price review, October 2026",
+            discovery_gap="Catalog and request-shape compatibility require runtime admission",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-5-6-terra", "gpt-6-1-sol"),
+            owner="Smart routing current-candidate policy",
+            provenance="Current-model mandate; primary vendor role and price review, October 2026",
+            discovery_gap="Catalog and request-shape compatibility require runtime admission",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-5-4-pro", "gpt-6-astra"),
+            owner="Smart routing current-candidate policy",
+            provenance="Current-model mandate; primary vendor role and price review, October 2026",
+            discovery_gap="Catalog and request-shape compatibility require runtime admission",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-5-5-pro", "gpt-6-astra"),
+            owner="Smart routing current-candidate policy",
+            provenance="Current-model mandate; primary vendor role and price review, October 2026",
+            discovery_gap="Catalog and request-shape compatibility require runtime admission",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-6-sol", "gpt-6-1-sol"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-5-6-sol", "gpt-6-1-sol"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-5-6-luna", "gpt-6-luna"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+        StaticModelFallback(
+            model_ids=("gpt-5-4-nano", "gpt-6-luna"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+        StaticModelFallback(
+            model_ids=("claude-haiku-4-5", "claude-haiku-5-5"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+        StaticModelFallback(
+            model_ids=("claude-sonnet-4-6", "claude-sonnet-5-5"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+        StaticModelFallback(
+            model_ids=("claude-sonnet-5", "claude-sonnet-5-5"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+        StaticModelFallback(
+            model_ids=("claude-opus-4-8", "claude-opus-5-5"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+        StaticModelFallback(
+            model_ids=("claude-opus-5", "claude-opus-5-5"),
+            owner="Smart routing current-candidate policy",
+            provenance="Primary vendor successor and comparable-cost qualification, October 2026",
+            discovery_gap="Only an actual supplied catalog can qualify provider availability",
+        ),
+    )
+}
+
 
 #: Claude serving endpoints the router ranks, cheapest → most powerful.
 SMART_ROUTING_CLAUDE_LADDER = _SMART_ROUTING_FALLBACKS["claude_ladder"].model_ids
@@ -217,7 +316,7 @@ _BACKGROUND_TITLE_FALLBACKS: dict[str, StaticModelFallback] = {
         model_ids=("gpt-6-luna",),
         owner="Background session titles (omnigent.runner.background_titles.service)",
         provenance=(
-            "codex's own dotted catalog slug for its cheapest current arm — the "
+            "codex's current native Luna catalog ID for its cheapest current arm — the "
             "gateway's hyphenated spelling 400s on codex's backend"
         ),
         discovery_gap=(

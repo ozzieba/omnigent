@@ -25,6 +25,7 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import get_user_id as _get_user_id
 from omnigent.server.routes._auth_helpers import require_access as _require_access
+from omnigent.server.routes._host_admission import dispatch_authorized_host_operation
 from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _HOST_BOUND_RUNNER_CONNECT_GRACE_S,
@@ -414,28 +415,40 @@ async def _forward_codex_goal_event(
     :returns: Runner forward result, or ``None`` if no runner could be
         reached.
     """
-    runner_result = await _forward_session_change_to_runner(
-        session_id,
-        runner_router,
-        event,
-    )
-    if runner_result is not None:
-        return runner_result
+
+    async def invoke():
+        runner_result = await _forward_session_change_to_runner(
+            session_id,
+            runner_router,
+            event,
+        )
+        if runner_result is not None:
+            return runner_result
+        if event.get("type") == "goal_get":
+            return None
+        runner_client = await _launch_runner_for_codex_goal(
+            session_id=session_id,
+            conv=conv,
+            request=request,
+            user_id=user_id,
+            runner_router=runner_router,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            runner_exit_reports=runner_exit_reports,
+        )
+        if runner_client is None:
+            return None
+        return await _post_codex_goal_event_to_runner(session_id, runner_client, event)
+
     if event.get("type") == "goal_get":
-        return None
-    runner_client = await _launch_runner_for_codex_goal(
-        session_id=session_id,
-        conv=conv,
-        request=request,
-        user_id=user_id,
-        runner_router=runner_router,
-        conversation_store=conversation_store,
-        permission_store=permission_store,
-        runner_exit_reports=runner_exit_reports,
+        return await invoke()
+    return await dispatch_authorized_host_operation(
+        request,
+        conv.host_id,
+        "input",
+        invoke,
+        is_complete=lambda result: result is not None and 200 <= result.status_code < 300,
     )
-    if runner_client is None:
-        return None
-    return await _post_codex_goal_event_to_runner(session_id, runner_client, event)
 
 
 async def _require_codex_native_goal_session(

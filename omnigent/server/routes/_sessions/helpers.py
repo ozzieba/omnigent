@@ -2996,6 +2996,7 @@ async def _persist_external_assistant_message(
     )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
     persisted = persisted_items[0]
+    session_live_state.persist_scheduled_run_started(session_id)
     _publish_external_assistant_message(
         session_id,
         persisted,
@@ -3052,11 +3053,34 @@ def _parse_external_conversation_item(
             f"Invalid data payload for external item type {item_type!r}: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    provenance = {
+        key: _optional_native_provenance(body.data, key)
+        for key in ("native_thread_id", "native_turn_id", "native_item_id")
+    }
+    if any(provenance.values()) and not all(provenance.values()):
+        raise OmnigentError(
+            "external_conversation_item native provenance requires thread, turn, and item ids",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return NewConversationItem(
         type=item_type,
         response_id=response_id.strip(),
         data=data,
+        **provenance,
     )
+
+
+def _optional_native_provenance(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 128:
+        raise OmnigentError(
+            f"external_conversation_item data.{key} must be a non-empty string "
+            "of at most 128 characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return value.strip()
 
 
 def _find_claude_native_subagent_child(
@@ -4674,6 +4698,12 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
         if isinstance(data, dict):
             data.pop("response_id", None)
     session_stream.publish(session_id, payload)
+    session_live_state.persist_scheduled_run_completion(
+        session_id,
+        "failed",
+        error_code="cancelled",
+        error="scheduled turn was interrupted",
+    )
 
 
 def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
@@ -5277,6 +5307,7 @@ async def _provision_managed_sandbox(
     relaunch_host: Host | None,
     provider: str | None = None,
     agent_name: str | None = None,
+    runtime_image_reference: str | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -5326,6 +5357,7 @@ async def _provision_managed_sandbox(
                 repo=repo,
                 agent_name=agent_name,
                 on_stage=_on_stage,
+                runtime_image_reference=runtime_image_reference,
             )
         return await launch_managed_host(
             config=sandbox_config,
@@ -5335,6 +5367,7 @@ async def _provision_managed_sandbox(
             provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
+            runtime_image_reference=runtime_image_reference,
         )
     except HTTPException as exc:
         _logger.warning(
@@ -8961,6 +8994,7 @@ def _persist_stored_session_bundle(
     agent_bundle_location: str,
     agent_description: str | None,
     runner_id: str | None = None,
+    environment_runtime_ref: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -8998,6 +9032,7 @@ def _persist_stored_session_bundle(
             runner_id=runner_id,
             project_id=metadata.project_id,
             environment_profile=metadata.environment_profile,
+            environment_runtime_ref=environment_runtime_ref,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)

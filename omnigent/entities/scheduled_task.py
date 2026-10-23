@@ -111,6 +111,8 @@ class ScheduledTaskRun:
     :param conversation_id: Conversation created by this firing, or ``None``
         before dispatch / after the conversation is deleted.
     :param fired_at: Unix epoch seconds dispatch began, or ``None``.
+    :param started_at: Unix epoch seconds accepted model output was observed,
+        or ``None`` until the SDK relay or native transcript bridge proves work.
     :param finished_at: Unix epoch seconds the run reached a terminal state,
         or ``None``.
     :param error: Failure detail when ``status == "failed"``; ``None`` otherwise.
@@ -125,6 +127,7 @@ class ScheduledTaskRun:
     scheduled_at: int
     conversation_id: str | None = None
     fired_at: int | None = None
+    started_at: int | None = None
     finished_at: int | None = None
     error: str | None = None
     error_code: str | None = None

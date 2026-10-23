@@ -1144,7 +1144,9 @@ async def test_list_tasks_leaves_young_running_run_untouched(
 # scheduled-run completion.
 
 
-def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, str]:
+def _seed_running_run_for_conv(
+    db_uri: str, conversation_id: str, *, started_at: int | None = None
+) -> tuple[str, str]:
     """Create a task + a ``running`` run bound to ``conversation_id``.
 
     :returns: ``(task_id, run_id)``.
@@ -1174,6 +1176,7 @@ def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, 
         scheduled_at=1000,
         conversation_id=conversation_id,
         fired_at=1001,
+        started_at=started_at,
     )
     return task_id, run_id
 
@@ -1230,7 +1233,7 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
     )
 
     conv_id = uuid.uuid4().hex
-    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id, started_at=1002)
 
     session_live_state.configure(
         SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
@@ -1248,6 +1251,44 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
     assert row.status == "succeeded"
     assert row.finished_at is not None
     assert row.error_code is None
+
+
+async def test_publish_status_bootstrap_idle_and_running_do_not_complete_scheduled_run(
+    db_uri: str,
+) -> None:
+    """Prompt delivery plus generic startup status must not count as model work."""
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+    schedule_store = SqlAlchemyScheduledTaskStore(db_uri)
+    session_live_state.configure(SqlAlchemyConversationStore(db_uri), schedule_store)
+    try:
+        _publish_status(conv_id, "idle")
+        _publish_status(conv_id, "running")
+        _publish_status(conv_id, "idle")
+        import time
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            rows, _ = schedule_store.list_runs(task_id)
+            current = next(row for row in rows if row.id == run_id)
+            if current.status != "running":
+                break
+            time.sleep(0.02)
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert current.status == "running"
+    assert current.finished_at is None
 
 
 async def test_publish_status_failed_edge_transitions_scheduled_run_to_failed(

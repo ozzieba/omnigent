@@ -5,7 +5,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
+from omnigent.server.runtime_manifests import (
+    OMNIGENT_HOST_RUNTIME,
+    get_runtime_manifest,
+)
+
 CapabilityState = Literal["available", "unavailable", "denied", "requestable"]
+WorkspaceAccess = Literal["read-only", "read-write"]
 
 
 @dataclass(frozen=True)
@@ -46,13 +52,17 @@ class EnvironmentProfile:
     name: str
     description: str
     access: str
+    workspace_access: WorkspaceAccess
     capabilities: tuple[EnvironmentCapability, ...]
+    runtime_manifest_reference: str
+    managed_host_image_reference: str | None = None
 
     @property
     def reference(self) -> str:
         return f"{self.id}@{self.revision}"
 
     def public_dict(self) -> dict[str, object]:
+        runtime_manifest = get_runtime_manifest(self.runtime_manifest_reference)
         return {
             "id": self.id,
             "revision": self.revision,
@@ -60,6 +70,11 @@ class EnvironmentProfile:
             "name": self.name,
             "description": self.description,
             "access": self.access,
+            "workspace_access": self.workspace_access,
+            "runtime_manifest": (
+                runtime_manifest.public_dict() if runtime_manifest is not None else None
+            ),
+            "managed_host_image_reference": self.managed_host_image_reference,
             "capabilities": [capability.public_dict() for capability in self.capabilities],
         }
 
@@ -77,6 +92,9 @@ WORKSPACE_READONLY = EnvironmentProfile(
         "no host mounts or credentials."
     ),
     access="read-only",
+    workspace_access="read-only",
+    runtime_manifest_reference=OMNIGENT_HOST_RUNTIME.reference,
+    managed_host_image_reference="omnigent-host@1",
     capabilities=(
         EnvironmentCapability(
             id="session.workspace",
@@ -163,6 +181,7 @@ WORKSPACE_EDITABLE = replace(
         "No host mounts or credentials."
     ),
     access="read-write workspace only",
+    workspace_access="read-write",
     capabilities=tuple(
         replace(
             capability,
@@ -320,6 +339,20 @@ def environment_profile_agent_guide(
         "Inspect this session's profile at any time with `sys_session_get_info`.",
         "Only capabilities marked available below are present in this environment.",
     ]
+    runtime_manifest = get_runtime_manifest(profile.runtime_manifest_reference)
+    if runtime_manifest is not None:
+        lines.extend(
+            [
+                "Image tool manifest "
+                f"`{runtime_manifest.reference}` describes declared host-image contents; "
+                "it does not guarantee that this session uses that image or grant access.",
+            ]
+        )
+        for tool in runtime_manifest.tools:
+            lines.append(
+                f"- Image tool `{tool.id}`: {tool.state}; version: "
+                f"{tool.version or 'not installed'}. {tool.reason}"
+            )
     if filesystem_path is not None:
         lines.append(
             "A read-only `AGENTS.md` copy of this environment guide is mounted at "
@@ -390,9 +423,12 @@ def validate_environment_profile_spec(reference: str, spec: object) -> bool:
 
     if not isinstance(spec, OSEnvSpec):
         return False
-    if reference in (WORKSPACE_READONLY.reference, WORKSPACE_READONLY_V2.reference):
+    profile = get_environment_profile(reference)
+    if profile is None:
+        return False
+    if profile.workspace_access == "read-only":
         expected_sandbox = replace(_default_sandbox_for_platform(), write_paths=[])
-    elif reference in (WORKSPACE_EDITABLE.reference, WORKSPACE_EDITABLE_V2.reference):
+    elif profile.workspace_access == "read-write":
         expected_sandbox = replace(_default_sandbox_for_platform(), write_paths=["."])
     else:
         return False

@@ -27,6 +27,7 @@ from omnigent.model_fallbacks import (
     SMART_ROUTING_GPT_LADDER,
     SMART_ROUTING_PI_EXCLUDED,
     SMART_ROUTING_PI_LADDER,
+    SMART_ROUTING_SUPERSESSIONS,
     SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
 )
@@ -1176,6 +1177,44 @@ def _version_key(model: str, prefixes: Sequence[str] | None = None) -> tuple[int
     return tuple(int(s) for s in _bare_id(model, prefixes).split("-") if s.isdigit())
 
 
+def current_routing_candidate(
+    model: str,
+    candidates: Sequence[str],
+    *,
+    prefixes: Sequence[str] | None = None,
+    aliases: Mapping[str, str] | None = None,
+    barred: Sequence[str] = (),
+) -> str | None:
+    """Resolve a current catalog target without inventing provider endpoints."""
+    bare = _bare_id(model, prefixes)
+
+    def superseded_target(value: str) -> str | None:
+        # Check each spelling independently: overlapping custom prefixes must
+        # never hide a recognized canonical provider spelling.
+        for prefix in ("", *_configured_prefixes(prefixes), *MODEL_ID_PREFIXES):
+            normalized = _bare_id(value, (prefix,) if prefix else ())
+            if normalized in SMART_ROUTING_SUPERSESSIONS:
+                return SMART_ROUTING_SUPERSESSIONS[normalized]
+        return None
+
+    target = superseded_target(model) or bare
+    if target is None:
+        return None
+    skip = {_bare_id(value, prefixes) for value in barred}
+    for candidate in candidates:
+        candidate_bare = _bare_id(candidate, prefixes)
+        if superseded_target(candidate) is not None or candidate_bare in skip:
+            continue
+        resolved = apply_servable_alias(candidate, prefixes, aliases=aliases)
+        resolved_bare = _bare_id(resolved, prefixes)
+        if target not in (candidate_bare, resolved_bare) or target in skip:
+            continue
+        if superseded_target(resolved) is not None or resolved_bare in skip:
+            return None
+        return resolved
+    return None
+
+
 def substitute_model(
     model: str,
     candidates: Sequence[str],
@@ -1211,11 +1250,27 @@ def substitute_model(
         local.setdefault(_bare_id(candidate, prefixes), candidate)
     skip = {_bare_id(m, prefixes) for m in barred}
     family = _model_family(model)
+    skip.update(SMART_ROUTING_SUPERSESSIONS)
+    if any(
+        _bare_id(model, (prefix,) if prefix else ()) in SMART_ROUTING_SUPERSESSIONS
+        for prefix in ("", *_configured_prefixes(prefixes), *MODEL_ID_PREFIXES)
+    ):
+        successor = current_routing_candidate(
+            model, candidates, prefixes=prefixes, aliases=aliases, barred=barred
+        )
+        if successor is not None:
+            return successor
+        # Preserve the existing tier/family fallback contract; every output
+        # still passes the current-candidate and resolved-alias policy.
 
     # 1. The exact pick, when the workspace serves it.
     bare = _bare_id(model, prefixes)
     if bare not in skip and bare in local:
-        return apply_servable_alias(local[bare], prefixes, aliases=aliases)
+        exact = current_routing_candidate(
+            local[bare], candidates, prefixes=prefixes, aliases=aliases, barred=barred
+        )
+        if exact is not None:
+            return exact
 
     # 2. The best servable model of the pick's own tier (opus/sonnet/sol/luna).
     tier = _model_tier(model, prefixes)
@@ -1226,15 +1281,23 @@ def substitute_model(
             if cand_bare not in skip
             and _model_family(cand_bare) == family
             and _model_tier(cand_bare, prefixes) == tier
+            and current_routing_candidate(
+                orig, [orig], prefixes=prefixes, aliases=aliases, barred=barred
+            )
+            is not None
         ]
         if same_tier:
             best = max(same_tier, key=lambda m: _version_key(m, prefixes))
-            return apply_servable_alias(best, prefixes, aliases=aliases)
+            return current_routing_candidate(
+                best, candidates, prefixes=prefixes, aliases=aliases, barred=barred
+            )
 
     # 3. The family fallback, then decline.
     fallback = _FAMILY_FALLBACK.get(family)
     if fallback is not None and fallback not in skip and fallback in local:
-        return apply_servable_alias(local[fallback], prefixes, aliases=aliases)
+        return current_routing_candidate(
+            local[fallback], candidates, prefixes=prefixes, aliases=aliases, barred=barred
+        )
     return None
 
 
@@ -1453,8 +1516,14 @@ class TaskV1RouteOptionSource:
             )
         if local is None:
             return None
+        pool = catalog.get(harness or "", [])
+        current = current_routing_candidate(
+            local, pool, prefixes=self._model_prefixes, aliases=self._aliases
+        )
+        if current is None:
+            return None
         return ResolvedRoute(
-            model=apply_servable_alias(local, self._model_prefixes, aliases=self._aliases),
+            model=current,
             harness=harness,
             raw_model=raw,
         )
@@ -1798,6 +1867,15 @@ class ExternalRoutingClient:
             self._ambient_config = config
         return _config_bearer(self._ambient_config, "the ambient Databricks environment")
 
+    def _selection_model_is_superseded(self) -> bool:
+        if self._selection_model is None:
+            return False
+        return any(
+            _bare_id(self._selection_model, (prefix,) if prefix else ())
+            in SMART_ROUTING_SUPERSESSIONS
+            for prefix in ("", *_configured_prefixes(self._model_prefixes), *MODEL_ID_PREFIXES)
+        )
+
     async def route(
         self,
         message: str,
@@ -1812,6 +1890,9 @@ class ExternalRoutingClient:
             # The account has no routing API; skip the call rather than spend a
             # round trip per turn to be told so again.
             self.last_error = self._permanent_error
+            return None
+        if self._selection_model_is_superseded():
+            self.last_error = "The configured routing judge model is superseded."
             return None
         # The seam turns the catalog into router vocabulary and injects
         # whatever arms the router's scenario menu demands.
@@ -1853,6 +1934,9 @@ class ExternalRoutingClient:
 
         auth, auth_headers = await asyncio.to_thread(self._resolve_credentials)
         self.last_error = None
+        if self._selection_model_is_superseded():
+            self.last_error = "The configured routing judge model is superseded."
+            return None
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout) as http:
                 resp = await http.post(
@@ -2221,6 +2305,20 @@ async def route_session_harness(
         )
         chosen_harness = _redirected
 
+    if chosen_harness is None:
+        return None, None, None, "No available harness can run the selected wire protocol."
+    current = current_routing_candidate(
+        chosen_model, harness_models.get(chosen_harness, []), prefixes=prefixes
+    )
+    if current is None:
+        return None, None, None, "No current catalog-backed routing target is available."
+    if current != chosen_model and any(
+        _bare_id(chosen_model, (prefix,) if prefix else ()) in SMART_ROUTING_SUPERSESSIONS
+        for prefix in ("", *_configured_prefixes(prefixes), *MODEL_ID_PREFIXES)
+    ):
+        raw_model = raw_model or chosen_model
+        chosen_model = current
+
     # The UI shows what the router said, not only what we could run — but only
     # when they are genuinely different models, not the same one spelled bare.
     verdict: dict[str, Any] = {
@@ -2392,6 +2490,16 @@ async def route_turn(
             return None, None
         raw_model = raw_model or model
         model = substitute
+
+    current = current_routing_candidate(model, available.get(harness or "", []), prefixes=prefixes)
+    if current is None:
+        return None, None
+    if current != model and any(
+        _bare_id(model, (prefix,) if prefix else ()) in SMART_ROUTING_SUPERSESSIONS
+        for prefix in ("", *_configured_prefixes(prefixes), *MODEL_ID_PREFIXES)
+    ):
+        raw_model = raw_model or model
+        model = current
 
     _logger.info("smart_routing: session=%s model=%s", session_id, model)
     # The rationale paraphrases the user's prompt, so it stays off INFO.

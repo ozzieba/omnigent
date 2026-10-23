@@ -945,6 +945,89 @@ def test_quick_probe_cache_survives_configured_flip_within_ttl(
         connect_mod._invalidate_quick_probe_cache()
 
 
+async def test_full_probe_seeds_only_missing_quick_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Completed full observations avoid a duplicate quick PATH scan."""
+    from omnigent.host import connect as connect_mod
+
+    latest = {
+        "goose-native": False,
+        "codex-native": connect_mod.HARNESS_BINARY_MISSING,
+        "claude-native": "needs-auth",
+        "qwen-native": "version-too-low",
+        "sdk": True,
+    }
+    calls: list[str] = []
+    monkeypatch.setattr(connect_mod, "configured_harness_map", lambda: latest)
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda h: calls.append(h) or False)
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        host = HostProcess.__new__(HostProcess)
+        assert await host._probe_configured_harnesses(startup=False) is latest
+        assert connect_mod._unavailable_harness_became_ready(latest) is False
+        assert calls == []
+        assert connect_mod._quick_probe_cached == {"goose-native": False, "codex-native": False}
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+
+
+async def test_full_probe_miss_expires_from_completion_and_discovers_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new install is observed at the unchanged sixty-second TTL boundary."""
+    from types import SimpleNamespace
+
+    from omnigent.host import connect as connect_mod
+
+    clock = {"now": 20.0}
+    calls: list[str] = []
+    latest = {"goose-native": False}
+
+    def full():
+        clock["now"] = 40.0
+        return latest
+
+    monkeypatch.setattr(connect_mod, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+    monkeypatch.setattr(connect_mod, "configured_harness_map", full)
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda h: calls.append(h) or True)
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        host = HostProcess.__new__(HostProcess)
+        assert await host._probe_configured_harnesses(startup=False) is latest
+        assert connect_mod._quick_probe_cache["goose-native"] == 40.0
+        clock["now"] = 99.999
+        assert connect_mod._unavailable_harness_became_ready(latest) is False
+        assert calls == []
+        clock["now"] = 100.0
+        assert connect_mod._unavailable_harness_became_ready(latest) is True
+        assert calls == ["goose-native"]
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+
+
+async def test_unknown_full_probe_preserves_existing_quick_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable full observation does not invent or refresh readiness."""
+    from omnigent.host import connect as connect_mod
+
+    def unavailable():
+        raise RuntimeError("synthetic unavailable probe")
+
+    monkeypatch.setattr(connect_mod, "configured_harness_map", unavailable)
+    connect_mod._invalidate_quick_probe_cache()
+    try:
+        connect_mod._quick_probe_cache["goose-native"] = 1.0
+        connect_mod._quick_probe_cached["goose-native"] = True
+        host = HostProcess.__new__(HostProcess)
+        assert await host._probe_configured_harnesses(startup=False) is None
+        assert connect_mod._quick_probe_cache == {"goose-native": 1.0}
+        assert connect_mod._quick_probe_cached == {"goose-native": True}
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+
+
 async def test_live_host_refreshes_harness_readiness_without_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

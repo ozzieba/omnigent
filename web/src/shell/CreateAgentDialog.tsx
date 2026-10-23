@@ -200,6 +200,9 @@ export function CreateAgentDialog({
       harness,
       model: model.trim(),
       environmentProfile: environmentProfile || undefined,
+      environmentWorkspaceAccess: environmentProfiles.find(
+        (profile) => profile.reference === environmentProfile,
+      )?.workspace_access,
       mcpServers: toMCPInputs(mcpEntries),
     });
     reset();
@@ -305,6 +308,55 @@ export function CreateAgentDialog({
                 environmentProfilesError ??
                 "Select a published environment profile."}
             </p>
+            {environmentProfiles.find((profile) => profile.reference === environmentProfile)
+              ?.runtime_manifest ? (
+              <div
+                className="rounded border px-2 py-1.5 text-xs"
+                aria-label="Runtime image manifest"
+              >
+                <p className="font-medium">
+                  Image inventory:{" "}
+                  {
+                    environmentProfiles.find((profile) => profile.reference === environmentProfile)!
+                      .runtime_manifest!.reference
+                  }
+                </p>
+                <p className="text-muted-foreground">
+                  These are declared image contents; this profile does not guarantee that a session
+                  uses that image or grant tool access.
+                </p>
+                <ul className="mt-1 flex flex-col gap-1">
+                  {environmentProfiles
+                    .find((profile) => profile.reference === environmentProfile)!
+                    .runtime_manifest!.tools.map((tool) => (
+                      <li key={tool.id}>
+                        <span className="font-medium">{tool.id}</span> · {tool.state}
+                        {tool.version ? ` · ${tool.version}` : ""}
+                        <span className="block text-muted-foreground">{tool.reason}</span>
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            ) : null}
+            {environmentProfiles.find((profile) => profile.reference === environmentProfile)
+              ?.managed_host_image_reference && (
+              <p className="text-xs text-muted-foreground" data-testid="create-agent-managed-image">
+                Managed runtime{" "}
+                {
+                  environmentProfiles.find((profile) => profile.reference === environmentProfile)!
+                    .managed_host_image_reference
+                }
+                :{" "}
+                {
+                  environmentProfiles.find((profile) => profile.reference === environmentProfile)!
+                    .managed_host_image.state
+                }
+                {environmentProfiles.find((profile) => profile.reference === environmentProfile)!
+                  .managed_host_image.image
+                  ? ` · ${environmentProfiles.find((profile) => profile.reference === environmentProfile)!.managed_host_image.image}`
+                  : ` · ${environmentProfiles.find((profile) => profile.reference === environmentProfile)!.managed_host_image.reason}`}
+              </p>
+            )}
             {environmentProfiles.find((profile) => profile.reference === environmentProfile)
               ?.capabilities?.length ? (
               <ul className="mt-1 flex flex-col gap-1.5" aria-label="Environment capabilities">

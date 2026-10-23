@@ -6002,7 +6002,18 @@ async def _post_user_message(
         item_type="message",
         item_data=item_data,
         response_id=_response_id(params),
+        native_provenance=_native_item_provenance(params, item),
     )
+
+
+def _native_item_provenance(params: _JsonObject, item: _JsonObject) -> tuple[str, str, str] | None:
+    """Return the stable Codex identity tuple when the source supplies it."""
+    thread_id = _thread_id_from_params(params)
+    turn_id = _turn_id_from_payload(params)
+    item_id = item.get("id")
+    if all(isinstance(value, str) and value for value in (thread_id, turn_id, item_id)):
+        return thread_id, turn_id, item_id  # type: ignore[return-value]
+    return None
 
 
 async def _post_agent_message(
@@ -6033,6 +6044,7 @@ async def _post_agent_message(
             "content": [{"type": "output_text", "text": text}],
         },
         response_id=_response_id(params),
+        native_provenance=_native_item_provenance(params, item),
     )
 
 
@@ -6432,13 +6444,13 @@ async def _post_external_item(
     item_type: str,
     item_data: _JsonObject,
     response_id: str,
+    native_provenance: tuple[str, str, str] | None = None,
 ) -> None:
     """
     Post one external conversation item to AP.
 
-    The forwarder does not send a dedup key to the server — items are
-    persisted with a random primary key. Avoiding re-posts on resume is
-    the producer's own responsibility.
+    Codex source identity is sent when available, allowing the server to
+    enforce durable replay idempotency. Legacy/synthetic forwarders may omit it.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -6447,15 +6459,22 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :returns: None.
     """
+    data: _JsonObject = {
+        "item_type": item_type,
+        "item_data": item_data,
+        "response_id": response_id,
+    }
+    if native_provenance is not None:
+        data.update(
+            native_thread_id=native_provenance[0],
+            native_turn_id=native_provenance[1],
+            native_item_id=native_provenance[2],
+        )
     response = await _post_session_event(
         client,
         session_id,
         event_type="external_conversation_item",
-        data={
-            "item_type": item_type,
-            "item_data": item_data,
-            "response_id": response_id,
-        },
+        data=data,
     )
     if response is None:
         _logger.warning("failed to post Codex conversation item")

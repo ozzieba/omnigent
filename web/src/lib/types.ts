@@ -321,6 +321,7 @@ export interface Session {
   workspace?: string | null;
   /** Immutable server-owned environment profile revision selected at creation. */
   environmentProfile?: string | null;
+  environmentRuntimeRef?: string | null;
   /**
    * Native-terminal CLI args the session was launched with, e.g.
    * ``["--permission-mode", "plan"]``. Reflects the LAUNCH command only:

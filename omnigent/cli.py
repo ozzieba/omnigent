@@ -4271,6 +4271,15 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.server.host_admission_bootstrap import create_cli_host_admission
+
+    try:
+        host_admission = create_cli_host_admission(
+            cfg.get("host_admission"), host_store=host_store, auth_provider=auth_provider
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     from omnigent.process_logging import configure_process_logging
 
     server_log_path = configure_process_logging(
@@ -4292,6 +4301,7 @@ def server(
         project_store=project_store,
         auth_provider=auth_provider,
         host_store=host_store,
+        host_admission=host_admission,
         account_store=account_store,
         policy_modules=cfg.get("policy_modules"),
         debug_router_modules=config_str_list(cfg.get("debug_router_modules")),

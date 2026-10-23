@@ -257,8 +257,8 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep tmux bubblewrap
+          for i in 1 2 3 4; do sudo apt-get -o Acquire::Retries=5 update && break; [ "$i" = 4 ] && exit 1; sleep $((i * 15)); done
+          sudo apt-get -o Acquire::Retries=5 install -y ripgrep tmux bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
           node .github/ci-deps/node_modules/@anthropic-ai/claude-code/install.cjs

@@ -15,10 +15,14 @@ import { authenticatedFetch } from "./identity";
 /**
  * Default session settings a project stores, pre-filled into the new-chat
  * composer. All fields optional — an unset key means "no default for this
- * slot". The vocabulary is client-owned; the server persists the object whole
- * and never acts on it, so adding a key here needs no backend change.
+ * slot". Reads can also include server-owned routing metadata; write helpers
+ * omit those fields while preserving the client's session defaults.
  */
 export interface ProjectConfig {
+  /** Server-managed quota route; never sent in client config writes. */
+  readonly quota_route?: string | null;
+  /** Server-managed launch project; never sent in client config writes. */
+  readonly project_enum?: string | null;
   /** Default host id, or the sandbox sentinel. */
   host_id?: string;
   /** Default working directory / repo path on that host. */
@@ -69,6 +73,13 @@ interface ProjectListResponse {
   data: Project[];
 }
 
+function writableProjectConfig(config: ProjectConfig): ProjectConfig {
+  const defaults = { ...config };
+  Reflect.deleteProperty(defaults, "quota_route");
+  Reflect.deleteProperty(defaults, "project_enum");
+  return defaults;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const body = (await res.json()) as { error?: { message?: string }; message?: string };
@@ -101,7 +112,7 @@ export async function createProject(name: string, config?: ProjectConfig): Promi
   const res = await authenticatedFetch("/v1/projects", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(config ? { name, config } : { name }),
+    body: JSON.stringify(config ? { name, config: writableProjectConfig(config) } : { name }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as Project;
@@ -127,7 +138,7 @@ export async function updateProjectConfig(id: string, config: ProjectConfig): Pr
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ config }),
+    body: JSON.stringify({ config: writableProjectConfig(config) }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as Project;

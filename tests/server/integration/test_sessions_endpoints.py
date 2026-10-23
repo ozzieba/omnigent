@@ -3535,6 +3535,108 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert published[5][1]["item"]["type"] == "terminal_command"
 
 
+async def test_codex_forwarder_lost_ack_replay_is_idempotent_with_pending_upload(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive the Codex forwarder through the real event route and SQL store.
+
+    The first ASGI request commits, then the client loses its acknowledgement.
+    A later native replay uses the same stable source tuple. It must return
+    the existing row without draining the next queued upload or broadcasting
+    a second consumed event.
+    """
+    from omnigent import codex_native_forwarder as forwarder
+    from omnigent.runtime import pending_inputs
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    pending_inputs.reset_for_tests()
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    class _LoseFirstAcknowledgement:
+        """Route each POST normally, then drop only the first response."""
+
+        def __init__(self) -> None:
+            self.posts = 0
+            self.first_response_status: int | None = None
+
+        async def post(self, url: str, *, json: dict[str, Any], **kwargs: Any) -> httpx.Response:
+            response = await client.post(url, json=json, **kwargs)
+            self.posts += 1
+            if self.posts == 1:
+                self.first_response_status = response.status_code
+                raise httpx.ReadTimeout("simulated lost acknowledgement", request=response.request)
+            return response
+
+    forwarder_client = _LoseFirstAcknowledgement()
+    item = {
+        "id": "native-item-1",
+        "type": "userMessage",
+        "content": [{"type": "text", "text": "question"}],
+    }
+    params = {"threadId": "native-thread-1", "turnId": "native-turn-1"}
+    pending_inputs.record(
+        session_id,
+        [
+            {"type": "input_text", "text": "question"},
+            {"type": "input_image", "file_id": "upload-for-first-message"},
+        ],
+    )
+    try:
+        # The forwarder sees a transport failure after the route committed.
+        await forwarder._post_user_message(forwarder_client, session_id, params, item)
+        assert forwarder_client.first_response_status == 202
+        assert forwarder_client.posts == 1
+        assert pending_inputs.snapshot_for(session_id) == []
+
+        # Queue a new upload before reconnect replay. It belongs to the next
+        # message and must remain pending after the duplicate native item.
+        pending_inputs.record(
+            session_id,
+            [
+                {"type": "input_text", "text": "next question"},
+                {"type": "input_image", "file_id": "upload-for-next-message"},
+            ],
+        )
+        await forwarder._post_user_message(forwarder_client, session_id, params, item)
+
+        stored = await asyncio.to_thread(
+            SqlAlchemyConversationStore(db_uri).list_items, session_id
+        )
+        assert len(stored.data) == 1
+        persisted = stored.data[0]
+        assert (
+            persisted.native_thread_id,
+            persisted.native_turn_id,
+            persisted.native_item_id,
+        ) == ("native-thread-1", "native-turn-1", "native-item-1")
+        assert persisted.data.role == "user"
+        assert persisted.data.content[0] == {
+            "type": "input_image",
+            "file_id": "upload-for-first-message",
+        }
+        assert (
+            len([event for _, event in published if event["type"] == "session.input.consumed"])
+            == 1
+        )
+        assert pending_inputs.snapshot_for(session_id)[0]["content"][-1]["file_id"] == (
+            "upload-for-next-message"
+        )
+        assert forwarder_client.posts == 2
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 async def test_post_external_function_call_output_caps_oversized_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -10251,3 +10353,134 @@ async def test_create_session_notifies_runner_with_init_envelope(
         "runner seeds it into the first spawn; got "
         f"{envelope.snapshot.model_override!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "failure_code,expected_code",
+    [
+        ("rate_limit", "native_rate_limit"),
+        ("authentication_failed", "native_authentication_failed"),
+        ("unknown", "native_turn_error"),
+        (True, "native_turn_error"),
+        ("private-error-text", "native_turn_error"),
+    ],
+)
+async def test_native_failure_code_preserves_real_route_failure_status(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: object,
+    expected_code: str,
+) -> None:
+    """
+    A ``failed`` edge with no wire ``output`` carries the persisted error text.
+
+    claude-native's ``StopFailure`` edge posts no ``output``, but the
+    harness's own explanation (its last assistant message, e.g. "There's an
+    issue with the selected model (…)") is already persisted. The handler
+    must attach it so the parent inbox shows it instead of the generic
+    "Error: native sub-agent turn failed", and surface it as the session's
+    typed error under the harness-neutral ``native_turn_error`` code.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    detail = (
+        "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
+        "It may not exist or you may not have access to it."
+    )
+    forwarded: list[dict[str, Any]] = []
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Capture forwarded runner events.
+
+        :param request: Request sent to the fake runner.
+        :returns: Accepted response.
+        """
+        forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient:
+        """
+        Resolve the session to the fake runner client.
+
+        :param session_id: Session id being routed.
+        :param runner_router: Real app runner router, unused here.
+        :returns: The fake runner client.
+        """
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    try:
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child = child_resp.json()
+
+        item_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "response_id": "resp_native_failed",
+                    "source_id": "src_native_failed",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": "claude-native-ui",
+                        "content": [{"type": "output_text", "text": detail}],
+                    },
+                },
+            },
+        )
+        assert item_resp.status_code == 202, item_resp.text
+
+        forwarded.clear()
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "native_failure_code": failure_code},
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    assert forwarded, "the failed edge was never forwarded to the runner"
+    assert forwarded[0]["body"]["data"] == {
+        "status": "failed",
+        "output": detail,
+        "native_failure_code": failure_code,
+    }
+    failed_events = [ev for _sid, ev in published if ev.get("status") == "failed"]
+    assert failed_events, f"no failed status was published: {published}"
+    error = failed_events[0]["error"]
+    assert error is not None
+    assert error["code"] == expected_code
+    assert "selected model" in error["message"]
+    snapshot = (await client.get(f"/v1/sessions/{child['id']}")).json()
+    assert snapshot["last_task_error"]["code"] == expected_code
+    assert snapshot["labels"]["omnigent.last_task_error_code"] == expected_code

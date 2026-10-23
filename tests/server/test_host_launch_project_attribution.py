@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -29,7 +30,7 @@ def _store(
     *,
     project_id: str = "project_uuid",
     name: str = "chatgpt-playground",
-    config: dict[str, str] | None = None,
+    config: dict[str, Any] | None = None,
 ):
     project = Project(
         id=project_id,
@@ -70,7 +71,7 @@ def test_legacy_unprojected_native_launch_defaults_to_personal_agent_infra(
 
 
 def test_personal_native_launch_rejects_unknown_project_name() -> None:
-    with pytest.raises(ProjectAttributionError, match="not an allowed"):
+    with pytest.raises(ProjectAttributionError, match="allowed personal project_enum"):
         resolve_launch_project_enum(
             _conversation(project_id="project_uuid"),
             harness="claude-native",
@@ -131,3 +132,62 @@ def test_work_route_requires_explicit_vertex_route() -> None:
     )
     assert attribution.quota_route == "work-vertex"
     assert attribution.project_enum is None
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "claude-native", "opifex"])
+@pytest.mark.parametrize(
+    "project_enum", ["chatgpt-playground", "planar-jacobian", "planar-jc-codex"]
+)
+def test_renamed_personal_project_uses_server_owned_enum(harness: str, project_enum: str) -> None:
+    attribution = resolve_launch_attribution(
+        _conversation(project_id="project_uuid", labels={"omni_project": "untrusted"}),
+        harness=harness,
+        project_store=_store(
+            name="Human readable project title",
+            config={"quota_route": "personal-llmq", "project_enum": project_enum},
+        ),
+    )
+    assert attribution.quota_route == "personal-llmq"
+    assert attribution.project_enum == project_enum
+
+
+@pytest.mark.parametrize("project_enum", [None, False, 1, "", "unknown", "planar-jacobian "])
+def test_explicit_invalid_enum_cannot_fall_back_to_personal_name(project_enum: object) -> None:
+    with pytest.raises(ProjectAttributionError, match="allowed personal project_enum"):
+        resolve_launch_attribution(
+            _conversation(project_id="project_uuid"),
+            harness="codex-native",
+            project_store=_store(
+                config={"quota_route": "personal-llmq", "project_enum": project_enum},
+            ),
+        )
+
+
+def test_legacy_personal_name_cannot_conflict_with_explicit_enum() -> None:
+    with pytest.raises(ProjectAttributionError, match="conflicts"):
+        resolve_launch_attribution(
+            _conversation(project_id="project_uuid"),
+            harness="codex-native",
+            project_store=_store(
+                config={
+                    "quota_route": "personal-llmq",
+                    "project_enum": "planar-jacobian",
+                }
+            ),
+        )
+
+
+@pytest.mark.parametrize("project_enum", [None, "planar-jacobian", "work-project"])
+def test_work_route_cannot_carry_a_personal_enum_field(project_enum: object) -> None:
+    with pytest.raises(ProjectAttributionError, match="work route"):
+        resolve_launch_attribution(
+            _conversation(project_id="project_uuid"),
+            harness="claude-native",
+            project_store=_store(
+                name="Work display title",
+                config={
+                    "quota_route": "work-vertex",
+                    "project_enum": project_enum,
+                },
+            ),
+        )

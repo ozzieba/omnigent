@@ -16,6 +16,8 @@ Two auth setups are exercised:
 
 from __future__ import annotations
 
+import json
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -24,6 +26,8 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.db.db_models import SqlProject, current_workspace_id
+from omnigent.entities import Project
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
@@ -157,13 +161,19 @@ async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClien
     assert fetched["config"] == cfg
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("quota_route", "personal-llmq"), ("project_enum", "planar-jacobian")],
+)
 async def test_create_rejects_client_owned_route_classification(
     project_client: httpx.AsyncClient,
+    key: str,
+    value: str,
 ) -> None:
     """Public callers cannot mint personal/work launch authorization."""
     resp = await project_client.post(
         "/v1/projects",
-        json={"name": "tamper-route", "config": {"quota_route": "personal-llmq"}},
+        json={"name": "tamper-route", "config": {key: value}},
     )
     assert resp.status_code == 400
     assert "server-owned" in resp.json()["error"]["message"]
@@ -210,34 +220,68 @@ async def test_patch_preserves_and_cannot_override_server_owned_routing(
     project_client: httpx.AsyncClient,
 ) -> None:
     """Client config replacement cannot erase or forge authoritative routing."""
-    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
     store = project_app.state.project_store
-    store.update(
-        created["id"],
-        user_id=None,
+    project = store.create(
+        uuid.uuid4().hex,
+        "P",
+        None,
         config={
             "quota_route": "personal-llmq",
+            "project_enum": "planar-jacobian",
             "host_id": "old",
         },
     )
 
     replaced = await project_client.patch(
-        f"/v1/projects/{created['id']}",
+        f"/v1/projects/{project.id}",
         json={"config": {"host_id": "new"}},
     )
     assert replaced.status_code == 200
     assert replaced.json()["config"] == {
         "quota_route": "personal-llmq",
+        "project_enum": "planar-jacobian",
         "host_id": "new",
     }
 
-    tampered = await project_client.patch(
-        f"/v1/projects/{created['id']}",
-        json={"config": {"quota_route": "work-vertex"}},
-    )
-    assert tampered.status_code == 400
-    fetched = await project_client.get(f"/v1/projects/{created['id']}")
+    for key, value in [("quota_route", "work-vertex"), ("project_enum", "planar-jc-codex")]:
+        tampered = await project_client.patch(
+            f"/v1/projects/{project.id}",
+            json={"config": {key: value}},
+        )
+        assert tampered.status_code == 400
+    fetched = await project_client.get(f"/v1/projects/{project.id}")
     assert fetched.json()["config"]["quota_route"] == "personal-llmq"
+    assert fetched.json()["config"]["project_enum"] == "planar-jacobian"
+
+
+@pytest.mark.parametrize("remove_attribution", [False, True])
+async def test_patch_preserves_current_routing_after_stale_project_read(
+    project_app: FastAPI,
+    project_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    remove_attribution: bool,
+) -> None:
+    """A settings edit cannot erase new routing or resurrect rolled-back routing."""
+    routing = {"quota_route": "personal-llmq", "project_enum": "planar-jacobian"}
+    store = project_app.state.project_store
+    project = store.create(uuid.uuid4().hex, "P", None, routing if remove_attribution else {})
+    original_get = store.get
+    current_routing = {} if remove_attribution else routing
+
+    def read_then_admin_update(project_id: str, *, user_id: str | None) -> Project | None:
+        snapshot = original_get(project_id, user_id=user_id)
+        with store._session("classify_project") as session:
+            row = session.get(SqlProject, (current_workspace_id(), project_id))
+            assert row is not None
+            row.config = json.dumps(current_routing) if current_routing else None
+        return snapshot
+
+    monkeypatch.setattr(store, "get", read_then_admin_update)
+    response = await project_client.patch(
+        f"/v1/projects/{project.id}", json={"config": {"host_id": "new"}}
+    )
+    assert response.status_code == 200
+    assert response.json()["config"] == {**current_routing, "host_id": "new"}
 
 
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:

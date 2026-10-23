@@ -88,9 +88,33 @@ def _restore_runtime_globals() -> Iterator[None]:
         setattr(_globals, name, value)
 
 
-CLAUDE_MODEL = "databricks-claude-opus-4-8"
-GPT_MODEL = "databricks-gpt-5-5"
+CLAUDE_MODEL = "databricks-claude-opus-5-5"
+GPT_MODEL = "databricks-gpt-6-1-sol"
 ROUTING_MESSAGE = "refactor the auth module and add tests"
+#: The decline the current-model policy gives a pick the pane's catalog cannot serve.
+NO_CURRENT_TARGET = "No current catalog-backed routing target is available."
+
+
+@pytest.fixture(autouse=True)
+def _current_claude_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offer the current Claude endpoint in the static candidate table.
+
+    Without a host-reported catalog, candidates come from the static table, and
+    the current-model policy only serves catalog-backed current targets. The
+    static Claude ladder carries only superseded ids, so a deployment supplies
+    its current Claude endpoints through ``routing.current_generation_models``;
+    mirror that here (the GPT entry is the shipped default, kept as is).
+
+    :param monkeypatch: Restores the table after each test.
+    """
+    from omnigent.server import smart_routing
+
+    monkeypatch.setattr(
+        smart_routing,
+        "_CURRENT_GENERATION_MODELS",
+        {**smart_routing._CURRENT_GENERATION_MODELS, "claude": (CLAUDE_MODEL,)},
+    )
+
 
 SPAWN_PAYLOAD = {
     "harness": "claude-native",
@@ -279,7 +303,9 @@ async def test_fixed_native_harness_create_routes_the_model(
         (
             "claude-native",
             lambda: FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change")),
-            GPT_MODEL,
+            # A pick outside the pane's family has no current catalog-backed
+            # target on that pane; the current-model policy declines it.
+            NO_CURRENT_TARGET,
         ),
         ("codex-native", lambda: None, "not configured"),
     ],
@@ -1174,8 +1200,8 @@ async def test_auto_routing_is_refused_when_no_router_can_serve_an_off_gateway_a
 # The candidate set an ungatewayed host answers with: the pane's own provider
 # spelling, never the static table's ``databricks-*`` ids.
 _OFF_GATEWAY_CATALOG = {
-    "claude-native": ["claude-opus-4-8"],
-    "codex-native": ["gpt-5-5"],
+    "claude-native": ["claude-opus-5-5"],
+    "codex-native": ["gpt-6-1-sol"],
 }
 
 
@@ -1193,7 +1219,7 @@ async def test_auto_routing_falls_back_to_the_built_in_judge_off_the_gateway(
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     routing_client = FakeRoutingClient(
-        RoutingResult(model="gpt-5-5", rationale="narrow change", harness="codex-native")
+        RoutingResult(model="gpt-6-1-sol", rationale="narrow change", harness="codex-native")
     )
     with (
         patch("omnigent.runtime._globals._caps", new=_caps_with(routing_client, oss=True)),
@@ -1210,7 +1236,7 @@ async def test_auto_routing_falls_back_to_the_built_in_judge_off_the_gateway(
         )
 
     assert error is None
-    assert (agent_name, model) == ("codex-native-ui", "gpt-5-5")
+    assert (agent_name, model) == ("codex-native-ui", "gpt-6-1-sol")
     assert verdict is not None
     assert verdict["router_source"] == "oss-llm"
     # The host's own catalog is the whole offer: no static databricks-* top-up.
@@ -1305,7 +1331,7 @@ async def test_a_judge_only_create_pins_nothing_when_the_pick_is_out_of_family()
     assert agent_name == "claude-native-ui"
     assert (model, verdict) == (None, None)
     assert error is not None
-    assert GPT_MODEL in error
+    assert NO_CURRENT_TARGET in error
 
 
 async def test_top_level_smart_routing_create_is_rejected_when_no_router_can_serve(
@@ -1333,7 +1359,7 @@ async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_
 
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(
-        RoutingResult(model="gpt-5-5", rationale="narrow change", harness="codex-native")
+        RoutingResult(model="gpt-6-1-sol", rationale="narrow change", harness="codex-native")
     )
     ungatewayed = _host_reporting({"claude-native": True, "codex-native": False})
     with (
@@ -1347,7 +1373,7 @@ async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_
         created = await _create_smart_routing_session(client, wrappers, routing_client, oss=True)
 
     assert created.status_code == 201, created.text
-    assert created.json()["model_override"] == "gpt-5-5"
+    assert created.json()["model_override"] == "gpt-6-1-sol"
     # The chip records which router answered.
     items = (await client.get(f"/v1/sessions/{created.json()['id']}/items")).json()["data"]
     decisions = [i for i in items if i["type"] == "routing_decision"]
@@ -1540,10 +1566,10 @@ async def test_sdk_harness_create_is_not_gated_by_native_gateway_state(
 # per-session catalog is out of reach. The host answers instead, and the static
 # table only tops up what it could not answer for. Either way the router's
 # current arms must be servable candidates — an arm missing from the candidate
-# set is substituted down a generation (a routed gpt-5-6-sol applying 5-5).
+# set is substituted down a generation (a routed gpt-6-1-sol applying 5-6).
 
-SOL = "databricks-gpt-5-6-sol"
-LUNA = "databricks-gpt-5-6-luna"
+SOL = "databricks-gpt-6-1-sol"
+LUNA = "databricks-gpt-6-luna"
 HOST_GPT_CATALOG = [LUNA, SOL]
 
 
@@ -1622,8 +1648,8 @@ async def test_pre_session_catalog_is_offered_instead_of_the_static_table(
 @pytest.mark.parametrize(
     ("arm", "applied"),
     [
-        ("gpt-5-6-sol", "databricks-gpt-5-6-sol"),
-        ("gpt-5-6-luna", "databricks-gpt-5-6-luna"),
+        ("gpt-5-6-sol", "databricks-gpt-6-1-sol"),
+        ("gpt-5-6-luna", "databricks-gpt-6-luna"),
         # No discovery listing carries glm, so the static table is its only
         # source; it applies under the gateway's model-route spelling.
         ("glm-5-2", "system.ai.glm-5-2"),

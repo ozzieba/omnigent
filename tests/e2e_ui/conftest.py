@@ -295,6 +295,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="1-indexed shard this run executes (requires --splits).",
     )
 
+    parser.addoption(
+        "--ui-ci-progress",
+        action="store_true",
+        default=False,
+        help="Emit canonical UI item and phase progress records for CI.",
+    )
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Fail fast on unsafe e2e-ui harness options.
@@ -310,6 +317,11 @@ def pytest_configure(config: pytest.Config) -> None:
             "tests/e2e_ui must run headless in CI. Remove --headed; headed "
             "browser windows are only allowed for local debugging."
         )
+
+    if config.getoption("--ui-ci-progress"):
+        from tests.e2e_ui.ci_progress import UIProgress
+
+        config.pluginmanager.register(UIProgress(config), "ui-ci-progress")
 
 
 @pytest.fixture(scope="session")
@@ -406,6 +418,9 @@ def pytest_collection_modifyitems(
         raise pytest.UsageError("--splits must be >= 1")
     if not 1 <= group <= splits:
         raise pytest.UsageError(f"--group must be between 1 and {splits}")
+    deselected = [item for index, item in enumerate(items) if index % splits != group - 1]
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
     items[:] = items[group - 1 :: splits]
 
 

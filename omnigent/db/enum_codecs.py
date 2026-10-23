@@ -98,6 +98,10 @@ HOST_STATUS: dict[str, int] = {
     "offline": 2,
 }
 
+HOST_ADMISSION_STATE: dict[str, int] = {"open": 1, "draining": 2}
+HOST_ADMISSION_OPERATION: dict[str, int] = {"launch": 1, "input": 2}
+HOST_OPERATION_STATE: dict[str, int] = {"pending": 1, "complete": 2, "unknown": 3}
+
 AGENT_KIND: dict[str, int] = {
     "template": 1,
     "session": 2,
@@ -288,6 +292,31 @@ def encode_host_status(name: str) -> int:
 def decode_host_status(code: int) -> str:
     """Decode a ``hosts.status`` int code to its name."""
     return _decode(HOST_STATUS, code, field="hosts.status")
+
+
+def encode_host_admission_state(name: str) -> int:
+    """Encode a host fence state."""
+    return _encode(HOST_ADMISSION_STATE, name, field="host_turnover_admission.state")
+
+
+def decode_host_admission_state(code: int) -> str:
+    """Decode a host fence state."""
+    return _decode(HOST_ADMISSION_STATE, code, field="host_turnover_admission.state")
+
+
+def encode_host_admission_operation(name: str) -> int:
+    """Encode the kind of an admitted host operation."""
+    return _encode(HOST_ADMISSION_OPERATION, name, field="host_turnover_operations.operation")
+
+
+def encode_host_operation_state(name: str) -> int:
+    """Encode an operation custody state."""
+    return _encode(HOST_OPERATION_STATE, name, field="host_turnover_operations.state")
+
+
+def decode_host_operation_state(code: int) -> str:
+    """Decode an operation custody state."""
+    return _decode(HOST_OPERATION_STATE, code, field="host_turnover_operations.state")
 
 
 def encode_agent_kind(name: str) -> int:

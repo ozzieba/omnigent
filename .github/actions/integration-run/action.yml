@@ -87,8 +87,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        sudo apt-get update
-        sudo apt-get install -y tmux ripgrep bubblewrap
+        for i in 1 2 3 4; do sudo apt-get -o Acquire::Retries=5 update && break; [ "$i" = 4 ] && exit 1; sleep $((i * 15)); done
+        sudo apt-get -o Acquire::Retries=5 install -y tmux ripgrep bubblewrap
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         npm install --ignore-scripts
         node node_modules/@anthropic-ai/claude-code/install.cjs

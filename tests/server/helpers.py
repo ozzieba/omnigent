@@ -579,6 +579,7 @@ def install_fake_kubernetes_launcher(
         secret_mounts: list[dict[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
+        allow_process_env_fallbacks: bool = True,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image

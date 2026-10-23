@@ -13,7 +13,7 @@ import json
 import math
 import secrets
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -25,6 +25,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.db.db_models import current_workspace_id, uuid_to_bytes
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.debug_logging import debug_event
 from omnigent.entities import (
@@ -93,6 +94,8 @@ from omnigent.runtime.policies.builder import (
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.prompt import append_session_goal_context
+from omnigent.runtime.subagent_block_notifier import WakeDeliveryUnknown
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
@@ -112,6 +115,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.host_admission import AsyncAdmission, guarded_operation
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
@@ -346,6 +350,7 @@ from omnigent.stores.conversation_store import (
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.host_admission_store import Refused
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
@@ -1146,6 +1151,7 @@ def _build_session_response(
         pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
         environment_profile=conv.environment_profile,
+        environment_runtime_ref=conv.environment_runtime_ref,
         environment_capabilities=environment_capabilities,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -2216,7 +2222,54 @@ async def _persist_external_codex_subagent_start(
     )
 
 
+_external_item_locks: dict[tuple[str, str, str, str], tuple[asyncio.Lock, int]] = {}
+
+
+@contextlib.asynccontextmanager
+async def _external_item_lock(key: tuple[str, str, str, str]) -> AsyncIterator[None]:
+    """Serialize one source item locally and evict its lock after the last waiter.
+
+    Pending inputs and session streams are process-affine in the current
+    runtime. The database unique index remains the cross-process append guard,
+    but this lock does not make pending-input drain plus append one transaction
+    across multiple AP workers.
+    """
+    lock, users = _external_item_locks.get(key, (asyncio.Lock(), 0))
+    _external_item_locks[key] = (lock, users + 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        current_lock, current_users = _external_item_locks[key]
+        if current_lock is lock and current_users == 1:
+            _external_item_locks.pop(key, None)
+        elif current_lock is lock:
+            _external_item_locks[key] = (lock, current_users - 1)
+
+
 async def _persist_external_conversation_item(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+) -> str:
+    """Serialize provenance retries before they can consume queued uploads."""
+    item = _parse_external_conversation_item(body)
+    provenance = (item.native_thread_id, item.native_turn_id, item.native_item_id)
+    if not all(provenance):
+        return await _persist_external_conversation_item_once(
+            session_id, conv, body, conversation_store, created_by, background_title_coordinator
+        )
+    key = (session_id, *provenance)
+    async with _external_item_lock(key):
+        return await _persist_external_conversation_item_once(
+            session_id, conv, body, conversation_store, created_by, background_title_coordinator
+        )
+
+
+async def _persist_external_conversation_item_once(
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -2245,6 +2298,20 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _parse_external_conversation_item(body)
+    if all((item.native_thread_id, item.native_turn_id, item.native_item_id)):
+        find_native_item_id = getattr(conversation_store, "find_native_item_id", None)
+        if find_native_item_id is not None:
+            existing_id = await asyncio.to_thread(
+                find_native_item_id,
+                session_id,
+                item.native_thread_id,
+                item.native_turn_id,
+                item.native_item_id,
+            )
+            if existing_id is not None:
+                # A committed replay is acknowledged by the original id. It
+                # must not consume pending input or emit a second broadcast.
+                return existing_id
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -2300,6 +2367,12 @@ async def _persist_external_conversation_item(
     if pending_background_title is not None:
         pending_background_title.schedule()
     persisted = persisted_items[0]
+    if item.type in {"function_call", "reasoning"} or (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "assistant"
+    ):
+        session_live_state.persist_scheduled_run_started(session_id)
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -2904,6 +2977,7 @@ async def _run_managed_launch(
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
     project_store: ProjectStore | None = None,
+    runtime_image_reference: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2989,6 +3063,7 @@ async def _run_managed_launch(
         relaunch_host=relaunch_host,
         provider=provider,
         agent_name=agent_name,
+        runtime_image_reference=runtime_image_reference,
     )
     if managed is None:
         return
@@ -3595,6 +3670,7 @@ def _kick_managed_relaunch(
             agent_store=agent_store,
             agent_id=conv.agent_id,
             project_store=getattr(app_state, "project_store", None),
+            runtime_image_reference=conv.environment_runtime_ref,
         )
     )
     _managed_launch_tasks.add(relaunch_task)
@@ -5701,6 +5777,23 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    routing_body = body
+    if (
+        body.type == "message"
+        and body.data.get("role") == "user"
+        and conv.labels.get("omnigent.wrapper") in {"claude-code-native-ui", "opencode-native-ui"}
+        and isinstance(body.data.get("content"), list)
+    ):
+        goal = await asyncio.to_thread(conversation_store.get_session_goal, session_id)
+        if goal is not None:
+            body = body.model_copy(
+                update={
+                    "data": {
+                        **body.data,
+                        "content": append_session_goal_context(body.data["content"], goal),
+                    }
+                }
+            )
     if body.type == "message" and _is_native_terminal_session(conv):
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
@@ -5782,7 +5875,7 @@ async def _dispatch_session_event_to_runner_impl(
             from omnigent.server.smart_routing import route_turn_or_decline
 
             _harness = _native_pane_harness(conv)
-            _user_text = _extract_user_text_for_routing(body)
+            _user_text = _extract_user_text_for_routing(routing_body)
             # Cross-family spawns belong to auto-harness sessions: a pinned
             # session's children stay in its family (the rule the in-harness
             # spawn gate applies via ``candidate_models(cross_harness=False)``).
@@ -6521,6 +6614,25 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                             )
                     if evt_type == "response.completed":
+                        # A completed model response proves the scheduled turn
+                        # started; a runner's startup/running status does not.
+                        # The INPUT-phase policy short-circuit also publishes a
+                        # synthetic completed response (`deny_<random>`), which
+                        # never reached the model and must not count as work.
+                        _completed_response = event.get("response")
+                        _completed_id = (
+                            _completed_response.get("id")
+                            if isinstance(_completed_response, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(_completed_response, dict)
+                            and _completed_response.get("status") == "completed"
+                            and isinstance(_completed_id, str)
+                            and bool(_completed_id)
+                            and not _completed_id.startswith("deny_")
+                        ):
+                            session_live_state.persist_scheduled_run_started(session_id)
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
@@ -7152,6 +7264,7 @@ async def _wake_parent_for_blocked_child(
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    host_admission: AsyncAdmission | None = None,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -7197,24 +7310,28 @@ async def _wake_parent_for_blocked_child(
             child.id,
         )
         return False
-    # Ensure the parent's SSE relay is live so the wake turn's output is
-    # persisted (parity with post_event).
-    _ensure_runner_relay(
-        parent_id,
-        parent_conv.runner_id,
-        runner_client,
-        conversation_store,
-    )
-    body = SessionEventInput(
-        type="message",
-        data={
-            "role": "user",
-            "content": [{"type": "input_text", "text": notice}],
-        },
-    )
-    try:
-        # None args: a system notice carries no agent/files/artifacts; the runner
-        # recomputes has_mcp_servers from the parent's cached spec.
+    binding = None
+    if host_admission is not None and parent_conv.host_id is not None:
+        try:
+            binding = await host_admission.binding_for_host(
+                current_workspace_id(), uuid_to_bytes(parent_conv.host_id).hex()
+            )
+        except (Refused, TimeoutError, ValueError):
+            return False
+
+    invoked = False
+
+    async def invoke() -> bool:
+        nonlocal invoked
+        invoked = True
+        _ensure_runner_relay(parent_id, parent_conv.runner_id, runner_client, conversation_store)
+        body = SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": notice}],
+            },
+        )
         await _dispatch_session_event_to_runner(
             parent_id,
             parent_conv,
@@ -7226,7 +7343,21 @@ async def _wake_parent_for_blocked_child(
             artifact_store=None,
             runner_router=runner_router,
         )
-    except (httpx.HTTPError, OmnigentError):
+        return True
+
+    try:
+        if binding is None:
+            return await invoke()
+        return await guarded_operation(host_admission, binding, "input", invoke)
+    except Refused as exc:
+        if binding is None:
+            raise
+        if invoked:
+            raise WakeDeliveryUnknown("HOST_WAKE_UNRESOLVED") from exc
+        return False
+    except (httpx.HTTPError, OmnigentError) as exc:
+        if binding is not None:
+            raise WakeDeliveryUnknown("HOST_WAKE_UNRESOLVED") from exc
         _logger.warning(
             "subagent block wake POST failed for parent=%s child=%s",
             parent_id,
@@ -7234,12 +7365,17 @@ async def _wake_parent_for_blocked_child(
             exc_info=True,
         )
         return False
-    return True
+    except Exception as exc:
+        if binding is not None:
+            raise WakeDeliveryUnknown("HOST_WAKE_UNRESOLVED") from exc
+        raise
 
 
 def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    *,
+    host_admission: AsyncAdmission | None = None,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -7283,6 +7419,7 @@ def configure_subagent_block_notifier(
             notice,
             conversation_store=conversation_store,
             runner_router=runner_router,
+            host_admission=host_admission,
         )
 
     notifier = SubagentBlockNotifier(
@@ -8350,11 +8487,13 @@ async def _create_session_from_existing_agent(
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
     inherited_environment_profile: str | None = None
+    inherited_environment_runtime_ref: str | None = None
     if body.parent_session_id is not None:
         parent_conv = conversation_store.get_conversation(body.parent_session_id)
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
             inherited_environment_profile = parent_conv.environment_profile
+            inherited_environment_runtime_ref = parent_conv.environment_runtime_ref
             # A child the caller binds to an explicit host/workspace runs on
             # a runner that host launches there. Pinning it to the parent's
             # runner instead would execute it in the parent's process and
@@ -8372,6 +8511,49 @@ async def _create_session_from_existing_agent(
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
+
+    if (
+        body.environment_profile is not None
+        and inherited_environment_profile is not None
+        and body.environment_profile != inherited_environment_profile
+    ):
+        raise OmnigentError(
+            "a child session must use its parent's immutable environment profile",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    selected_environment_profile = body.environment_profile or inherited_environment_profile
+    if inherited_environment_profile is not None:
+        environment_runtime_ref = inherited_environment_runtime_ref
+        if body.host_type == "managed":
+            sandbox_config = getattr(request.app.state, "sandbox_config", None)
+            selected_provider = (
+                sandbox_config.for_provider(body.sandbox_provider)
+                if sandbox_config is not None
+                else None
+            )
+            if (
+                environment_runtime_ref is None
+                or selected_provider is None
+                or selected_provider.provider != "kubernetes"
+                or sandbox_config.managed_host_image(environment_runtime_ref) is None
+            ):
+                raise OmnigentError(
+                    "the parent's selected environment profile has no managed image "
+                    "published for the selected Kubernetes provider",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+    else:
+        from omnigent.server.managed_hosts import resolve_profile_runtime_reference
+
+        try:
+            environment_runtime_ref = resolve_profile_runtime_reference(
+                selected_environment_profile,
+                deployment=getattr(request.app.state, "sandbox_config", None),
+                provider=body.sandbox_provider,
+                managed=body.host_type == "managed",
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must
@@ -8508,7 +8690,8 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
             project_id=project_resolution.project_id,
-            environment_profile=inherited_environment_profile,
+            environment_profile=selected_environment_profile,
+            environment_runtime_ref=environment_runtime_ref,
         )
     except NameAlreadyExistsError as exc:
         if (
@@ -8878,6 +9061,7 @@ def _create_session_from_bundle(
     metadata: SessionCreateMetadata,
     bundle_bytes: bytes,
     runner_id: str | None = None,
+    environment_runtime_ref: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -8984,6 +9168,7 @@ def _create_session_from_bundle(
         agent_bundle_location=agent_bundle_location,
         agent_description=spec.description,
         runner_id=runner_id,
+        environment_runtime_ref=environment_runtime_ref,
     )
 
 

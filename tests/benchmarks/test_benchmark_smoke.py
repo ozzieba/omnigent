@@ -538,7 +538,10 @@ _RUNNER_JOURNEYS = [
 ]
 
 
-@pytest.mark.timeout(300)
+# 600s, not 300s: the test is ~55s CPU-bound on an idle box but 175-285s on the
+# 8-worker CI runner, so a loaded runner crossed the 300s thread-timeout, which
+# os._exit()s the xdist worker ("node down: Not properly terminated").
+@pytest.mark.timeout(600)
 async def test_benchmark_smoke_runner_journeys() -> None:
     """Run each full-turn journey once through server + runner + mock LLM.
 

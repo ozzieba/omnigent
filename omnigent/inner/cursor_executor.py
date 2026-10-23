@@ -50,7 +50,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, TypeAlias, TypedDict
+from typing import Any, Protocol, TypeAlias, TypedDict
 
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
@@ -114,13 +114,6 @@ class _CursorAgent(Protocol):
         raise NotImplementedError
 
 
-# Cursor's auto model-select, used when a spec pins no cursor model (the SDK
-# requires a model for local agents, so unlike the old ACP path we can't pass
-# ``None``). The SDK renamed the id from ``auto`` to ``auto-smart``; keep
-# mapping the legacy id for specs/env that still say ``auto``.
-_DEFAULT_CURSOR_MODEL = "auto-smart"
-_LEGACY_AUTO_MODEL = "auto"
-
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
 # instead of blocking the SDK's daemon callback thread forever.
@@ -132,30 +125,37 @@ _TOOL_CALL_TIMEOUT_S = 1800.0
 _HOOK_APPROVAL_TIMEOUT_S = 86400
 
 
-def _resolve_model(model: str | None) -> str:
-    """Resolve the cursor model id, dropping ids cursor can't honor.
-
-    cursor-sdk accepts only Cursor model ids (``auto-smart``, ``gpt-5``,
-    ``composer-2.5``, ...), so a gateway-routed model id (carried by a spec
-    authored for another harness) falls back to cursor's auto-select. ``None``
-    likewise resolves to :data:`_DEFAULT_CURSOR_MODEL` (the SDK requires a model).
-    The legacy ``auto`` id is remapped to ``auto-smart``.
-    """
-    if not model or model.startswith(("databricks-", "databricks/")):
-        if model:
-            # Warn, not debug: the requested model is silently NOT honored, and
-            # a debug line is invisible in the harness subprocess — so a user who
-            # pinned a non-Cursor model would otherwise have no idea it was dropped.
-            logger.warning(
-                "CursorExecutor: requested model %r is not a Cursor model id; "
-                "falling back to %r auto-select.",
-                model,
-                _DEFAULT_CURSOR_MODEL,
-            )
-        return _DEFAULT_CURSOR_MODEL
-    if model == _LEGACY_AUTO_MODEL:
-        return _DEFAULT_CURSOR_MODEL
+def _resolve_model(model: str | None, router_mode: str | None = None) -> str:
+    """Require an explicit fixed ID or an explicitly selected Router mode."""
+    if router_mode is not None and router_mode not in {"cost", "balanced", "intelligence"}:
+        raise ValueError("Unsupported Cursor Router mode")
+    if model is None and router_mode is not None:
+        model = "auto-smart"
+    if not model or model == "default" or model.startswith(("databricks-", "databricks/")):
+        raise ValueError("An explicit Cursor model or Router mode is required")
+    if model == "auto-smart" and router_mode is None:
+        raise ValueError("Cursor Router requires an explicit optimize_for mode")
     return model
+
+
+async def _catalog_model_selection(
+    client: Any, model: str, router_mode: str | None, api_key: str | None
+) -> Any:
+    """Validate the selected account's catalog before creating an agent."""
+    catalog = await asyncio.wait_for(client.list_models(api_key=api_key), timeout=15)
+    matches = [entry for entry in catalog if entry.id == model]
+    if len(matches) != 1:
+        raise ValueError("Requested Cursor model is unavailable in the account catalog")
+    if model != "auto-smart":
+        return model
+    modes = [parameter for parameter in matches[0].parameters if parameter.id == "optimize_for"]
+    if len(modes) != 1 or router_mode not in {entry.value for entry in modes[0].values}:
+        raise ValueError("Requested Cursor Router mode is unavailable in the account catalog")
+    from cursor_sdk import ModelParameterValue, ModelSelection
+
+    return ModelSelection(
+        id=model, params=[ModelParameterValue(id="optimize_for", value=router_mode)]
+    )
 
 
 def _first_of(data: Mapping[str, object], *keys: str, default: int = 0) -> int:
@@ -538,6 +538,7 @@ class CursorExecutor(Executor):
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
+        router_mode: str | None = None,
         api_key: str | None = None,
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
@@ -550,9 +551,9 @@ class CursorExecutor(Executor):
             falls back to ``os_env.cwd`` then the process cwd.
         :param os_env: Optional OS environment / sandbox spec (its ``cwd`` is
             used when *cwd* is unset).
-        :param model: Cursor model id (e.g. ``"gpt-5"``); a gateway-routed id
-            or ``None`` falls back to cursor's ``auto-smart`` select. Legacy
-            ``"auto"`` is remapped to ``auto-smart``.
+        :param model: Explicit Cursor model ID, validated against the account catalog.
+        :param router_mode: Explicit Router optimization (cost, balanced, intelligence).
+            Required for ``auto-smart``; with no model, explicitly selects Router.
         :param api_key: Cursor API key. ``None`` falls back to ``CURSOR_API_KEY``
             in the environment.
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
@@ -566,6 +567,7 @@ class CursorExecutor(Executor):
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
         self._model_override = model
+        self._router_mode = router_mode
         self._api_key = api_key or os.environ.get("CURSOR_API_KEY") or None
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
@@ -790,6 +792,9 @@ class CursorExecutor(Executor):
         async with _bridge_spawn_in_cwd(cwd):
             client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
+            selection = await _catalog_model_selection(
+                client, model, self._router_mode, self._api_key
+            )
             local_kwargs: _JsonObject = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
@@ -806,7 +811,7 @@ class CursorExecutor(Executor):
             local = LocalAgentOptions(**local_kwargs)
             agent = await AsyncAgent.create(
                 client=client,
-                model=model,
+                model=selection,
                 api_key=self._api_key,
                 name=self._agent_name,
                 local=local,
@@ -825,7 +830,13 @@ class CursorExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         session_key = self._session_key(messages)
-        model = _resolve_model((config.model if config else None) or self._model_override)
+        try:
+            model = _resolve_model(
+                (config.model if config else None) or self._model_override, self._router_mode
+            )
+        except ValueError as exc:
+            yield ExecutorError(message=str(exc))
+            return
         tools_fp = _tools_fingerprint(tools)
         state = self._session_states.setdefault(session_key, _CursorSessionState())
 

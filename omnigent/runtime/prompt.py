@@ -14,8 +14,38 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
+from omnigent.entities.session_goal import SessionGoal
 from omnigent.runtime.tool_result_replay import image_omitted_placeholder
 from omnigent.spec import AgentSpec
+
+
+def append_session_goal_context(
+    content: list[dict[str, Any]], goal: SessionGoal
+) -> list[dict[str, Any]]:
+    """Append the authoritative goal snapshot after the current user's content.
+
+    Native terminal adapters cannot all update system instructions mid-session.
+    This additive context therefore travels through their existing message path.
+    It does not change turn ownership, provider configuration or execution limits.
+    """
+    lifecycle = (
+        "Pursue this standing goal within the current user's direction and existing limits."
+        if goal.status == "active"
+        else "Do not autonomously resume this goal; its recorded hold remains in effect."
+    )
+    snapshot = goal.model_dump(
+        include={"session_id", "objective", "status", "revision", "completion_evidence"}
+    )
+    framework = (
+        "Omnigent standing goal context (durable record, not a new request or permission):\n"
+        + json.dumps(snapshot, ensure_ascii=False)
+        + "\n"
+        + lifecycle
+        + " The current explicit request still governs this turn. A completed turn is not "
+        "a completed goal. Record completion only through goal control with evidence. "
+        "Do not change models, credentials, budgets or ownership because of this context."
+    )
+    return [*content, {"type": "input_text", "text": framework}]
 
 
 def append_framework_instructions(
