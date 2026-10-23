@@ -473,6 +473,10 @@ class _CodexNativeLaunchConfig:
         still has work to do. False on a session something already routed —
         a web create that pinned the model before the pane launched — so the
         ``UserPromptSubmit`` hook is never registered and no prompt is held.
+    :param terminal_ui: ``True`` for a terminal-UI session
+        (``omnigent.wrapper=codex-native-ui``): prompts typed into its TUI never
+        reach the runner, so its app-server also gets the llmq prompt gate
+        (:mod:`omnigent.codex_llmq_hook`).
     """
 
     workspace: Path
@@ -487,6 +491,7 @@ class _CodexNativeLaunchConfig:
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
+    terminal_ui: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1040,6 +1045,7 @@ async def _codex_native_launch_config(
     # Fork directives stamped on a clone at fork time. Only consulted when
     # the clone has no external_session_id of its own yet (see the
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
+    from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
     from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
@@ -1057,6 +1063,7 @@ async def _codex_native_launch_config(
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
     bypass_sandbox = False
+    terminal_ui = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -1067,6 +1074,7 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        terminal_ui = labels.get(WRAPPER_LABEL_KEY) == CODEX_NATIVE_WRAPPER_VALUE
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
     routing_class = routing_class_from_snapshot(
@@ -1087,6 +1095,7 @@ async def _codex_native_launch_config(
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
+        terminal_ui=terminal_ui,
     )
 
 
@@ -4725,6 +4734,8 @@ async def _auto_create_codex_terminal(
         # Persist trust for every merged hook so the review finds nothing to
         # review. See trust_all_codex_hooks.
         trust_all_hooks=True,
+        # A terminal-UI session's typed prompts never pass the runner's gate.
+        llmq_prompt_gate=launch_config.terminal_ui,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and

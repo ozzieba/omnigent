@@ -33,6 +33,12 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.codex_llmq_hook import HOOK_MODULE as _LLMQ_HOOK_MODULE
+from omnigent.codex_llmq_hook import (
+    gate_env_snapshot,
+    llmq_hooks_settings,
+    write_gate_snapshot,
+)
 from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
@@ -1343,6 +1349,14 @@ class CodexNativeAppServer:
         surfaces it to Omnigent (which posts a single durable banner). Prevents
         re-posting the same notice on every subsequent ensure. Not a
         constructor input.
+    :param llmq_prompt_gate: ``True`` for a terminal-UI session
+        (``omnigent.wrapper=codex-native-ui``), whose typed prompts the runner
+        never sees: :meth:`start` then also registers the llmq prompt gate
+        (:mod:`omnigent.codex_llmq_hook`) when this process's environment
+        provisions it. Runner-driven sessions leave it off; the runner gates
+        their turns itself.
+    :param llmq_hooks_registered: Runtime field set by :meth:`start`: whether
+        the llmq prompt-gate hooks were written. Not a constructor input.
     """
 
     codex_path: str
@@ -1370,6 +1384,8 @@ class CodexNativeAppServer:
     trust_project: bool = False
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
+    llmq_prompt_gate: bool = False
+    llmq_hooks_registered: bool = False
     process_group_id: int | None = None
 
     async def start(self) -> None:
@@ -1468,6 +1484,18 @@ class CodexNativeAppServer:
             self.codex_home,
             self.config_overrides,
         )
+        # Terminal-UI sessions gate typed prompts through llmq (design #76 "B").
+        # Codex hands its hooks the app-server's filtered env, which drops the
+        # controller URL and token file, so they are snapshotted into the bridge
+        # dir from THIS process's env (the one the runner gate reads), and the
+        # hook is registered only when that env provisions the gate.
+        llmq_snapshot = (
+            gate_env_snapshot(os.environ)
+            if self.llmq_prompt_gate and policy_hooks_supported
+            else None
+        )
+        write_gate_snapshot(self.bridge_dir, llmq_snapshot)
+        self.llmq_hooks_registered = llmq_snapshot is not None
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
@@ -1493,6 +1521,7 @@ class CodexNativeAppServer:
                 # is the switch for the first-message routing hook. Same
                 # rendezvous-as-switch shape as the subagent router above.
                 turn_routing=_turn_router_advertised(self.bridge_dir),
+                llmq_gate=self.llmq_hooks_registered,
             )
             if self.ap_server_url:
                 write_policy_hook_config(
@@ -1609,6 +1638,26 @@ class CodexNativeAppServer:
                 except Exception:  # noqa: BLE001 - routing trust never blocks startup
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
+                        exc_info=True,
+                    )
+            # The llmq prompt gate is a third module in the same file. Best
+            # effort as well: llmq fails open by design, so an untrusted gate
+            # only means typed prompts run unmetered.
+            if self.llmq_hooks_registered:
+                try:
+                    still_untrusted = await trust_codex_llmq_hooks(
+                        client.request, cwd=str(self.cwd)
+                    )
+                    if still_untrusted:
+                        _logger.warning(
+                            "codex llmq prompt-gate hooks still untrusted; typed prompts "
+                            "will not be gated: %s",
+                            ", ".join(still_untrusted),
+                        )
+                except Exception:  # noqa: BLE001 - llmq trust never blocks startup
+                    _logger.warning(
+                        "codex llmq prompt-gate hook trust failed; typed prompts will not "
+                        "be gated",
                         exc_info=True,
                     )
             # Runner-owned sessions launch the TUI with
@@ -1940,6 +1989,7 @@ def _write_codex_policy_hooks_file(
     router_session_id: str | None = None,
     user_hooks_source: Path | None = None,
     turn_routing: bool = False,
+    llmq_gate: bool = False,
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
@@ -1962,6 +2012,11 @@ def _write_codex_policy_hooks_file(
     :param turn_routing: ``True`` when the session launched with Smart Routing
         on, which registers the ``UserPromptSubmit`` first-message routing
         hook.
+    :param llmq_gate: ``True`` for a terminal-UI session whose launch
+        provisions the llmq gate: registers :mod:`omnigent.codex_llmq_hook` on
+        ``UserPromptSubmit`` (admission) and on ``Stop`` (settlement). Codex
+        runs an event's hooks concurrently, so its position after the policy
+        and routing hooks does not order them.
     :returns: None.
     """
     payloads: list[Mapping[str, object]] = [
@@ -1976,6 +2031,8 @@ def _write_codex_policy_hooks_file(
                 python_executable=python_executable,
             )
         )
+    if llmq_gate:
+        payloads.append(llmq_hooks_settings(bridge_dir, python_executable))
     _ = write_codex_hooks_file(codex_home, payloads, user_hooks_source=user_hooks_source)
 
 
@@ -2192,6 +2249,36 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
         ", ".join(sorted(str(h.get("eventName")) for h in ours)),
     )
     return []
+
+
+async def trust_codex_llmq_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
+    """
+    Trust the generated llmq prompt-gate hooks so codex runs them.
+
+    The same ``hooks/list`` -> ``config/batchWrite`` pass as
+    :func:`trust_codex_router_hooks`, filtered on the llmq hook module so it
+    never touches the policy, routing or user hooks.
+
+    :param request: Bound app-server JSON-RPC request coroutine, e.g.
+        ``client.request``.
+    :param cwd: The session cwd the hooks are scoped to, e.g.
+        ``"/home/user/repo"``.
+    :returns: Keys of llmq hooks still untrusted afterwards; empty when every
+        one is trusted (or none are registered).
+    """
+
+    def _untrusted(listed: _JsonObject) -> list[_JsonObject]:
+        return [
+            h
+            for h in _our_hooks_from_list(listed, cwd, _LLMQ_HOOK_MODULE)
+            if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+        ]
+
+    untrusted = _untrusted(await request("hooks/list", {"cwds": [cwd]}))
+    if not untrusted:
+        return []
+    await _persist_hook_trust(request, untrusted)
+    return [str(h.get("key")) for h in _untrusted(await request("hooks/list", {"cwds": [cwd]}))]
 
 
 async def trust_all_codex_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
@@ -2471,6 +2558,7 @@ def build_codex_native_server(
     bypass_sandbox: bool = False,
     trust_project: bool = False,
     trust_all_hooks: bool = False,
+    llmq_prompt_gate: bool = False,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2517,6 +2605,9 @@ def build_codex_native_server(
         startup hook-review screen on a persistent ``resume`` attach (see
         :func:`trust_all_codex_hooks`). Interactive CLI sessions leave it
         disabled so a human reviews their own new or changed hooks.
+    :param llmq_prompt_gate: Whether this is a terminal-UI session whose typed
+        prompts get the llmq prompt gate (see
+        :attr:`CodexNativeAppServer.llmq_prompt_gate`).
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2583,6 +2674,7 @@ def build_codex_native_server(
         pinned_model=pinned_model,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
+        llmq_prompt_gate=llmq_prompt_gate,
     )
 
 

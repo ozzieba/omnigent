@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
+from omnigent.codex_llmq_hook import clear_runner_turn, mark_runner_turn
 from omnigent.codex_native_app_server import (
     CODEX_ACTIVE_TURN_RESYNC_ATTEMPTS,
     CodexAppServerClient,
@@ -103,8 +104,10 @@ async def _start_codex_turn(
                 )
     # The runner admitted this turn (llmq gate) before handing it to us: record
     # its turn id so the forwarder does not admit it again as a turn Codex
-    # started by itself (goal continuation; see omnigent.runner.llmq_goal_gate).
+    # started by itself (goal continuation; see omnigent.runner.llmq_goal_gate),
+    # and mark it so a terminal-UI session's prompt-gate hook skips it too.
     mark_turn_start_pending(bridge_dir)
+    marked = mark_runner_turn(bridge_dir)
     try:
         response = await client.request(
             "turn/start",
@@ -121,6 +124,8 @@ async def _start_codex_turn(
         )
     except BaseException:
         clear_turn_start_pending(bridge_dir)
+        if marked:
+            clear_runner_turn(bridge_dir)
         raise
     result = _json_object(response.get("result"))
     turn = _json_object(result.get("turn")) if result is not None else None

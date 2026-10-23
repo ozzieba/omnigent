@@ -1254,6 +1254,9 @@ async def _prepare_codex_terminal(
             ap_server_url=base_url,
             ap_auth_headers=headers,
             developer_instructions=developer_instructions,
+            # ``omnigent codex`` is the terminal-UI wrapper: prompts typed here
+            # never reach the runner's llmq gate.
+            llmq_prompt_gate=True,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None
