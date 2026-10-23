@@ -48,6 +48,7 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
+import { TURBO_DESCRIPTION } from "@/components/TurboControls";
 import {
   Command,
   CommandEmpty,
@@ -268,9 +269,6 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // Agents whose bundled skills render as always-visible pills under the
 // landing composer. Deliberately an allowlist while the pattern proves
 // out — other agents keep the "/" menu as the only skill surface.
-/** Shown beside the Turbo switch: what it allows, in one line. */
-const TURBO_DESCRIPTION =
-  "Let this session's Codex turns use paid credits past the subscription margin";
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 
 function createdHarnessOptions({

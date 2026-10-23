@@ -67,7 +67,6 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
-import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { useAppName } from "@/lib/branding";
@@ -235,6 +234,7 @@ import { SessionImage } from "@/components/SessionImage";
 import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
+import { TURBO_DESCRIPTION, TurboChip, TurboSwitch } from "@/components/TurboControls";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
@@ -6698,39 +6698,6 @@ function SessionConfigModal({
  *   requests re-open (bare ``/model`` submits route here now that the composer
  *   trigger is a read-only label). ``0`` / omitted means never requested.
  */
-/** Shown beside the Turbo controls: what the switch allows, in one line. */
-export const TURBO_DESCRIPTION =
-  "Let this session's Codex turns use paid credits past the subscription margin";
-
-/**
- * The per-session Turbo switch (oz, 2026-10-06), right next to the model
- * selector. Writes through the store immediately (optimistic, rolled back on a
- * failed PATCH) rather than through the modal's Save: it is a plain session
- * flag, not part of the launch config.
- */
-function TurboSwitch({ testId, componentId }: { testId: string; componentId: string }) {
-  const turbo = useChatStore((s) => s.turbo);
-  const setTurbo = useChatStore((s) => s.setTurbo);
-  return (
-    <div className="flex items-center gap-2">
-      <Switch
-        checked={turbo}
-        onCheckedChange={(checked) => {
-          void setTurbo(checked).catch(() => {
-            // The store already rolled the switch back; nothing to surface here.
-          });
-        }}
-        aria-label="Turbo"
-        data-testid={testId}
-        componentId={componentId}
-      />
-      <span className="text-sm text-muted-foreground" data-testid={`${testId}-state`}>
-        {turbo ? "On: paid credits allowed" : "Off"}
-      </span>
-    </div>
-  );
-}
-
 function ComposerConfigGear({
   harnessLabel,
   showModels,
@@ -7014,7 +6981,9 @@ function useResolvedComposerModel(
  * label whenever a Codex session has Turbo on. Turbo lets the llmq gate admit
  * a turn that would spend credits, so it must be readable at a glance, not
  * only in the gear's hover tooltip or the config modal. Renders nothing when
- * Turbo is off or the session is not a Codex model-picker session.
+ * Turbo is off or the session is not a Codex model-picker session. In a
+ * terminal-first session's Terminal view the composer unmounts and the header
+ * carries the chip instead (HeaderTurboChip).
  */
 function ComposerTurboChip({
   showModels,
@@ -7025,15 +6994,7 @@ function ComposerTurboChip({
 }) {
   const turbo = useChatStore((s) => s.turbo);
   if (!showModels || modelPickerKind !== "codex" || !turbo) return null;
-  return (
-    <span
-      data-testid="composer-turbo-chip"
-      title="Turbo is on: this session may spend paid credits"
-      className="mr-1 shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs font-medium leading-none text-amber-700 dark:text-amber-400"
-    >
-      Turbo: paid credits
-    </span>
-  );
+  return <TurboChip testId="composer-turbo-chip" className="mr-1" />;
 }
 
 /**
