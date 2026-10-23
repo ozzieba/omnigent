@@ -202,6 +202,7 @@ class GoalContinuationGate:
         self._activate = True
         # The forwarder's current app-server client; it replaces a dropped one.
         self._codex: CodexRequester | None = None
+        self._closed = False  # after aclose(), late events start no work
         self._tasks: set[asyncio.Task[Any]] = set()
         # Long-lived waits (held re-checks, unused-admission expiry).
         self._waits: set[asyncio.Task[Any]] = set()
@@ -258,7 +259,7 @@ class GoalContinuationGate:
         model: str | None,
     ) -> None:
         """A ``turn/started`` for the forwarder's thread: classify and admit it off-loop."""
-        if not turn_id or not thread_id:
+        if self._closed or not turn_id or not thread_id:
             return
         # Turns of a thread run one at a time: a still-tracked earlier turn ended
         # without a terminal event reaching us (reconnect), so close it unmeasured.
@@ -287,6 +288,8 @@ class GoalContinuationGate:
 
     def usage_updated(self, params: object) -> None:
         """A ``thread/tokenUsage/updated`` for the forwarder's thread."""
+        if self._closed:
+            return
         turn_id = params.get("turnId") if isinstance(params, dict) else None
         counts = self._meter_turn is not None and (
             not isinstance(turn_id, str) or not turn_id or turn_id == self._meter_turn
@@ -295,7 +298,7 @@ class GoalContinuationGate:
 
     def turn_finished(self, turn_id: str | None) -> None:
         """A ``turn/completed`` / ``turn/failed`` for the forwarder's thread."""
-        if not turn_id:
+        if self._closed or not turn_id:
             return
         usage = None
         if turn_id == self._meter_turn:
@@ -319,6 +322,7 @@ class GoalContinuationGate:
 
     async def aclose(self) -> None:
         """Stop holding, and end every reservation this gate still owns."""
+        self._closed = True
         for task in list(self._waits):
             task.cancel()
         for turn_id in list(self._tracked):

@@ -2096,20 +2096,23 @@ async def supervise_forwarder(
                     subscribe_task, forwarder_state, target.thread_id
                 )
         finally:
-            # First, so a failing close below cannot leave a hold task running.
-            if forwarder_state.llmq_goal_gate is not None:
-                await forwarder_state.llmq_goal_gate.aclose()
-            if mcp_settle_timer is not None:
-                mcp_settle_timer.cancel()
+            try:
+                if mcp_settle_timer is not None:
+                    mcp_settle_timer.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await mcp_settle_timer
+                await target.delta_coalescer.close()
+                await target.usage_coalescer.close()
+                await target.elicitation_tracker.close()
+                subscribe_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await mcp_settle_timer
-            await target.delta_coalescer.close()
-            await target.usage_coalescer.close()
-            await target.elicitation_tracker.close()
-            subscribe_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await subscribe_task
-            await client.close()
+                    await subscribe_task
+                await client.close()
+            finally:
+                # Last (its drain can wait on llmq), but even if a close above fails,
+                # so no hold task outlives the forwarder.
+                if forwarder_state.llmq_goal_gate is not None:
+                    await forwarder_state.llmq_goal_gate.aclose()
 
 
 async def _await_backfilling_subscription(

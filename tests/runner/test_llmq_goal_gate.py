@@ -480,13 +480,19 @@ async def test_a_transient_goal_get_fault_does_not_end_the_hold(setup) -> None:
             codex.fail.discard("thread/goal/get")
             server.turbo = True  # the user then enables Turbo
 
+    paused = {"threadId": THREAD, "status": "paused"}
     gate = make_gate(llmq, config, [], on_sleep)
     async with server.client() as ap:
         start(gate, codex, ap, bridge, "t1")
-        await asyncio.sleep(0.05)
+        # The goal starts active: wait for the hold to pause it before waiting for
+        # the resume, or the initial "active" ends the wait at once.
+        for _ in range(1000):
+            if paused in codex.calls("thread/goal/set"):
+                break
+            await asyncio.sleep(0.01)
         gate.turn_finished("t1")
-        for _ in range(200):
-            if codex.goal_status == "active" or (not gate._waits and len(codex.requests) > 3):
+        for _ in range(1000):  # generous: the re-checks run against llmq's real app
+            if codex.goal_status == "active":
                 break
             await asyncio.sleep(0.01)
         await gate.drain()
@@ -616,9 +622,12 @@ async def test_a_hold_survives_a_codex_reconnect(setup) -> None:
     gate = make_gate(llmq, config, [], on_sleep)
     async with server.client() as ap:
         start(gate, old, ap, bridge, "t1")
-        await asyncio.sleep(0.05)
+        for _ in range(1000):
+            if {"threadId": THREAD, "status": "paused"} in old.calls("thread/goal/set"):
+                break
+            await asyncio.sleep(0.01)
         gate.turn_finished("t1")
-        for _ in range(200):
+        for _ in range(1000):  # generous: the re-checks run against llmq's real app
             if new.goal_status == "active":
                 break
             await asyncio.sleep(0.01)
@@ -626,3 +635,19 @@ async def test_a_hold_survives_a_codex_reconnect(setup) -> None:
         await gate.aclose()
     assert new.goal_status == "active"
     assert new.calls("thread/goal/set")[-1] == {"threadId": THREAD, "status": "active"}
+
+
+async def test_a_closed_gate_ignores_late_events(setup) -> None:
+    """Events that arrive after aclose() (before the subscription is cancelled)
+    start no work on the gate's closed llmq client."""
+    llmq, config, bridge = setup
+    llmq.publish(33)
+    codex, server = FakeCodex(), FakeServer()
+    gate = make_gate(llmq, config, [])
+    await gate.aclose()
+    async with server.client() as ap:
+        start(gate, codex, ap, bridge, "late")
+        gate.usage_updated(usage("late", (5, 0, 1), (5, 0, 1)))
+        gate.turn_finished("late")
+        await gate.drain()
+    assert codex.requests == [] and llmq.seen == [] and reservations(llmq) == []
