@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
+from omnigent.codex_llmq_hook import clear_runner_turn, mark_runner_turn
 from omnigent.codex_native_app_server import (
     CODEX_ACTIVE_TURN_RESYNC_ATTEMPTS,
     CodexAppServerClient,
@@ -96,19 +97,27 @@ async def _start_codex_turn(
                     "Failed to mirror codex model switch into config.toml: model=%s",
                     switched_model,
                 )
-    response = await client.request(
-        "turn/start",
-        {
-            "threadId": state.thread_id,
-            "input": input_items,
-            "environments": [
-                {
-                    "environmentId": "local",
-                    "cwd": state.cwd or str(Path.cwd()),
-                }
-            ],
-        },
-    )
+    # The runner already asked llmq for this turn; the marker tells a
+    # terminal-UI session's prompt-gate hook not to admit it a second time.
+    marked = mark_runner_turn(bridge_dir)
+    try:
+        response = await client.request(
+            "turn/start",
+            {
+                "threadId": state.thread_id,
+                "input": input_items,
+                "environments": [
+                    {
+                        "environmentId": "local",
+                        "cwd": state.cwd or str(Path.cwd()),
+                    }
+                ],
+            },
+        )
+    except BaseException:
+        if marked:
+            clear_runner_turn(bridge_dir)
+        raise
     result = _json_object(response.get("result"))
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
