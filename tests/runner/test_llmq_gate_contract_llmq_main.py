@@ -33,10 +33,12 @@ from llm_quota_controller.config import Settings, TokenGrant  # noqa: E402
 from llm_quota_controller.engine import QuotaEngine  # noqa: E402
 from llm_quota_controller.models import AdmissionDecision  # noqa: E402
 from llm_quota_controller.native_turns import (  # noqa: E402
+    NativeTurnActivation,
     NativeTurnAdmission,
     NativeTurnSettlement,
 )
 
+from omnigent.runner import llmq_gate  # noqa: E402
 from omnigent.runner.llmq_gate import (  # noqa: E402
     GateConfig,
     GateDecision,
@@ -123,6 +125,7 @@ class Llmq:
         self.app = llmq_api.create_app(self.settings, self.engine)
         self.seen: list[dict[str, Any]] = []
         self.answers: list[dict[str, Any]] = []
+        self.activations: list[dict[str, Any]] = []
 
     def publish(self, used: float, *, credited: bool = True, age: float = 0.0) -> dict:
         now = int(self.clock())
@@ -149,6 +152,8 @@ class Llmq:
             async def handle_async_request(inner, request: httpx.Request) -> httpx.Response:
                 if request.url.path.endswith("/admissions"):
                     self.seen.append(json.loads(request.content))
+                if request.url.path.endswith("/activations"):
+                    self.activations.append(json.loads(request.content))
                 response = await transport.handle_async_request(request)
                 if request.url.path.endswith("/admissions"):
                     body = await response.aread()
@@ -513,3 +518,113 @@ async def test_hung_controller_fails_open_after_five_seconds_without_retry(gate_
     )
     assert 4.5 <= elapsed <= 7.0, elapsed
     assert connections == 1
+
+
+# ----------------------------------------------------------------- activation
+
+
+def _dispatch_authorized(llmq: Llmq, reservation_id: str) -> bool:
+    metadata = json.loads(llmq.reservation(reservation_id)["metadata_json"])
+    return metadata.get("dispatch_authorized_at") is not None
+
+
+async def _activate(llmq: Llmq, cfg: GateConfig, decision: GateDecision, key: str) -> bool | None:
+    async with llmq.client() as client:
+        return await llmq_gate.activate_codex_turn(client, cfg, decision, turn_key=key)
+
+
+async def test_activation_body_validates_against_llmq_main_model(tmp_path, gate_config) -> None:
+    llmq = Llmq(tmp_path)
+    llmq.publish(33)
+    decision, key, *_ = await _gate(llmq, gate_config)
+    assert await _activate(llmq, gate_config, decision, key) is True
+    parsed = NativeTurnActivation.model_validate(llmq.activations[0])
+    assert parsed.reservation_id == decision.reservation_id and parsed.turn_key == key
+    assert (parsed.model, parsed.turbo, parsed.evidence) == ("gpt-6.1-sol", False, "controller")
+
+
+async def test_an_activated_turn_is_dispatched_in_llmq_and_never_cancelled_as_unrun(
+    tmp_path, gate_config
+) -> None:
+    """After activation llmq refuses "never ran" (409): the turn is settled measured,
+    settled unmeasured at its estimate (#1328), or, on an llmq without that form, left
+    at its estimate for the lease."""
+    llmq = Llmq(tmp_path)
+    llmq.publish(33)
+    decision, key, *_ = await _gate(llmq, gate_config)
+    rid = decision.reservation_id or ""
+    assert await _activate(llmq, gate_config, decision, key) is True
+    assert _dispatch_authorized(llmq, rid)
+    async with llmq.client() as client:
+        # Why the close must not fall back to a cancel once activated:
+        assert not await llmq_gate.cancel_codex_turn(client, gate_config, decision, turn_key=key)
+        outcome = await close_codex_turn(
+            client,
+            gate_config,
+            decision,
+            turn_key=key,
+            tap=_tap(CREATED, COMPLETED_NO_USAGE),
+            activated=True,
+        )
+    row = llmq.reservation(rid)
+    metadata = json.loads(row["metadata_json"])
+    if UNMEASURED_FORM:
+        assert outcome == "estimated"
+        assert row["status"] == "settled" and row["actual_ppm"] == row["estimated_ppm"]
+        assert metadata["native_usage_basis"] == "retained_estimate"
+    else:
+        assert outcome == "retained"
+        assert row["status"] == "active"  # llmq's conservative charge for a dispatched turn
+    assert "native_input_tokens" not in metadata
+
+
+async def test_an_activated_turn_with_measured_usage_settles_its_tokens(
+    tmp_path, gate_config
+) -> None:
+    llmq = Llmq(tmp_path)
+    llmq.publish(33)
+    decision, key, *_ = await _gate(llmq, gate_config)
+    assert await _activate(llmq, gate_config, decision, key) is True
+    async with llmq.client() as client:
+        outcome = await close_codex_turn(
+            client,
+            gate_config,
+            decision,
+            turn_key=key,
+            tap=_tap(CREATED, COMPLETED),
+            activated=True,
+        )
+    assert outcome == "settled"
+    metadata = json.loads(llmq.reservation(decision.reservation_id or "")["metadata_json"])
+    assert (metadata["native_input_tokens"], metadata["native_output_tokens"]) == (140, 20)
+
+
+async def test_a_turbo_credit_bearing_turn_activates_as_admitted(tmp_path, gate_config) -> None:
+    """The activation repeats Turbo: without it llmq re-checks the 95% receipt against
+    the margin and answers not ready."""
+    llmq = Llmq(tmp_path)
+    llmq.publish(95)
+    decision, key, *_ = await _gate(llmq, gate_config, turbo_after=1)
+    assert decision.credit_bearing and decision.turbo
+    assert await _activate(llmq, gate_config, decision, key) is True
+    assert llmq.activations[0]["turbo"] is True
+    assert _dispatch_authorized(llmq, decision.reservation_id or "")
+
+
+async def test_a_not_ready_activation_leaves_the_reservation_cancellable(
+    tmp_path, gate_config
+) -> None:
+    """llmq's receipt went stale between admission and dispatch: it answers not ready
+    and records no dispatch, so a turn that then never ran can still be released."""
+    llmq = Llmq(tmp_path)
+    llmq.publish(33)
+    decision, key, *_ = await _gate(llmq, gate_config)
+    llmq.receipt.unlink()
+    assert await _activate(llmq, gate_config, decision, key) is False
+    rid = decision.reservation_id or ""
+    assert not _dispatch_authorized(llmq, rid)
+    async with llmq.client() as client:
+        outcome = await close_codex_turn(
+            client, gate_config, decision, turn_key=key, tap=TurnStreamTap(), activated=False
+        )
+    assert outcome == "cancelled" and llmq.reservation(rid)["status"] == "cancelled"

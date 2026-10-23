@@ -26,6 +26,7 @@ import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { HeaderProjectTag } from "./HeaderProjectTag";
 import { HeaderTitle } from "./HeaderTitle";
+import { HeaderTurboChip } from "./HeaderTurboChip";
 import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
@@ -167,6 +168,12 @@ interface ChatHeaderProps {
   onToggleRightPanel: () => void;
   /** Gating + handlers for the mobile session-menu FAB. */
   mobileMenu: MobileSessionMenuProps;
+  /**
+   * Set for a Codex session, whose per-session Turbo switch applies; `null`
+   * or omitted for every other harness. Drives the Terminal-view Turbo chip
+   * (see HeaderTurboChip). `canToggle` is false for read-only viewers.
+   */
+  turboControl?: { canToggle: boolean } | null;
 }
 
 /**
@@ -215,6 +222,7 @@ export function ChatHeader({
   rightPanelOpen,
   onToggleRightPanel,
   mobileMenu,
+  turboControl = null,
 }: ChatHeaderProps) {
   // Dwell on the toggle for 400ms to peek the sidebar; leaving before then cancels
   // the pending peek so a quick pass-over never opens it. Peek is a desktop
@@ -480,6 +488,10 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
+        {/* Turbo paid-credits chip while a Codex session shows its terminal:
+            the composer (which carries it in Chat view) is unmounted then.
+            Self-gates to null in Chat view and while Turbo is off. */}
+        {conversationId && turboControl && <HeaderTurboChip canToggle={turboControl.canToggle} />}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
         {conversationId && <ViewModeToggle />}

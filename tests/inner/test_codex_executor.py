@@ -1347,8 +1347,9 @@ class TestCodexExecutor(unittest.TestCase):
         Without forwarding the codex token-usage notification, harness-backed
         codex tests produce empty token-usage artifacts even though the
         provider counted real tokens. This test asserts the inner executor
-        captures the latest ``tokenUsage.last`` breakdown and attaches it
-        to the next ``TurnComplete`` it yields.
+        attaches the turn's ``tokenUsage.last`` breakdown (here a single model
+        response; see the multi-response test for the sum) to the
+        ``TurnComplete`` it yields.
         """
 
         async def _t():
@@ -1420,12 +1421,171 @@ class TestCodexExecutor(unittest.TestCase):
                     "input_tokens": 100,
                     "output_tokens": 25,
                     "total_tokens": 125,
+                    "context_tokens": 125,
                     "model": "gpt-5.4-mini",
                 },
             )
-            # The cached usage must be cleared after consumption so the next
+            # The turn's usage must be cleared after consumption so the next
             # turn doesn't inherit stale numbers.
-            self.assertIsNone(session._last_turn_usage)
+            self.assertIsNone(session._turn_usage.take("gpt-5.4-mini"))
+
+        _run(_t())
+
+    @staticmethod
+    def _usage_update(turn_id: str, last: dict[str, int], total: dict[str, int]) -> dict:
+        def breakdown(values: dict[str, int]) -> dict[str, int]:
+            return {
+                "inputTokens": values.get("in", 0),
+                "cachedInputTokens": values.get("cached", 0),
+                "outputTokens": values.get("out", 0),
+                "reasoningOutputTokens": 0,
+                "totalTokens": values.get("in", 0) + values.get("out", 0),
+            }
+
+        return {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": turn_id,
+                "tokenUsage": {"last": breakdown(last), "total": breakdown(total)},
+            },
+        }
+
+    def test_app_server_run_turn_sums_token_usage_over_every_model_response(self):
+        """A turn with a tool call makes several model responses; Codex reports each
+        response's usage as ``tokenUsage.last``. ``TurnComplete.usage`` (which the llmq
+        gate settles as the turn's measured usage, and which prices the turn) is the
+        sum over the turn, not the last response. A re-sent notification (unchanged
+        ``total``, e.g. a rate-limit refresh) and another turn's are not counted."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+            update = self._usage_update
+
+            async def _inject_events() -> None:
+                await asyncio.sleep(0.01)
+                for event in (
+                    # response 1 (asks for a tool)
+                    update("turn-1", {"in": 1000, "out": 40}, {"in": 1000, "out": 40}),
+                    # the same info re-sent (rate-limit refresh): not a new response
+                    update("turn-1", {"in": 1000, "out": 40}, {"in": 1000, "out": 40}),
+                    # a stale notification for another turn
+                    update("turn-0", {"in": 7, "out": 7}, {"in": 1007, "out": 47}),
+                    # response 2 (the answer), mostly served from the prompt cache
+                    update(
+                        "turn-1",
+                        {"in": 1200, "cached": 900, "out": 60},
+                        {"in": 2207, "cached": 900, "out": 107},
+                    ),
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}},
+                ):
+                    session._events.put_nowait(event)
+                    await asyncio.sleep(0.001)
+
+            inject_task = asyncio.create_task(_inject_events())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertEqual(
+                events[-1].usage,
+                {
+                    "input_tokens": 2200 - 900,  # non-cached portion of both responses
+                    "cache_read_input_tokens": 900,
+                    "output_tokens": 100,
+                    "total_tokens": 2300,  # billing: every response's tokens
+                    "context_tokens": 1260,  # context ring: the last response's total
+                    "model": "gpt-5.4-mini",
+                },
+            )
+
+        _run(_t())
+
+    def test_app_server_run_turn_final_answer_includes_its_own_response_usage(self):
+        """Codex reports a response's usage only after the response completes, which
+        is after the final-answer item the executor finishes the turn on. The turn
+        must still carry that last response's tokens, not only the earlier ones."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+            update = self._usage_update
+
+            async def _inject_events() -> None:
+                await asyncio.sleep(0.01)
+                for event in (
+                    update("turn-1", {"in": 500, "out": 20}, {"in": 500, "out": 20}),
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "done",
+                            },
+                        },
+                    },
+                    update("turn-1", {"in": 600, "out": 30}, {"in": 1100, "out": 50}),
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}},
+                ):
+                    session._events.put_nowait(event)
+                    await asyncio.sleep(0.001)
+
+            inject_task = asyncio.create_task(_inject_events())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertEqual(events[-1].response, "done")
+            self.assertEqual(
+                events[-1].usage,
+                {
+                    "input_tokens": 1100,
+                    "output_tokens": 50,
+                    "total_tokens": 1150,
+                    "context_tokens": 630,
+                    "model": "gpt-5.4-mini",
+                },
+            )
 
         _run(_t())
 

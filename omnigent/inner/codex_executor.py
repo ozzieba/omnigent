@@ -128,6 +128,10 @@ _TURN_EVENT_WARN_SECONDS = 600.0
 # warning cadence is unchanged.
 _TURN_EVENT_POLL_SECONDS = 5.0
 _TURN_COMPLETED_DRAIN_SECONDS = 1.0
+# How long a turn that ended on its final-answer item waits for the usage of the
+# model response that carried it (Codex reports a response's usage only after
+# the response completes, i.e. after its final item).
+_FINAL_ANSWER_USAGE_DRAIN_SECONDS = 1.0
 # Wall-clock budget for the ``codex --version`` probe. A broken codex
 # build that blocks (e.g. on stdin) must not stall session startup — on
 # timeout the probe kills the process and reports the version as unknown.
@@ -279,6 +283,92 @@ def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[st
     if model:
         usage["model"] = model
     return usage
+
+
+def _usage_turn_matches(params: object, active_turn_id: str) -> bool:
+    """Whether a usage notification belongs to the active turn (unscoped counts)."""
+    turn_id = params.get("turnId") if isinstance(params, dict) else None
+    return not isinstance(turn_id, str) or not turn_id or turn_id == active_turn_id
+
+
+def _usage_count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+_USAGE_FIELDS = ("inputTokens", "cachedInputTokens", "outputTokens", "totalTokens")
+
+
+class CodexTurnUsage:
+    """Whole-turn token usage from Codex ``thread/tokenUsage/updated`` notifications.
+
+    Each notification carries ``last`` (the usage of the most recent model
+    response) and ``total`` (the thread's running sum: codex-rs adds ``last`` to
+    ``total`` once per completed response, ``TokenUsageInfo::append_last_usage``).
+    A turn that calls tools makes several model responses, so the turn's usage is
+    the sum of ``last`` over the turn's notifications, not the final ``last``.
+    Codex also re-sends unchanged info (e.g. on a rate-limit refresh); such a
+    notification repeats ``total`` and is not counted again. As in the
+    openai-agents executor, ``context_tokens`` is the LAST response's total (the
+    context-ring proxy), since the summed ``total_tokens`` is a billing figure
+    that re-counts the history once per response.
+    """
+
+    def __init__(self) -> None:
+        self._seen_total: tuple[int, ...] | None = None
+        self._sum: dict[str, int] | None = None
+        self._last_context = 0
+
+    def reset(self) -> None:
+        """Start a new turn (the thread's running total is kept for dedup)."""
+        self._sum = None
+        self._last_context = 0
+
+    def observe(self, params: object, *, count: bool = True) -> bool:
+        """Record one notification; add its ``last`` when it is a new response.
+
+        :param count: Whether the notification belongs to the turn being
+            measured; a foreign one still advances the dedup baseline.
+        :returns: Whether ``last`` was added to the turn's sum.
+        """
+        if not isinstance(params, dict):
+            return False
+        token_usage = params.get("tokenUsage")
+        if not isinstance(token_usage, dict):
+            return False
+        total = token_usage.get("total")
+        total_key = (
+            tuple(_usage_count(total.get(name)) for name in _USAGE_FIELDS)
+            if isinstance(total, dict)
+            else None
+        )
+        repeated = total_key is not None and total_key == self._seen_total
+        if total_key is not None:
+            self._seen_total = total_key
+        last = token_usage.get("last")
+        if not count or repeated or not isinstance(last, dict):
+            return False
+        current = self._sum or dict.fromkeys(_USAGE_FIELDS, 0)
+        for name in _USAGE_FIELDS:
+            current[name] += _usage_count(last.get(name))
+        self._sum = current
+        self._last_context = _usage_count(last.get("totalTokens")) or (
+            _usage_count(last.get("inputTokens")) + _usage_count(last.get("outputTokens"))
+        )
+        return True
+
+    def take(self, model: str | None) -> dict[str, object] | None:
+        """The turn's usage in :class:`TurnComplete` wire shape, then reset.
+
+        :returns: ``None`` when no notification was counted for the turn.
+        """
+        summed, self._sum = self._sum, None
+        context, self._last_context = self._last_context, 0
+        if summed is None:
+            return None
+        usage = _extract_codex_last_turn_usage({"tokenUsage": {"last": summed}}, model)
+        if usage is not None and context:
+            usage["context_tokens"] = context
+        return usage
 
 
 def _format_codex_error_params(params: object) -> str:
@@ -2289,11 +2379,10 @@ class _CodexAppServerSession:
         self._process_cwd: Path | None = None
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
-        # Most recent ``thread/tokenUsage/updated`` payload's ``last``
-        # turn breakdown, mapped to the wire shape. Consumed (and cleared)
-        # on the next ``turn/completed`` so each TurnComplete carries the
-        # usage for the turn that just finished.
-        self._last_turn_usage: dict[str, object] | None = None
+        # The current turn's token usage, summed over its model responses
+        # from ``thread/tokenUsage/updated``. Taken (and cleared) when the
+        # turn completes, so each TurnComplete carries the whole turn's usage.
+        self._turn_usage = CodexTurnUsage()
         # Serialize concurrent writes to the subprocess stdin so that parallel
         # tool-call responses don't interleave bytes on the pipe.
         self._stdin_lock = asyncio.Lock()
@@ -2504,6 +2593,43 @@ class _CodexAppServerSession:
             )
         return formatted
 
+    async def _drain_final_answer_usage_tail(self, *, active_turn_id: str) -> None:
+        """Wait briefly for the usage of the response that carried the final answer.
+
+        Codex reports a model response's usage (``thread/tokenUsage/updated``)
+        only after the response completes, which is after its final-answer item.
+        A turn that ends on that item would otherwise miss its last response's
+        tokens. Stops at that notification, at the turn's ``turn/completed``, or
+        after ``_FINAL_ANSWER_USAGE_DRAIN_SECONDS``. The turn is over, so other
+        events read here are dropped, as the next turn's start would drop them.
+
+        :param active_turn_id: The current turn id.
+        """
+        deadline = time.monotonic() + _FINAL_ANSWER_USAGE_DRAIN_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                message = await asyncio.wait_for(self._events.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return
+            self._record_event(message)
+            params = message.get("params", {})
+            if not isinstance(params, dict):
+                continue
+            method = message.get("method")
+            if method == "thread/tokenUsage/updated":
+                if self._turn_usage.observe(
+                    params, count=_usage_turn_matches(params, active_turn_id)
+                ):
+                    return
+            elif method == "turn/completed":
+                turn = params.get("turn")
+                completed_id = turn.get("id") if isinstance(turn, dict) else None
+                if not isinstance(completed_id, str) or completed_id == active_turn_id:
+                    return
+
     async def _drain_turn_completed_tail(
         self,
         *,
@@ -2691,6 +2817,7 @@ class _CodexAppServerSession:
             return
         active_turn_id: str = raw_active_turn_id
         self.active_turn_id = active_turn_id
+        self._turn_usage.reset()
 
         while not self._events.empty():
             queued_message = self._events.get_nowait()
@@ -2983,8 +3110,10 @@ class _CodexAppServerSession:
                                 active_turn_id,
                                 final_response[:120],
                             )
-                            turn_usage = self._last_turn_usage
-                            self._last_turn_usage = None
+                            await self._drain_final_answer_usage_tail(
+                                active_turn_id=active_turn_id
+                            )
+                            turn_usage = self._turn_usage.take(model)
                             _notify_usage_from_dict(model=model, usage=turn_usage)
                             yield TurnComplete(response=final_response, usage=turn_usage)
                             return
@@ -2997,7 +3126,9 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
-                    self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                    self._turn_usage.observe(
+                        params, count=_usage_turn_matches(params, active_turn_id)
+                    )
                     continue
 
                 if method == "turn/completed":
@@ -3024,8 +3155,7 @@ class _CodexAppServerSession:
                             message_buffers=message_buffers,
                             final_response=final_response,
                         )
-                    turn_usage = self._last_turn_usage
-                    self._last_turn_usage = None
+                    turn_usage = self._turn_usage.take(model)
                     _notify_usage_from_dict(model=model, usage=turn_usage)
                     yield TurnComplete(response=final_response, usage=turn_usage)
                     return

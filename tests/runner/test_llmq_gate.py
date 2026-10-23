@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import llmq_gate
 from omnigent.runner.llmq_gate import (
     GateConfig,
     GateDecision,
@@ -48,15 +49,39 @@ def config(tmp_path: Path, **overrides: Any) -> GateConfig:
 class Controller:
     """A fake llmq answering admissions from a script and recording requests."""
 
-    def __init__(self, answers: list[Any], *, unmeasured_form: bool = True) -> None:
+    def __init__(
+        self,
+        answers: list[Any],
+        *,
+        unmeasured_form: bool = True,
+        activation_answer: Any = None,
+    ) -> None:
         self.answers = answers
         self.unmeasured_form = unmeasured_form
+        self.activation_answer = activation_answer
         self.requests: list[dict[str, Any]] = []
         self.settlements: list[dict[str, Any]] = []
         self.cancellations: list[dict[str, Any]] = []
+        self.activations: list[dict[str, Any]] = []
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
+        if request.url.path.endswith("/activations"):
+            self.activations.append(body)
+            answer = self.activation_answer
+            if answer is None:
+                answer = {
+                    "reservation_id": body["reservation_id"],
+                    "ready": True,
+                    "reason": "ready",
+                }
+            if isinstance(answer, Exception):
+                raise answer
+            if isinstance(answer, int):
+                return httpx.Response(answer, text="nope")
+            if isinstance(answer, str):
+                return httpx.Response(200, text=answer)
+            return httpx.Response(200, json=answer)
         if request.url.path.endswith("/settlements"):
             if "usage_unmeasured" in body and not self.unmeasured_form:
                 # An llmq from before ozzieba/chatgpt-playground#1328: extra field.
@@ -738,3 +763,212 @@ async def test_cancel_without_a_reservation_posts_nothing(tmp_path: Path) -> Non
     async with client_for(controller) as client:
         assert not await cancel_codex_turn(client, config(tmp_path), UNRESERVED, turn_key="f" * 64)
     assert controller.cancellations == []
+
+
+# ----------------------------------------------------------------- activation
+
+
+@pytest.mark.asyncio
+async def test_an_admitted_decision_remembers_what_it_was_admitted_for(tmp_path: Path) -> None:
+    controller = Controller([admitted(credit_bearing=True)])
+    async with client_for(controller) as client:
+        decision = await admit_codex_turn(
+            client, config(tmp_path), turn_key="a" * 64, attempt=2, model="gpt-6.1-sol", turbo=True
+        )
+    assert (decision.model, decision.turbo, decision.attempt) == ("gpt-6.1-sol", True, 2)
+    # Bookkeeping only: two decisions for the same outcome still compare equal.
+    assert decision == GateDecision(
+        allow=True, verified=True, reason="admitted", reservation_id="res-1", credit_bearing=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_activation_repeats_the_admission_and_reports_whether_dispatch_was_authorised(
+    tmp_path: Path,
+) -> None:
+    controller = Controller([admitted(credit_bearing=True)])
+    cfg = config(tmp_path)
+    async with client_for(controller) as client:
+        decision = await admit_codex_turn(
+            client, cfg, turn_key="a" * 64, attempt=2, model="gpt-6.1-sol", turbo=True
+        )
+        first = await llmq_gate.activate_codex_turn(client, cfg, decision, turn_key="a" * 64)
+        again = await llmq_gate.activate_codex_turn(client, cfg, decision, turn_key="a" * 64)
+    assert (first, again) == (True, True)
+    body = controller.activations[0]
+    activation_id = body.pop("activation_id")
+    assert body == {
+        "turn_key": "a" * 64,
+        "agent_id": "fleet-p16v",
+        "workstream": "agent-infra",
+        "harness": "codex",
+        "model": "gpt-6.1-sol",
+        "attempt": 2,
+        "evidence": "controller",
+        "turbo": True,
+        "reservation_id": "res-1",
+    }
+    # Stable per reservation, so a repeated activation replays in llmq.
+    assert 8 <= len(activation_id) <= 200
+    assert controller.activations[1]["activation_id"] == activation_id
+    assert controller.settlements == [] and controller.cancellations == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        (
+            {
+                "reservation_id": "res-1",
+                "ready": False,
+                "reason": "native_turn_authority_unavailable",
+            },
+            False,
+        ),
+        (500, None),
+        (403, None),
+        ("not json", None),
+        ({"reservation_id": "res-1"}, None),
+        (httpx.ConnectError("down"), None),
+        (httpx.ReadTimeout("slow"), None),
+    ],
+    ids=[
+        "not-ready",
+        "http-500",
+        "http-403",
+        "non-json",
+        "no-ready-flag",
+        "unreachable",
+        "timeout",
+    ],
+)
+async def test_activation_faults_never_raise(tmp_path: Path, answer: Any, expected: Any) -> None:
+    controller = Controller([admitted()], activation_answer=answer)
+    cfg = config(tmp_path)
+    async with client_for(controller) as client:
+        decision = await admit_codex_turn(
+            client, cfg, turn_key="a" * 64, attempt=0, model="gpt-6.1-sol", turbo=False
+        )
+        assert (
+            await llmq_gate.activate_codex_turn(client, cfg, decision, turn_key="a" * 64)
+            is expected
+        )
+    assert len(controller.activations) == 1  # no retry
+
+
+@pytest.mark.asyncio
+async def test_unverified_or_unreserved_admissions_never_activate(tmp_path: Path) -> None:
+    controller = Controller([])
+    cfg = config(tmp_path)
+    async with client_for(controller) as client:
+        for decision in (
+            UNRESERVED,
+            GateDecision(allow=True, verified=False, reason="receipt_stale", reservation_id="r-1"),
+            # A decision the gate did not get from an admission (no model): nothing to repeat.
+            ADMITTED,
+        ):
+            assert (
+                await llmq_gate.activate_codex_turn(client, cfg, decision, turn_key="a" * 64)
+                is None
+            )
+    assert controller.activations == []
+
+
+def test_the_tap_reports_dispatch_once_and_never_raises_from_its_callback() -> None:
+    calls: list[str] = []
+    tap = TurnStreamTap(on_dispatch=lambda: calls.append("dispatched"))
+    tap.feed(sse({"type": "response.created", "response": {"id": "r"}}))
+    tap.feed(sse(COMPLETED_WITH_USAGE))
+    assert calls == ["dispatched"] and tap.dispatched
+
+    def boom() -> None:
+        raise RuntimeError("callback bug")
+
+    failing = TurnStreamTap(on_dispatch=boom)
+    failing.feed(sse({"type": "response.created", "response": {"id": "r"}}))
+    assert failing.dispatched
+    # A pathological line is ignored, not raised into the runner's drain loop.
+    deep = TurnStreamTap()
+    deep.feed('data: {"a":' + "[" * 100_000 + "\n\n")
+    assert deep.dispatched is False
+
+
+@pytest.mark.asyncio
+async def test_turn_activation_starts_once_and_reports_only_an_authorised_dispatch() -> None:
+    starts: list[int] = []
+
+    async def start() -> bool | None:
+        starts.append(1)
+        return True
+
+    activation = llmq_gate.TurnActivation(start)
+    assert await activation.result() is False  # never started: nothing to report
+    activation()
+    activation()
+    assert await activation.result() is True
+    assert starts == [1]
+
+    async def not_ready() -> bool | None:
+        return False
+
+    async def broken() -> bool | None:
+        raise RuntimeError("bug")
+
+    for fn in (not_ready, broken):
+        other = llmq_gate.TurnActivation(fn)
+        other()
+        assert await other.result() is False
+
+
+@pytest.mark.asyncio
+async def test_an_activated_unmeasured_turn_is_never_cancelled_on_an_llmq_without_the_form(
+    tmp_path: Path,
+) -> None:
+    """llmq answers 409 to a cancel once a turn was activated; the turn did run."""
+    controller = Controller([], unmeasured_form=False)
+    tap = TurnStreamTap()
+    tap.feed(sse({"type": "response.created", "response": {"id": "r"}}))
+    async with client_for(controller) as client:
+        outcome = await close_codex_turn(
+            client, config(tmp_path), ADMITTED, turn_key="e" * 64, tap=tap, activated=True
+        )
+    assert outcome == "retained"
+    assert controller.settlements == [] and controller.cancellations == []
+
+
+# ----------------------------------------------------------------- turn attribution
+
+
+def test_turn_attribution_records_admitted_turns_and_in_flight_starts(tmp_path: Path) -> None:
+    record = llmq_gate.turn_admission_record
+    assert record(tmp_path, "turn_a") == "unknown"
+    llmq_gate.mark_turn_start_pending(tmp_path)
+    assert record(tmp_path, "turn_a") == "pending"  # may be the start in flight
+    llmq_gate.note_admitted_turn(tmp_path, "turn_a")
+    assert record(tmp_path, "turn_a") == "admitted"
+    assert record(tmp_path, "turn_b") == "unknown"  # recording clears the pending marker
+    llmq_gate.mark_turn_start_pending(tmp_path)
+    llmq_gate.clear_turn_start_pending(tmp_path)
+    assert record(tmp_path, "turn_b") == "unknown"
+
+
+def test_a_stale_pending_start_is_not_waited_for(tmp_path: Path) -> None:
+    llmq_gate.mark_turn_start_pending(tmp_path)
+    (tmp_path / llmq_gate.TURN_START_PENDING_FILE).write_text(
+        str(llmq_gate.time.time() - llmq_gate.TURN_START_PENDING_MAX_AGE_S - 1)
+    )
+    assert llmq_gate.turn_admission_record(tmp_path, "turn_a") == "unknown"
+
+
+def test_turn_attribution_stays_bounded_and_never_raises(tmp_path: Path) -> None:
+    for n in range(3000):
+        llmq_gate.note_admitted_turn(tmp_path, f"019a-turn-{n:06d}")
+    path = tmp_path / llmq_gate.ADMITTED_TURNS_FILE
+    assert path.stat().st_size <= 64 * 1024 + 64
+    assert llmq_gate.turn_admission_record(tmp_path, "019a-turn-002999") == "admitted"
+    # An unwritable bridge dir is logged, not raised into the executor.
+    missing = tmp_path / "gone"
+    llmq_gate.mark_turn_start_pending(missing)
+    llmq_gate.note_admitted_turn(missing, "turn_x")
+    assert llmq_gate.turn_admission_record(missing, "turn_x") == "unknown"

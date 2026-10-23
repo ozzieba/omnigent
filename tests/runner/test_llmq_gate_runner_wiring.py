@@ -12,10 +12,14 @@ REAL gate talking to llmq main's real app through an ASGI transport. Proves:
 - a non-Codex harness never consults the gate;
 - the model asked about is the harness's (override, spec, default), never the agent name;
 - reservations end on every exit: settled with measured usage, cancelled when the harness
-  was never reached (spawn failure, rejected delivery), and left alone (never settled with
-  placeholder zeros) when the turn ran with unknown usage, including an interrupt;
+  was never reached (spawn failure, rejected delivery), and settled unmeasured at llmq's
+  estimate (never with placeholder zeros) when the turn ran with unknown usage, including
+  an interrupt;
+- a verified reservation is activated once the harness starts the turn, and never when
+  the harness was not reached;
 - the gate is inert for a work-vertex launch; an unexpected gate fault still shows the
-  indicator and the turn runs.
+  indicator and the turn runs;
+- a direct ``?stream=true`` Codex turn goes through the same gate and close.
 """
 
 from __future__ import annotations
@@ -166,9 +170,19 @@ def wired(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(runner_app_mod, "_build_spawn_env_from_spec", lambda *a, **k: {})
     llmq = Llmq(tmp_path)
     server = FakeServer()
-    state: dict[str, Any] = {"gate_calls": 0, "sleeps": 0, "closes": [], "harness": None}
+    state: dict[str, Any] = {
+        "gate_calls": 0,
+        "sleeps": 0,
+        "closes": [],
+        "harness": None,
+        "activations": [],
+        # Off by default: the baseline tests model an llmq that cannot be asked to
+        # activate (outcomes as before activation existed); tests opt in.
+        "activate": False,
+    }
     real_gate = llmq_gate.gate_codex_turn
     real_close = llmq_gate.close_codex_turn
+    real_activate = getattr(llmq_gate, "activate_codex_turn", None)
 
     async def gate(client, config, **kwargs):
         state["gate_calls"] += 1
@@ -193,8 +207,19 @@ def wired(monkeypatch, tmp_path: Path):
         state["closes"].append((decision.reservation_id, outcome))
         return outcome
 
+    async def activate(client, config, decision, **kwargs):
+        if not state["activate"]:
+            state["activations"].append((decision.reservation_id, None))
+            return None
+        assert real_activate is not None
+        async with llmq.client() as c:
+            ready = await real_activate(c, config, decision, **kwargs)
+        state["activations"].append((decision.reservation_id, ready))
+        return ready
+
     monkeypatch.setattr(runner_app_mod, "gate_codex_turn", gate)
     monkeypatch.setattr(runner_app_mod, "close_codex_turn", close)
+    monkeypatch.setattr(runner_app_mod, "activate_codex_turn", activate, raising=False)
     return llmq, server, state
 
 
@@ -477,3 +502,146 @@ async def test_an_unexpected_gate_fault_runs_the_turn_with_the_indicator(
     assert [(p["quota_gate"]["state"], p["quota_gate"]["reason"]) for p in server.gate_posts] == [
         ("unverified", "gate_error")
     ]
+
+
+def _dispatch_authorized(llmq, reservation_id: str) -> bool:
+    metadata = json.loads(llmq.reservation(reservation_id)["metadata_json"])
+    return metadata.get("dispatch_authorized_at") is not None
+
+
+async def test_a_started_turn_is_activated_then_settled_with_its_usage(wired) -> None:
+    llmq, server, state = wired
+    state["activate"] = True
+    llmq.publish(33)
+    harness = RecordingHarness(chunks=DONE_WITH_USAGE_CHUNKS)
+    app = _runner(harness, state, _spec("codex"), server=server)
+    await _post(app, "conv_act", "count my tokens")
+    await _wait_turn("conv_act")
+    await _settle_bg()
+    rows = _reservations(llmq)
+    assert len(rows) == 1
+    assert state["activations"] == [(rows[0]["id"], True)]
+    assert _dispatch_authorized(llmq, rows[0]["id"])
+    assert state["closes"] == [(rows[0]["id"], "settled")]
+    assert rows[0]["status"] == "settled"
+
+
+@pytest.mark.parametrize("failure", ["spawn", "rejected"])
+async def test_a_turn_that_never_reached_the_harness_is_never_activated(wired, failure) -> None:
+    llmq, server, state = wired
+    state["activate"] = True
+    llmq.publish(33)
+
+    class FailingPM(FakePM):
+        async def get_client(self, conversation_id: str, harness_name: str, *, env=None):
+            raise RuntimeError("harness failed to start")
+
+    if failure == "spawn":
+        harness = RecordingHarness()
+        app = _runner(harness, state, _spec("codex"), server=server, pm=FailingPM(harness))
+    else:
+        harness = RecordingHarness(status_code=500)
+        app = _runner(harness, state, _spec("codex"), server=server)
+    await _post(app, f"conv_never_{failure}", "never dispatched")
+    await _wait_turn(f"conv_never_{failure}")
+    await _settle_bg()
+    rows = _reservations(llmq)
+    assert len(rows) == 1 and state["activations"] == []
+    assert not _dispatch_authorized(llmq, rows[0]["id"])
+    assert state["closes"] == [(rows[0]["id"], "cancelled")]
+    assert rows[0]["status"] == "cancelled"
+
+
+async def test_unmeasured_activated_turns_close_on_either_llmq(wired) -> None:
+    """With #1328 an activated unmeasured turn settles at its estimate. Without it the
+    turn can be neither settled unmeasured nor cancelled (409), so the first one keeps
+    its estimate for the lease and the runner stops activating: the next unmeasured
+    turn is released as before activation existed."""
+    llmq, server, state = wired
+    state["activate"] = True
+    llmq.publish(33)
+    harness = RecordingHarness()
+    app = _runner(harness, state, _spec("codex"), server=server)
+    for conv in ("conv_unm_1", "conv_unm_2"):
+        await _post(app, conv, "no usage reported")
+        await _wait_turn(conv)
+        await _settle_bg()
+    assert len(_reservations(llmq)) == 2 and len(state["closes"]) == 2
+    first, second = (rid for rid, _ in state["closes"])  # in turn order
+    status = {rid: llmq.reservation(rid)["status"] for rid in (first, second)}
+    if UNMEASURED_FORM:
+        assert state["activations"] == [(first, True), (second, True)]
+        assert state["closes"] == [(first, "estimated"), (second, "estimated")]
+        assert status == {first: "settled", second: "settled"}
+    else:
+        assert state["activations"] == [(first, True)]
+        assert state["closes"] == [(first, "retained"), (second, "released")]
+        assert status == {first: "active", second: "cancelled"}
+
+
+async def _post_stream(app, conv: str, text: str, *, model_override: str = "gpt-6.1-sol") -> str:
+    body: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_codex",
+        "model": "codex-agent",
+        "model_override": model_override,
+        "content": [{"type": "input_text", "text": text}],
+    }
+    async with _runner_test_client(app) as http:
+        response = await http.post(f"/v1/sessions/{conv}/events?stream=true", json=body)
+        assert response.status_code == 200, response.text
+        return response.text
+
+
+async def test_a_direct_stream_codex_turn_is_held_until_turbo_releases_it(wired) -> None:
+    """``?stream=true`` used to call the harness without the gate (review D3a)."""
+    llmq, server, state = wired
+    llmq.publish(95)
+    harness = RecordingHarness()
+
+    async def on_sleep(n: int) -> None:
+        if n == 2:
+            server.turbo = True
+
+    state["on_sleep"] = on_sleep
+    app = _runner(harness, state, _spec("codex"), server=server)
+    text = await _post_stream(app, "conv_stream_held", "original streamed prompt")
+    await _settle_bg()
+    assert "response.completed" in text
+    assert len(harness.bodies) == 1
+    assert "original streamed prompt" in json.dumps(harness.bodies[0]["content"])
+    assert [p["quota_gate"]["state"] for p in server.gate_posts] == [
+        "blocked",
+        "blocked",
+        "verified",
+    ]
+    assert [r["attempt"] for r in llmq.seen] == [0, 1, 2]
+    assert len(state["closes"]) == 1 and state["closes"][0][1] == UNMEASURED[0]
+    assert llmq.reservation(state["closes"][0][0])["status"] == UNMEASURED[1]
+
+
+async def test_a_direct_stream_codex_turn_activates_and_settles_its_usage(wired) -> None:
+    llmq, server, state = wired
+    state["activate"] = True
+    llmq.publish(33)
+    harness = RecordingHarness(chunks=DONE_WITH_USAGE_CHUNKS)
+    app = _runner(harness, state, _spec("codex-native"), server=server)
+    await _post_stream(app, "conv_stream_usage", "count my tokens")
+    await _settle_bg()
+    rows = _reservations(llmq)
+    assert len(rows) == 1 and len(harness.bodies) == 1
+    assert state["activations"] == [(rows[0]["id"], True)]
+    assert state["closes"] == [(rows[0]["id"], "settled")]
+    metadata = json.loads(rows[0]["metadata_json"])
+    assert (metadata["native_input_tokens"], metadata["native_output_tokens"]) == (140, 20)
+
+
+async def test_a_direct_stream_claude_turn_is_not_gated(wired) -> None:
+    llmq, server, state = wired
+    llmq.publish(95)
+    harness = RecordingHarness()
+    app = _runner(harness, state, _spec("claude-sdk"), server=server)
+    await _post_stream(app, "conv_stream_claude", "hi")
+    assert state["gate_calls"] == 0 and llmq.seen == [] and server.gate_posts == []
+    assert len(harness.bodies) == 1

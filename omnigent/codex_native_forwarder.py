@@ -10,6 +10,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -58,6 +59,9 @@ from omnigent.codex_native_elicitation import (
 )
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.json_types import JsonObject as _JsonObject
+
+if TYPE_CHECKING:
+    from omnigent.runner.llmq_goal_gate import GoalContinuationGate
 
 _logger = logging.getLogger(__name__)
 
@@ -416,6 +420,9 @@ class _CodexForwarderState:
         repeatedly as edits land; only the newest diff is kept and it is
         flushed once at the terminal turn boundary (see
         :func:`_handle_turn_diff_updated` / :func:`_flush_turn_diff`).
+    :param llmq_goal_gate: llmq admission for the thread's turns nobody admitted
+        before they started (goal continuations), when the runner's llmq gate is
+        provisioned; ``None`` otherwise.
     """
 
     model: str | None = None
@@ -437,6 +444,7 @@ class _CodexForwarderState:
     posted_terminal_launch_args: list[str] | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
+    llmq_goal_gate: GoalContinuationGate | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
@@ -1960,10 +1968,15 @@ async def supervise_forwarder(
             elicitation_tracker=_CodexElicitationTaskTracker(),
         )
         synced_items_log = bridge_dir / _SYNCED_ITEMS_LOG_NAME
+        from omnigent.runner.llmq_goal_gate import GoalContinuationGate
+
         forwarder_state = _CodexForwarderState(
             parent_session_id=session_id,
             codex_client=client,
             synced_items_log=synced_items_log,
+            # Goal-mode continuation turns start without a runner turn/start,
+            # so the runner's llmq gate never sees them (review D3b).
+            llmq_goal_gate=GoalContinuationGate.from_env(),
         )
         # Seed dedup from what earlier forwarders of this bridge mirrored, so
         # the post-subscribe backfill can fill a restart gap without re-posting.
@@ -2088,6 +2101,8 @@ async def supervise_forwarder(
             await target.delta_coalescer.close()
             await target.usage_coalescer.close()
             await target.elicitation_tracker.close()
+            if forwarder_state.llmq_goal_gate is not None:
+                await forwarder_state.llmq_goal_gate.aclose()
             subscribe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await subscribe_task
@@ -3563,6 +3578,18 @@ async def _maybe_handle_turn_event(
         if delta_coalescer is not None:
             await delta_coalescer.flush()
         await _handle_turn_started(client, session_id, bridge_dir, params)
+        if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
+            forwarder_state.llmq_goal_gate.turn_started(
+                session_id=session_id,
+                thread_id=_thread_id_from_params(params) or "",
+                turn_id=_turn_id_from_payload(params.get("turn"))
+                or _turn_id_from_payload(params)
+                or "",
+                bridge_dir=bridge_dir,
+                server=client,
+                codex=codex_client or forwarder_state.codex_client,
+                model=forwarder_state.model,
+            )
         if forwarder_state is not None:
             # A new turn opens a fresh reasoning block: the next reasoning
             # delta must emit ``response.reasoning.started`` again.
@@ -3578,6 +3605,8 @@ async def _maybe_handle_turn_event(
             )
         return True
     if method in {"turn/completed", "turn/failed"}:
+        if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
+            forwarder_state.llmq_goal_gate.turn_finished(_terminal_turn_id_from_params(params))
         await _handle_terminal_turn_boundary(
             client,
             session_id=session_id,
@@ -3592,6 +3621,8 @@ async def _maybe_handle_turn_event(
         )
         return True
     if method == "thread/tokenUsage/updated":
+        if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
+            forwarder_state.llmq_goal_gate.usage_updated(params)
         _handle_usage_update(usage_coalescer, params, forwarder_state)
         # Flush immediately so the web UI cost badge updates live mid-turn.
         # Codex emits these only every few seconds; the coalescer dedups, so the
