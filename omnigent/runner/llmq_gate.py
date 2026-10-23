@@ -22,15 +22,20 @@ llmq actor (``LLMQ_AGENT_ID``) AND the launch's quota route is ``personal-llmq``
 otherwise :func:`GateConfig.from_env` returns ``None`` and no turn is gated.
 See designs/CODEX_LLMQ_GATE_AND_TURBO.md.
 
-Reservation lifecycle (llmq has no "usage unmeasured" settlement, and a zero-token
-settlement would be stored as measured usage and feed its token-cost calibration):
+Reservation lifecycle (a zero-token settlement would be stored as measured usage
+and feed llmq's token-cost calibration, so it is never sent):
 
 * the turn never reached the harness (spawn failure, rejected delivery, interrupt
   before the first event) -> cancel the reservation, so the lease does not leak;
 * the turn ran and the harness reported real token usage -> settle with it;
-* the turn ran but usage is unknown -> cancel the reservation unmeasured. This is
-  deliberate under-reporting (llmq is not a security boundary and fails open), so
-  unmeasured estimates cannot pile up into false holds: see :func:`close_codex_turn`.
+* the turn ran but usage is unknown -> settle it ``usage_unmeasured`` at llmq's own
+  estimate (marked ``retained_estimate``; ozzieba/chatgpt-playground#1328). An llmq
+  without that form answers 422 and the reservation is cancelled instead. Any other
+  llmq fault leaves it for the lease to expire: see :func:`close_codex_turn`.
+
+Ledger throttling (pacing, share, window estimate) is waited out for at most
+``LLMQ_MAX_ADMISSION_DELAY_SECONDS`` in total, then the turn runs with the
+``llmq_<reason>`` indicator; only the credit-safety margin / exhaustion refusals hold.
 """
 
 from __future__ import annotations

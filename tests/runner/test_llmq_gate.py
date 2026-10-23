@@ -620,6 +620,32 @@ async def test_an_llmq_without_the_unmeasured_form_gets_a_cancel_instead(
     assert controller.cancellations == [{"turn_key": "e" * 64, "reservation_id": "res-9"}]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["http_500", "timeout"])
+async def test_an_llmq_fault_while_settling_unmeasured_never_raises_or_cancels(
+    tmp_path: Path, failure: str
+) -> None:
+    """Fail open: a 5xx or timeout on the close is not "old llmq", so no cancel fallback."""
+    cancels: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/cancellations"):
+            cancels.append(request.url.path)
+            return httpx.Response(200, json={})
+        if failure == "timeout":
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(500, json={"detail": "boom"})
+
+    tap = TurnStreamTap()
+    tap.feed(sse({"type": "response.created", "response": {"id": "r"}}))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        outcome = await close_codex_turn(
+            client, config(tmp_path), ADMITTED, turn_key="e" * 64, tap=tap
+        )
+    assert outcome == "none"
+    assert cancels == []
+
+
 def _ledger_denial(retry_after: float) -> dict[str, Any]:
     return {
         **admitted(),
