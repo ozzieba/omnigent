@@ -200,6 +200,8 @@ class GoalContinuationGate:
         # Off after the first "retained"/"released" close: that llmq cannot settle
         # an activated turn unmeasured, so activating would strand estimates.
         self._activate = True
+        # The forwarder's current app-server client; it replaces a dropped one.
+        self._codex: CodexRequester | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         # Long-lived waits (held re-checks, unused-admission expiry).
         self._waits: set[asyncio.Task[Any]] = set()
@@ -236,6 +238,14 @@ class GoalContinuationGate:
 
     # ----------------------------------------------------------- forwarder hooks
 
+    def set_codex(self, codex: CodexRequester) -> None:
+        """Use ``codex`` from now on: the forwarder reconnected to the app-server.
+
+        A hold outlives connections (it lasts until the quota resets or Turbo is
+        turned on), so it must not keep using the client it started with.
+        """
+        self._codex = codex
+
     def turn_started(
         self,
         *,
@@ -261,6 +271,7 @@ class GoalContinuationGate:
             self._turn_ended.pop(next(iter(self._turn_ended)))
         if codex is None:
             return
+        self._codex = codex
         self._spawn(
             self._admit_started_turn(
                 session_id=session_id,
@@ -483,6 +494,8 @@ class GoalContinuationGate:
         try:
             while True:
                 await self._sleep(self._config.recheck_seconds)
+                if self._codex is not None:
+                    codex = self._codex  # the client after any reconnect
                 status = await _goal_status(codex, thread_id)
                 if status == _GOAL_FAULT:
                     # Codex could not say: the goal is still paused by us, so keep

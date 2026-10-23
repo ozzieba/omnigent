@@ -2083,6 +2083,8 @@ async def supervise_forwarder(
                     await client.close()
                 client = new_client
                 forwarder_state.codex_client = client
+                if forwarder_state.llmq_goal_gate is not None:
+                    forwarder_state.llmq_goal_gate.set_codex(client)
                 # The thread was already subscribed once, so its rollout
                 # normally exists; keep the activity signal's state.
                 was_active = thread_active.is_set()
@@ -2094,6 +2096,9 @@ async def supervise_forwarder(
                     subscribe_task, forwarder_state, target.thread_id
                 )
         finally:
+            # First, so a failing close below cannot leave a hold task running.
+            if forwarder_state.llmq_goal_gate is not None:
+                await forwarder_state.llmq_goal_gate.aclose()
             if mcp_settle_timer is not None:
                 mcp_settle_timer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -2101,8 +2106,6 @@ async def supervise_forwarder(
             await target.delta_coalescer.close()
             await target.usage_coalescer.close()
             await target.elicitation_tracker.close()
-            if forwarder_state.llmq_goal_gate is not None:
-                await forwarder_state.llmq_goal_gate.aclose()
             subscribe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await subscribe_task

@@ -592,3 +592,37 @@ async def test_the_gate_hears_a_turn_end_after_its_idle_edge_is_posted(tmp_path:
                 forwarder_state=state,
             )
     assert seen_at_finish and "idle" in seen_at_finish[0], (seen_at_finish, statuses)
+
+
+async def test_a_hold_survives_a_codex_reconnect(setup) -> None:
+    """The forwarder replaces a dropped app-server client; the hold must follow it.
+
+    A hold can last until the quota resets. After a reconnect the client captured
+    at turn/started is closed, so re-checking through it would fault forever and
+    the Turbo toggle would never release the goal (#128 re-review R1).
+    """
+    llmq, config, bridge = setup
+    llmq.publish(95)
+    old, server = FakeCodex(), FakeServer()
+    new = FakeCodex(goal_status="paused")
+
+    async def on_sleep(n: int) -> None:
+        if n == 1:
+            old.fail.update({"thread/goal/get", "thread/goal/set", "turn/interrupt"})  # closed
+            gate.set_codex(new)  # the forwarder installs the reconnected client
+        elif n == 2:
+            server.turbo = True
+
+    gate = make_gate(llmq, config, [], on_sleep)
+    async with server.client() as ap:
+        start(gate, old, ap, bridge, "t1")
+        await asyncio.sleep(0.05)
+        gate.turn_finished("t1")
+        for _ in range(200):
+            if new.goal_status == "active":
+                break
+            await asyncio.sleep(0.01)
+        await gate.drain()
+        await gate.aclose()
+    assert new.goal_status == "active"
+    assert new.calls("thread/goal/set")[-1] == {"threadId": THREAD, "status": "active"}
