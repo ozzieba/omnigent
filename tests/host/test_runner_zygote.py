@@ -56,6 +56,23 @@ def _fork_env(exit_code: int) -> dict[str, str]:
     }
 
 
+@pytest.fixture(autouse=True)
+def _patient_zygote_start(monkeypatch):
+    """Give the zygote's first ping time to survive a cold, loaded CI box.
+
+    ``ZygoteManager.start()`` pings the zygote right after spawning it, and the
+    zygote answers only once it has imported the whole runner graph. In
+    production that is ~1-2 s, but a cold interpreter on a CPU-starved xdist
+    runner has been observed taking 25+ s, brushing the 30 s production
+    ``_CONTROL_TIMEOUT_S`` safety net and erroring the fixture with
+    ``ZygoteUnavailable: runner zygote control error: timed out``. The timeout
+    is a wedge guard, not behaviour under test, so widen it here.
+
+    :param monkeypatch: Fixture used to widen the control timeout.
+    """
+    monkeypatch.setattr("omnigent.host.runner_zygote._CONTROL_TIMEOUT_S", 180.0)
+
+
 @pytest.fixture
 def manager(tmp_path):
     """A started :class:`ZygoteManager`, stopped on teardown.

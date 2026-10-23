@@ -27,3 +27,26 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda *a, **k: None,
     )
     monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a CLI unit test spawn a real host daemon or local server.
+
+    ``omnigent claude`` / ``codex`` / ... call ``cli._ensure_backend`` before
+    handing off to the (stubbed) native wrapper. Un-stubbed, that starts a real
+    host daemon plus a local Omnigent server (or a remote tunnel for
+    ``--server https://...``) from inside a unit test, which takes 10-30 s on a
+    loaded runner and fails with "host daemon for local did not claim its
+    registry record within 10s". Resolve the backend to the requested server
+    (or a dead loopback URL in local mode) instead.
+
+    ``autouse=True`` keeps this on by default. Tests that assert on
+    ``_ensure_backend`` itself import it directly (``from omnigent.cli import
+    _ensure_backend``) and are unaffected; tests that need a specific return
+    value re-patch ``omnigent.cli._ensure_backend`` themselves.
+    """
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda server=None, *_a, **_k: server or "http://localhost:0",
+    )

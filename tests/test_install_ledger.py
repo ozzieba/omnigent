@@ -120,6 +120,11 @@ def test_backfill_skips_write_when_content_is_unchanged(tmp_path: Path, monkeypa
     (state / "installation_id").write_text("install-123\n")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+    # ``generator.version`` comes from running ``omnigent --version`` under a 5 s
+    # timeout; on a loaded runner one build can time out to "unknown" while the
+    # other succeeds, which is a (spurious) content change. Pin it so the test
+    # only exercises the unchanged-content short-circuit.
+    monkeypatch.setattr(install_ledger, "_version_for", lambda _path: "omnigent test")
 
     existing = install_ledger.new_ledger(source="backfill", strategy="fast-backfill", deep=False)
     install_ledger.write_ledger(existing, path=install_ledger.backfill_ledger_path())
