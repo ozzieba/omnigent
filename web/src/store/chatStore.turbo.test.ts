@@ -82,6 +82,9 @@ describe("Turbo write ordering (R2-4)", () => {
   beforeEach(() => {
     updateSessionMock.mockReset();
     getSessionSlimMock.mockReset();
+    // A failed newest write reads Turbo back; by default that read fails, which
+    // keeps the rollback, so tests that do not care about it stay deterministic.
+    getSessionSlimMock.mockRejectedValue(new Error("not mocked"));
   });
 
   it("in-order responses: on then off ends off", async () => {
@@ -153,6 +156,41 @@ describe("Turbo write ordering (R2-4)", () => {
     b.reject(new Error("500"));
     await expect(pb).rejects.toThrow("500");
     expect(useChatStore.getState().turbo).toBe(true);
+  });
+
+  it("after the newest write fails, the switch is read back from the server (older write applied)", async () => {
+    // Off; the user flips On (A, slow) then Off (B). B fails and rolls back to Off;
+    // A then lands and the server holds On. Only the server can say which write
+    // stuck, so the switch is read back once nothing is in flight.
+    bindConversationForTest("conv_seq_newest_fail_old_ok", { turbo: false });
+    const [a, b] = queuePatches(2);
+    getSessionSlimMock.mockResolvedValueOnce({ id: "conv_seq_newest_fail_old_ok", turbo: true });
+    const pa = useChatStore.getState().setTurbo(true);
+    const pb = useChatStore.getState().setTurbo(false);
+    b.reject(new Error("500"));
+    await expect(pb).rejects.toThrow("500");
+    expect(useChatStore.getState().turbo).toBe(false);
+    expect(getSessionSlimMock).not.toHaveBeenCalled(); // A still in flight
+    a.resolve({ id: "conv_seq_newest_fail_old_ok", turbo: true });
+    await pa;
+    await vi.waitFor(() => expect(useChatStore.getState().turbo).toBe(true));
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("after the newest write fails, the switch is read back from the server (failed reply was applied)", async () => {
+    // On; A = Off (slow), B = On. The server applies A then B and holds On, but
+    // B's reply is lost (504). A's late echo (Off) must not decide the switch.
+    bindConversationForTest("conv_seq_ambiguous_fail", { turbo: true });
+    const [a, b] = queuePatches(2);
+    getSessionSlimMock.mockResolvedValueOnce({ id: "conv_seq_ambiguous_fail", turbo: true });
+    const pa = useChatStore.getState().setTurbo(false);
+    const pb = useChatStore.getState().setTurbo(true);
+    b.reject(new Error("504"));
+    await expect(pb).rejects.toThrow("504");
+    a.resolve({ id: "conv_seq_ambiguous_fail", turbo: false });
+    await pa;
+    await vi.waitFor(() => expect(getSessionSlimMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(useChatStore.getState().turbo).toBe(true));
   });
 
   it("the routing PATCH echo does not override a Turbo toggle made while it was in flight", async () => {

@@ -2083,6 +2083,8 @@ async def supervise_forwarder(
                     await client.close()
                 client = new_client
                 forwarder_state.codex_client = client
+                if forwarder_state.llmq_goal_gate is not None:
+                    forwarder_state.llmq_goal_gate.set_codex(client)
                 # The thread was already subscribed once, so its rollout
                 # normally exists; keep the activity signal's state.
                 was_active = thread_active.is_set()
@@ -2094,19 +2096,23 @@ async def supervise_forwarder(
                     subscribe_task, forwarder_state, target.thread_id
                 )
         finally:
-            if mcp_settle_timer is not None:
-                mcp_settle_timer.cancel()
+            try:
+                if mcp_settle_timer is not None:
+                    mcp_settle_timer.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await mcp_settle_timer
+                await target.delta_coalescer.close()
+                await target.usage_coalescer.close()
+                await target.elicitation_tracker.close()
+                subscribe_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await mcp_settle_timer
-            await target.delta_coalescer.close()
-            await target.usage_coalescer.close()
-            await target.elicitation_tracker.close()
-            if forwarder_state.llmq_goal_gate is not None:
-                await forwarder_state.llmq_goal_gate.aclose()
-            subscribe_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await subscribe_task
-            await client.close()
+                    await subscribe_task
+                await client.close()
+            finally:
+                # Last (its drain can wait on llmq), but even if a close above fails,
+                # so no hold task outlives the forwarder.
+                if forwarder_state.llmq_goal_gate is not None:
+                    await forwarder_state.llmq_goal_gate.aclose()
 
 
 async def _await_backfilling_subscription(
@@ -3605,20 +3611,24 @@ async def _maybe_handle_turn_event(
             )
         return True
     if method in {"turn/completed", "turn/failed"}:
-        if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
-            forwarder_state.llmq_goal_gate.turn_finished(_terminal_turn_id_from_params(params))
-        await _handle_terminal_turn_boundary(
-            client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            method=method,
-            params=params,
-            usage_coalescer=usage_coalescer,
-            delta_coalescer=delta_coalescer,
-            elicitation_tracker=elicitation_tracker,
-            codex_client=codex_client,
-            forwarder_state=forwarder_state,
-        )
+        try:
+            await _handle_terminal_turn_boundary(
+                client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                method=method,
+                params=params,
+                usage_coalescer=usage_coalescer,
+                delta_coalescer=delta_coalescer,
+                elicitation_tracker=elicitation_tracker,
+                codex_client=codex_client,
+                forwarder_state=forwarder_state,
+            )
+        finally:
+            # After the turn's own idle edge, so a held continuation's status is
+            # posted on top of it rather than under it.
+            if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
+                forwarder_state.llmq_goal_gate.turn_finished(_terminal_turn_id_from_params(params))
         return True
     if method == "thread/tokenUsage/updated":
         if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:

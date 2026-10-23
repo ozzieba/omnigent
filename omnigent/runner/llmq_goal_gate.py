@@ -32,7 +32,8 @@ is ``active``, :class:`GoalContinuationGate`:
   interrupting it without a pause would only make Codex start the next
   continuation at once.
 
-Every Codex or llmq call is bounded (5 s) and fails open; the forwarder's event
+Every Codex or llmq call and the Turbo read are bounded (5 s) and fail open; status
+posts use the forwarder's server client and its own timeout. The forwarder's event
 loop never waits on this module (each ``turn/started`` is handled in a task).
 """
 
@@ -111,9 +112,15 @@ async def _codex_result(
     return result if isinstance(result, dict) else {}
 
 
+_GOAL_FAULT = "<codex fault>"  # not a Codex goal status: Codex could not say
+
+
 async def _goal_status(codex: CodexRequester, thread_id: str) -> str | None:
+    """The thread's goal status; ``None`` without a goal, ``_GOAL_FAULT`` on a fault."""
     result = await _codex_result(codex, "thread/goal/get", {"threadId": thread_id})
-    goal = result.get("goal") if result is not None else None
+    if result is None:
+        return _GOAL_FAULT
+    goal = result.get("goal")
     status = goal.get("status") if isinstance(goal, dict) else None
     return status if isinstance(status, str) else None
 
@@ -121,7 +128,7 @@ async def _goal_status(codex: CodexRequester, thread_id: str) -> str | None:
 async def _read_turbo(server: httpx.AsyncClient, session_id: str) -> bool:
     """The session's current Turbo flag; off when the server cannot say."""
     try:
-        resp = await server.get(f"/v1/sessions/{session_id}")
+        resp = await server.get(f"/v1/sessions/{session_id}", timeout=_CODEX_TIMEOUT_S)
         return resp.status_code == 200 and resp.json().get("turbo") is True
     except (httpx.HTTPError, ValueError, AttributeError):
         return False
@@ -190,6 +197,12 @@ class GoalContinuationGate:
         self._attribution_wait = attribution_wait_seconds
         self._grant_ttl = grant_ttl_seconds
         self._interrupt_settle = interrupt_settle_seconds
+        # Off after the first "retained"/"released" close: that llmq cannot settle
+        # an activated turn unmeasured, so activating would strand estimates.
+        self._activate = True
+        # The forwarder's current app-server client; it replaces a dropped one.
+        self._codex: CodexRequester | None = None
+        self._closed = False  # after aclose(), late events start no work
         self._tasks: set[asyncio.Task[Any]] = set()
         # Long-lived waits (held re-checks, unused-admission expiry).
         self._waits: set[asyncio.Task[Any]] = set()
@@ -226,6 +239,14 @@ class GoalContinuationGate:
 
     # ----------------------------------------------------------- forwarder hooks
 
+    def set_codex(self, codex: CodexRequester) -> None:
+        """Use ``codex`` from now on: the forwarder reconnected to the app-server.
+
+        A hold outlives connections (it lasts until the quota resets or Turbo is
+        turned on), so it must not keep using the client it started with.
+        """
+        self._codex = codex
+
     def turn_started(
         self,
         *,
@@ -238,7 +259,7 @@ class GoalContinuationGate:
         model: str | None,
     ) -> None:
         """A ``turn/started`` for the forwarder's thread: classify and admit it off-loop."""
-        if not turn_id or not thread_id:
+        if self._closed or not turn_id or not thread_id:
             return
         # Turns of a thread run one at a time: a still-tracked earlier turn ended
         # without a terminal event reaching us (reconnect), so close it unmeasured.
@@ -251,6 +272,7 @@ class GoalContinuationGate:
             self._turn_ended.pop(next(iter(self._turn_ended)))
         if codex is None:
             return
+        self._codex = codex
         self._spawn(
             self._admit_started_turn(
                 session_id=session_id,
@@ -266,6 +288,8 @@ class GoalContinuationGate:
 
     def usage_updated(self, params: object) -> None:
         """A ``thread/tokenUsage/updated`` for the forwarder's thread."""
+        if self._closed:
+            return
         turn_id = params.get("turnId") if isinstance(params, dict) else None
         counts = self._meter_turn is not None and (
             not isinstance(turn_id, str) or not turn_id or turn_id == self._meter_turn
@@ -274,7 +298,7 @@ class GoalContinuationGate:
 
     def turn_finished(self, turn_id: str | None) -> None:
         """A ``turn/completed`` / ``turn/failed`` for the forwarder's thread."""
-        if not turn_id:
+        if self._closed or not turn_id:
             return
         usage = None
         if turn_id == self._meter_turn:
@@ -298,6 +322,7 @@ class GoalContinuationGate:
 
     async def aclose(self) -> None:
         """Stop holding, and end every reservation this gate still owns."""
+        self._closed = True
         for task in list(self._waits):
             task.cancel()
         for turn_id in list(self._tracked):
@@ -307,6 +332,8 @@ class GoalContinuationGate:
         pending = list(self._tasks)
         if pending:
             await asyncio.wait(pending, timeout=2 * _CODEX_TIMEOUT_S + 1)
+        for task in list(self._waits):  # backstop: a wait started during the drain
+            task.cancel()
         if self._owns_http and self._http is not None:
             await self._http.aclose()
 
@@ -334,9 +361,9 @@ class GoalContinuationGate:
         model: str,
     ) -> None:
         try:
-            if await self._attributed(bridge_dir, turn_id):
+            if self._closed or await self._attributed(bridge_dir, turn_id):
                 return
-            if await _goal_status(codex, thread_id) != "active":
+            if self._closed or await _goal_status(codex, thread_id) != "active":
                 # Not a goal continuation (or the goal cannot be read): out of
                 # this gate's scope; such turns are left as they were.
                 return
@@ -380,7 +407,8 @@ class GoalContinuationGate:
         activation = TurnActivation(
             lambda: activate_codex_turn(self._client(), self._config, decision, turn_key=key)
         )
-        activation()  # the turn is already running
+        if self._activate:
+            activation()  # the turn is already running
         self._tracked[turn_id] = _Tracked(session_id, decision, key, activation)
         if turn_id in self._finished:
             self._close_later(turn_id, self._finished.pop(turn_id))
@@ -402,6 +430,11 @@ class GoalContinuationGate:
             tap=tap,
             activated=await tracked.activation.result(),
         )
+        if outcome in ("retained", "released") and self._activate:
+            self._activate = False
+            _logger.warning(
+                "llmq goal gate: llmq has no unmeasured settlement; activation turned off"
+            )
         _logger.info(
             "llmq goal gate session=%s reservation %s (%s)",
             tracked.session_id,
@@ -425,6 +458,8 @@ class GoalContinuationGate:
         decision: GateDecision,
         turbo: bool,
     ) -> None:
+        if self._closed:
+            return  # the forwarder stopped while this turn was being admitted
         paused = await _codex_result(
             codex, "thread/goal/set", {"threadId": thread_id, "status": "paused"}
         )
@@ -439,6 +474,8 @@ class GoalContinuationGate:
                 await asyncio.wait_for(ended.wait(), self._interrupt_settle)
         await _post_status(server, session_id, decision, turbo)
         running = self._holds.get(session_id)
+        if self._closed:
+            return  # no hold may outlive the gate
         if running is None or running.done():
             self._holds[session_id] = self._spawn(
                 self._hold_loop(
@@ -467,7 +504,14 @@ class GoalContinuationGate:
         try:
             while True:
                 await self._sleep(self._config.recheck_seconds)
-                if await _goal_status(codex, thread_id) != "paused":
+                if self._codex is not None:
+                    codex = self._codex  # the client after any reconnect
+                status = await _goal_status(codex, thread_id)
+                if status == _GOAL_FAULT:
+                    # Codex could not say: the goal is still paused by us, so keep
+                    # holding (ending here would strand it paused for good).
+                    continue
+                if status != "paused":
                     # Resumed or cleared by someone else: the hold is over (a
                     # resumed continuation is admitted again at turn/started).
                     return
