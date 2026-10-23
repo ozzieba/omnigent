@@ -3605,20 +3605,24 @@ async def _maybe_handle_turn_event(
             )
         return True
     if method in {"turn/completed", "turn/failed"}:
-        if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
-            forwarder_state.llmq_goal_gate.turn_finished(_terminal_turn_id_from_params(params))
-        await _handle_terminal_turn_boundary(
-            client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            method=method,
-            params=params,
-            usage_coalescer=usage_coalescer,
-            delta_coalescer=delta_coalescer,
-            elicitation_tracker=elicitation_tracker,
-            codex_client=codex_client,
-            forwarder_state=forwarder_state,
-        )
+        try:
+            await _handle_terminal_turn_boundary(
+                client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                method=method,
+                params=params,
+                usage_coalescer=usage_coalescer,
+                delta_coalescer=delta_coalescer,
+                elicitation_tracker=elicitation_tracker,
+                codex_client=codex_client,
+                forwarder_state=forwarder_state,
+            )
+        finally:
+            # After the turn's own idle edge, so a held continuation's status is
+            # posted on top of it rather than under it.
+            if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
+                forwarder_state.llmq_goal_gate.turn_finished(_terminal_turn_id_from_params(params))
         return True
     if method == "thread/tokenUsage/updated":
         if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
