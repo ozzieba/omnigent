@@ -774,7 +774,11 @@ export interface ChatActions {
    * default. No-ops when there is no active conversation.
    */
   setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
-  /** Flip this session's Turbo switch: optimistic, PATCHes, rolls back on error. */
+  /**
+   * Flip this session's Turbo switch: optimistic, PATCHes, rolls back on error.
+   * Only the newest write settles the switch; a write superseded by a later
+   * toggle neither applies its echo nor rolls back (and resolves on failure).
+   */
   setTurbo: (on: boolean) => Promise<void>;
   /**
    * Set the active session's sub-agent routing switch — optimistic local
@@ -1180,6 +1184,45 @@ function savePickerPref(key: string, value: string | null): void {
 let modelPickRevision = 0;
 
 /**
+ * Per-conversation ledger of Turbo writes. Two quick toggles can be answered
+ * out of order, so only the newest write may settle the switch: an older
+ * write's echo or rollback would otherwise resurrect a value the user already
+ * replaced (on→off ending ON while the server holds OFF). Other replies that
+ * carry `turbo` (the routing PATCH echo, an override refresh) consult it too.
+ *
+ * - `seq`: bumped by every write, so a reply can tell whether it is still the
+ *   newest (never reset; a conversation's entry lives as long as the page).
+ * - `inFlight`: writes not yet answered.
+ * - `settled` / `settledSeq`: the server's last known value and the write it
+ *   came from — the switch when a burst of writes began, then the echo of the
+ *   newest answered write (a late echo of an older one never replaces it). A
+ *   failed newest write rolls back to it, not to an older write's
+ *   still-unconfirmed optimistic value.
+ */
+interface TurboWriteLedger {
+  seq: number;
+  inFlight: number;
+  settled: boolean;
+  settledSeq: number;
+}
+const turboWrites = new Map<string, TurboWriteLedger>();
+
+/**
+ * Snapshot the Turbo ledger before a request whose reply carries `turbo`.
+ *
+ * :param conversationId: conversation the request targets.
+ * :returns: a check, run on the reply, that is true only when no Turbo write
+ *     overlapped the request (none in flight when it started, none issued
+ *     since) — otherwise the reply's `turbo` may predate the user's toggle.
+ */
+function turboReplyGuard(conversationId: string): () => boolean {
+  const before = turboWrites.get(conversationId);
+  const seq = before?.seq ?? 0;
+  const quiet = (before?.inFlight ?? 0) === 0;
+  return () => quiet && (turboWrites.get(conversationId)?.seq ?? 0) === seq;
+}
+
+/**
  * Make `id` the live, active conversation and return setters bound to its entry.
  *
  * Test-only seam. Production reaches this state through `switchTo` /
@@ -1232,6 +1275,7 @@ export function initChatStore(client: QueryClient): void {
   // the next one (production calls this once at boot; tests call it per case).
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
+  turboWrites.clear();
   queryClient = client;
 }
 
@@ -2304,17 +2348,40 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   setTurbo: async (on) => {
     const { conversationId } = get();
     if (!conversationId) return;
-    const previous = get().turbo;
+    let ledger = turboWrites.get(conversationId);
+    if (ledger === undefined) {
+      ledger = { seq: 0, inFlight: 0, settled: false, settledSeq: 0 };
+      turboWrites.set(conversationId, ledger);
+    }
+    // The first write of a burst starts from the switch's current (settled)
+    // value; see `turboWrites`.
+    if (ledger.inFlight === 0) {
+      ledger.settled = get().turbo;
+      ledger.settledSeq = ledger.seq;
+    }
+    ledger.seq += 1;
+    ledger.inFlight += 1;
+    const seq = ledger.seq;
     // Pin the target like the routing switch does: the PATCH can outlive a
     // switch away, and the rollback must land on the conversation it belongs to.
     const patchSet = setterFor(conversationId);
     patchSet({ turbo: on });
     try {
       const session = await updateSession(conversationId, { turbo: on });
-      patchSet({ turbo: session.turbo ?? false });
+      const turbo = session.turbo ?? false;
+      if (seq > ledger.settledSeq) {
+        ledger.settled = turbo;
+        ledger.settledSeq = seq;
+      }
+      if (ledger.seq === seq) patchSet({ turbo });
     } catch (err) {
-      patchSet({ turbo: previous });
+      // A newer write owns the switch now; this failure changes nothing the
+      // user still asked for, so neither roll back nor report it.
+      if (ledger.seq !== seq) return;
+      patchSet({ turbo: ledger.settled });
       throw err;
+    } finally {
+      ledger.inFlight -= 1;
     }
   },
 
@@ -2336,6 +2403,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // backgrounded conversation showing an optimistic value the server rejected,
     // with no re-bind on return to correct it.
     const patchSet = setterFor(conversationId);
+    // The echo also carries `turbo`; it must not undo a Turbo toggle made
+    // while this PATCH was in flight (see `turboWrites`).
+    const turboReplyFresh = turboReplyGuard(conversationId);
     // Optimistic flip so the pill responds instantly; the PATCH
     // response (or the rollback below) is the settled truth.
     patchSet({
@@ -2349,7 +2419,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       });
       patchSet({
         costControlModeOverride: session.costControlModeOverride ?? null,
-        turbo: session.turbo ?? false,
+        ...(turboReplyFresh() ? { turbo: session.turbo ?? false } : {}),
         ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
       });
     } catch (err) {
@@ -2387,6 +2457,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   refreshSessionOverrides: async () => {
     const { conversationId } = get();
     if (!conversationId) return;
+    // Same overlap rule as the routing echo: a Turbo toggle made while this
+    // read was in flight is newer than the snapshot it returns.
+    const turboReplyFresh = turboReplyGuard(conversationId);
     let session: Session;
     try {
       // Deliberately NOT through `queryClient` — the two switches this reads
@@ -2403,7 +2476,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (get().conversationId !== conversationId) return;
     setActive({
       costControlModeOverride: session.costControlModeOverride ?? null,
-      turbo: session.turbo ?? false,
+      ...(turboReplyFresh() ? { turbo: session.turbo ?? false } : {}),
       subagentRoutingOverride: session.subagentRoutingOverride ?? null,
     });
   },

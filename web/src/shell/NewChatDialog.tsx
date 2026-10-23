@@ -48,6 +48,7 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
+import { TURBO_DESCRIPTION, TurboChip } from "@/components/TurboControls";
 import {
   Command,
   CommandEmpty,
@@ -268,9 +269,6 @@ const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
 // Agents whose bundled skills render as always-visible pills under the
 // landing composer. Deliberately an allowlist while the pattern proves
 // out — other agents keep the "/" menu as the only skill surface.
-/** Shown beside the Turbo switch: what it allows, in one line. */
-const TURBO_DESCRIPTION =
-  "Let this session's Codex turns use paid credits past the subscription margin";
 const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 
 function createdHarnessOptions({
@@ -3126,6 +3124,13 @@ export function NewChatLandingScreen() {
     (pickedHarness === AUTO_HARNESS_ID &&
       selectedAgent?.harness != null &&
       selectedAgent.harness in brainHarnessLabelsAll);
+  // The create call sends `turbo: true` under exactly this gate (see the create
+  // body); while it holds, the landing screen shows the paid-credits chip so the
+  // choice reads back without hovering the gear.
+  const turboArmed =
+    !smartRoutingHarnessSelected &&
+    nativeCodingAgentForAvailableAgent(selectedAgent)?.harness === "codex-native" &&
+    pickedTurbo;
   const configSummary = useMemo((): { label: string; value: string }[] => {
     if (smartRoutingHarnessSelected) {
       // Top-level Smart Routing's modal is the locked Permissions row alone, so
@@ -5114,6 +5119,7 @@ export function NewChatLandingScreen() {
                 />
               </div>
               <div className="flex items-center gap-0.5 md:gap-2">
+                {turboArmed && <TurboChip testId="new-chat-landing-turbo-chip" className="mr-1" />}
                 <div className="flex items-center rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
                   {/* Agent / harness picker — selects the agent or harness only.
                     Its run-config knobs (model / effort / permission mode for
