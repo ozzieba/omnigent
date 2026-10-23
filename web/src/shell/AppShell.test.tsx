@@ -246,7 +246,7 @@ const useSessionAgentMock = vi.mocked(useSessionAgent);
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
-import { useChatStore } from "@/store/chatStore";
+import { bindConversationForTest, useChatStore } from "@/store/chatStore";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
@@ -3967,5 +3967,100 @@ describe("Terminal-first shells — opening a shell from the mobile drawer", () 
     const probe = screen.getByTestId("view-probe");
     expect(probe).toHaveAttribute("data-view", "terminal");
     expect(probe).toHaveAttribute("data-terminal-view-key", "terminal:terminal_tui_main");
+  });
+});
+
+// R2-1: in a terminal-first session's Terminal view the composer — which
+// carries the Turbo chip in Chat view — is unmounted, so the header must show
+// the paid-credits state for a Codex session with Turbo on.
+describe("AppShell header Turbo chip in Terminal view", () => {
+  afterEach(() => {
+    bindConversationForTest(null);
+  });
+
+  // Owner by default; a row with no level reads as read-only once the list loads.
+  const codexTerminal = (permission_level = 4) =>
+    mockConversations([
+      {
+        id: "conv_codex",
+        permission_level,
+        labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui" },
+      },
+    ]);
+
+  it("shows the chip, with its toggle, for a Codex session with Turbo on", () => {
+    codexTerminal();
+    bindConversationForTest("conv_codex", { turbo: true });
+
+    renderShell("/c/conv_codex?view=terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    expect(screen.getByTestId("header-turbo-chip").textContent).toMatch(/paid credits/);
+    expect(screen.getByTestId("header-turbo-chip-trigger")).toBeTruthy();
+  });
+
+  it("leaves the chip to the composer in Chat view", () => {
+    codexTerminal();
+    bindConversationForTest("conv_codex", { turbo: true });
+
+    renderShell("/c/conv_codex?view=chat");
+
+    expect(screen.queryByTestId("header-turbo-chip")).toBeNull();
+  });
+
+  it("shows the chip for a label-less session whose snapshot resolves to codex-native", () => {
+    mockConversations([]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_custom_codex",
+        agentId: "ag_custom",
+        agentName: "my-codex",
+        runnerId: null,
+        status: "idle",
+        createdAt: 1_700_000_000,
+        title: "Custom Codex",
+        labels: { "omnigent.ui": "terminal" },
+        harness: "codex-native",
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: null,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    });
+    bindConversationForTest("conv_custom_codex", { turbo: true });
+
+    renderShell("/c/conv_custom_codex?view=terminal");
+
+    expect(screen.getByTestId("header-turbo-chip")).toBeTruthy();
+  });
+
+  it("shows no chip for a non-Codex native session, even with the flag set", () => {
+    mockConversations([
+      {
+        id: "conv_claude",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui" },
+      },
+    ]);
+    bindConversationForTest("conv_claude", { turbo: true });
+
+    renderShell("/c/conv_claude?view=terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    expect(screen.queryByTestId("header-turbo-chip")).toBeNull();
+  });
+
+  it("gives a read-only viewer the chip without the toggle", () => {
+    codexTerminal(1);
+    bindConversationForTest("conv_codex", { turbo: true });
+
+    renderShell("/c/conv_codex?view=terminal");
+
+    expect(screen.getByTestId("header-turbo-chip")).toBeTruthy();
+    expect(screen.queryByTestId("header-turbo-chip-trigger")).toBeNull();
   });
 });

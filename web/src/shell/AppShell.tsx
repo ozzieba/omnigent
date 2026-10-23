@@ -19,7 +19,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isIOSShell,
@@ -105,6 +105,7 @@ import {
 } from "./TerminalFirstContext";
 import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
+import { isCodexTurboSession } from "@/components/TurboControls";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "@/components/ui/sonner";
@@ -617,6 +618,19 @@ export function AppShell() {
   // Claude-native sub-agents have no terminal of their own — the parent
   // owns the tmux pane.
   const isClaudeNativeSubagent = wrapperLabel === "claude-code-native-ui-subagent";
+  // The per-session Turbo switch applies to Codex sessions only. The header
+  // shows its chip (and switch) while a terminal-first session's Terminal view
+  // has unmounted the composer that carries them in Chat view. Same capability
+  // source as ChatPage's composer gate: the snapshot wins once loaded. Toggling
+  // is an edit-level PATCH on the server.
+  const turboControl =
+    conversationId &&
+    isCodexTurboSession({
+      labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
+      harness: activeSession?.harness ?? null,
+    })
+      ? { canToggle: isEditorLevel(permissionLevel) }
+      : null;
   // Hide shells (the mobile Shells drawer entry) only for claude-native
   // sub-agents — they have no terminals of their own (the parent owns the
   // tmux pane). Native top-level sessions get shells like SDK ones; their
@@ -1963,6 +1977,7 @@ export function AppShell() {
                     onOpenSubagents: openSubagentsPanel,
                     onOpenMainExecutionLog: openMainExecutionLog,
                   }}
+                  turboControl={turboControl}
                 />
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
                   <Outlet />
