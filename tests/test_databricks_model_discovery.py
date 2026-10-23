@@ -340,6 +340,8 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
             {"name": "model-services/system.ai.gpt-5-5"},
             {"name": "model-services/system.ai.gpt-5-6-luna"},
             {"name": "model-services/system.ai.gpt-5-6-sol"},
+            {"name": "model-services/system.ai.gpt-6-luna"},
+            {"name": "model-services/system.ai.gpt-6-1-sol"},
             {"name": "model-services/system.ai.gpt-6-1"},
             {"name": "model-services/system.ai.kimi-k2"},
             {"name": "model-services/system.ai.claude-opus-5"},
@@ -347,12 +349,14 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
     )
 
     assert servable == (
-        # Curated (cheapest-safe-first) beats a newer non-curated generation.
+        # Curated (current Sol 6.1, then Luna) beats a newer non-curated id.
+        "system.ai.gpt-6-1-sol",
+        "system.ai.gpt-6-luna",
+        # Non-curated GPT, newest generation next.
+        "system.ai.gpt-6-1",
         "system.ai.gpt-5-6-sol",
         "system.ai.gpt-5-6-luna",
         "system.ai.gpt-5-5",
-        # Non-curated GPT, newest generation next.
-        "system.ai.gpt-6-1",
         # Codex-compatible but unversioned, last.
         "system.ai.kimi-k2",
     )

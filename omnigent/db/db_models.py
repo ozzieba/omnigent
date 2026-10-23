@@ -767,6 +767,8 @@ class SqlConversationMetadata(OmnigentBase):
     project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # Immutable server-owned environment catalog reference, e.g. workspace-readonly@1.
     environment_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Runtime image catalog revision resolved by the server, never caller supplied.
+    environment_runtime_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -1031,6 +1033,9 @@ class SqlConversationItem(ConversationBase):
     data: Mapped[str] = mapped_column(Text)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    native_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    native_turn_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    native_item_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
         # Backs the per-conversation position-ordered scan (the dominant read).
@@ -1053,6 +1058,23 @@ class SqlConversationItem(ConversationBase):
             "conversation_id",
             "response_id",
             "id",
+        ),
+        Index(
+            "uq_conversation_items_native_provenance",
+            "workspace_id",
+            "conversation_id",
+            "native_thread_id",
+            "native_turn_id",
+            "native_item_id",
+            unique=True,
+            postgresql_where=text(
+                "native_thread_id IS NOT NULL AND native_turn_id IS NOT NULL "
+                "AND native_item_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "native_thread_id IS NOT NULL AND native_turn_id IS NOT NULL "
+                "AND native_item_id IS NOT NULL"
+            ),
         ),
         # Latest-message previews scan one type per conversation ordered by
         # position DESC (list_latest_message_items_for_conversations). Ordering
@@ -1078,6 +1100,36 @@ class SqlConversationItem(ConversationBase):
 # (and the session-status error-label path) can clamp values to fit instead
 # of letting an over-length write raise ``DataError`` on PostgreSQL.
 LABEL_VALUE_MAX_LEN = 256
+
+
+class SqlSessionGoal(ConversationBase):
+    """One goal per session, isolated by tenant and independent of turn history."""
+
+    __tablename__ = "session_goals"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    objective: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    completion_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'paused', 'blocked', 'completed', 'cancelled')",
+            name="ck_session_goals_status",
+        ),
+        CheckConstraint("revision > 0", name="ck_session_goals_revision"),
+    )
 
 
 class SqlConversationLabel(ConversationBase):
@@ -1333,6 +1385,57 @@ class SqlPolicy(OmnigentBase):
         # update_default (default) key on name_cksum; this plain index backs
         # those lookups.
         Index("ix_policies_name_cksum", "workspace_id", "name_cksum", "id"),
+    )
+
+
+class SqlHostAdmission(OmnigentBase):
+    """Durable host maintenance fence; counts do not attest runtime quiet."""
+
+    __tablename__ = "host_turnover_admission"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    host_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    fence_token: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    verification_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("workspace_id >= 0", name="ck_host_admission_workspace"),
+        CheckConstraint("generation >= 0", name="ck_host_admission_generation"),
+        CheckConstraint("state IN (1, 2)", name="ck_host_admission_state"),
+        CheckConstraint(
+            "(state = 1 AND fence_token IS NULL) OR (state = 2 AND fence_token IS NOT NULL)",
+            name="ck_host_admission_fence",
+        ),
+    )
+
+
+class SqlHostAdmissionOperation(OmnigentBase):
+    """Operation custody journal; pending and unknown entries never expire."""
+
+    __tablename__ = "host_turnover_operations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    token: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relationship ownership and locking are enforced by the store (Rule R032).
+    host_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    operation: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("workspace_id >= 0", name="ck_host_operation_workspace"),
+        CheckConstraint("generation >= 0", name="ck_host_operation_generation"),
+        CheckConstraint("operation IN (1, 2)", name="ck_host_operation_kind"),
+        CheckConstraint("state IN (1, 2, 3)", name="ck_host_operation_state"),
+        Index("ix_host_turnover_operations_scope_state", "workspace_id", "host_id", "state"),
     )
 
 
@@ -1684,6 +1787,9 @@ class SqlScheduledTaskRun(OmnigentBase):
     status: Mapped[int] = mapped_column(SmallInteger)
     scheduled_at: Mapped[int] = mapped_column(Integer)
     fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Set only after accepted model output is observed. Bootstrap status edges
+    # alone do not prove the scheduled turn ran.
+    started_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Opaque free-text error blob, never SQL-queried — stored compressed.
     error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)

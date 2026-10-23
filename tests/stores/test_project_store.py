@@ -6,11 +6,16 @@ real SQLite database, covering owner scoping and per-owner name uniqueness.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import event, update
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session
 
+from omnigent.db.db_models import SqlProject, current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
@@ -44,6 +49,87 @@ def test_create_returns_project(store: SqlAlchemyProjectStore) -> None:
     assert project.user_id == "alice@example.com"
     assert project.created_at > 0
     assert project.updated_at is None
+
+
+def _is_lock_refusal(dialect: str, error: OperationalError) -> bool:
+    """Whether *error* is the database refusing a write because a row lock is held."""
+    orig = error.orig
+    if dialect == "sqlite":
+        return (
+            isinstance(orig, sqlite3.OperationalError)
+            and orig.sqlite_errorcode == sqlite3.SQLITE_BUSY
+        )
+    if dialect == "postgresql":
+        # 55P03 = lock_not_available (lock_timeout expired).
+        return getattr(orig, "sqlstate", None) == "55P03"
+    if dialect == "mysql":
+        # 1205 = ER_LOCK_WAIT_TIMEOUT.
+        return bool(orig is not None and orig.args and orig.args[0] == 1205)
+    return False
+
+
+@pytest.mark.parametrize(
+    ("initial_routing", "admin_routing"),
+    [
+        ({}, {"quota_route": "personal-llmq", "project_enum": "planar-jacobian"}),
+        ({"quota_route": "personal-llmq", "project_enum": "planar-jacobian"}, {}),
+    ],
+)
+def test_admin_routing_write_cannot_land_between_ordinary_read_and_flush(
+    store: SqlAlchemyProjectStore,
+    initial_routing: dict[str, str],
+    admin_routing: dict[str, str],
+) -> None:
+    dialect = store._engine.dialect.name
+    if dialect not in ("sqlite", "postgresql", "mysql"):
+        pytest.skip(f"no row-lock timeout setup for dialect {dialect!r}")
+    project = store.create(_uid("routing-race"), "Routing race", "alice", initial_routing)
+    workspace_id = current_workspace_id()
+    observed: list[str] = []
+    statement = update(SqlProject).where(
+        SqlProject.workspace_id == workspace_id, SqlProject.id == project.id
+    )
+
+    def interleave(session: Session, _context: object, _instances: object) -> None:
+        if not any(isinstance(row, SqlProject) for row in session.dirty):
+            return
+        with store._engine.connect() as connection:
+            # The store holds a write lock on the project row from its initial
+            # read until commit (SQLite: BEGIN IMMEDIATE; Postgres/MySQL:
+            # SELECT ... FOR UPDATE). A competing writer must therefore be
+            # refused. Fail fast instead of waiting out the default lock timeout.
+            if dialect == "sqlite":
+                connection.exec_driver_sql("PRAGMA busy_timeout = 0")
+            elif dialect == "postgresql":
+                connection.exec_driver_sql("SET lock_timeout = '200ms'")
+            else:
+                connection.exec_driver_sql("SET SESSION innodb_lock_wait_timeout = 1")
+            try:
+                connection.execute(
+                    statement.values(config=json.dumps(admin_routing) if admin_routing else None)
+                )
+                connection.commit()
+                observed.append("committed")
+            except OperationalError as error:
+                assert _is_lock_refusal(dialect, error), error
+                observed.append("blocked")
+
+    event.listen(Session, "before_flush", interleave)
+    try:
+        store.update(project.id, user_id="alice", config={"icon": "new"})
+    finally:
+        event.remove(Session, "before_flush", interleave)
+
+    assert observed == ["blocked"]
+    ordinary = store.get(project.id, user_id="alice")
+    assert ordinary is not None
+    assert ordinary.config == {"icon": "new", **initial_routing}
+
+    with store._engine.begin() as connection:
+        connection.execute(statement.values(config=json.dumps({"icon": "new", **admin_routing})))
+    after_admin = store.get(project.id, user_id="alice")
+    assert after_admin is not None
+    assert after_admin.config == {"icon": "new", **admin_routing}
 
 
 def test_get_returns_created_project(store: SqlAlchemyProjectStore) -> None:
@@ -260,6 +346,42 @@ def test_update_same_config_is_noop(store: SqlAlchemyProjectStore) -> None:
     updated = store.update(_uid("p1"), user_id="alice@example.com", config={"host_id": "x"})
     assert updated is not None
     assert updated.updated_at is None
+
+
+def test_update_preserves_current_server_routing_without_mutating_input(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """Internal stale config cannot replace the current authoritative fields."""
+    routing = {"quota_route": "personal-llmq", "project_enum": "planar-jacobian"}
+    store.create(_uid("p1"), "P", "alice@example.com", {**routing, "host_id": "old"})
+    stale = {"quota_route": "work-vertex", "project_enum": "planar-jc-codex", "host_id": "new"}
+    updated = store.update(_uid("p1"), user_id="alice@example.com", config=stale)
+    assert updated is not None
+    assert updated.config == {**routing, "host_id": "new"}
+    assert stale == {
+        "quota_route": "work-vertex",
+        "project_enum": "planar-jc-codex",
+        "host_id": "new",
+    }
+
+
+@pytest.mark.parametrize("existing", [{}, {"quota_route": None}])
+def test_update_cannot_insert_missing_server_routing(
+    store: SqlAlchemyProjectStore, existing: dict[str, str | None]
+) -> None:
+    """An ordinary update preserves absence and existing null values."""
+    store.create(_uid("p1"), "P", "alice@example.com", existing)
+    updated = store.update(
+        _uid("p1"),
+        user_id="alice@example.com",
+        config={
+            "quota_route": "personal-llmq",
+            "project_enum": "planar-jacobian",
+            "host_id": "new",
+        },
+    )
+    assert updated is not None
+    assert updated.config == {**existing, "host_id": "new"}
 
 
 def test_create_rejects_oversized_config(store: SqlAlchemyProjectStore) -> None:

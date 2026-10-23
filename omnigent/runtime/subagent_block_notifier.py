@@ -60,6 +60,10 @@ _BLOCK_WAKE_ESCALATION_DELAY_S = 120.0
 WakeDispatch = Callable[[str, "Conversation", str], Awaitable[bool]]
 
 
+class WakeDeliveryUnknown(RuntimeError):
+    """Delivery or admission is unresolved; automatic retry must stop."""
+
+
 class _WakeOutcome(enum.Enum):
     """
     Result of one bounded-retry wake delivery.
@@ -67,12 +71,14 @@ class _WakeOutcome(enum.Enum):
     ``DELIVERED`` — the dispatch confirmed delivery; ``MOOT`` — the block
     resolved mid-flight so nothing (stale) was sent and the cleared
     debounce slot must be left alone; ``FAILED`` — every attempt failed,
-    so the caller releases the arm and a re-publish can retry.
+    so the caller releases the arm and a re-publish can retry. ``UNKNOWN``
+    retains the arm until resolution because dispatch must not be repeated.
     """
 
     DELIVERED = "delivered"
     MOOT = "moot"
     FAILED = "failed"
+    UNKNOWN = "unknown"
 
 
 async def _sleep(seconds: float) -> None:
@@ -296,6 +302,8 @@ class SubagentBlockNotifier:
             outcome = await self._deliver_with_retry(
                 parent_id, child, notice, armed_id=elicitation_id
             )
+            if outcome is _WakeOutcome.UNKNOWN:
+                return  # Keep the arm until resolution; never repeat uncertain delivery.
             if outcome is _WakeOutcome.FAILED:
                 # Release the arm so a later publish of this id can retry.
                 with self._lock:
@@ -330,7 +338,8 @@ class SubagentBlockNotifier:
         flight clears the arm and this reports ``MOOT`` so the caller leaves
         the cleared slot alone. ``None`` (resolution notices — the block is
         already resolved) skips that gate. A dispatch that returns ``False``
-        or raises is retried after a short backoff; an exhausted run reports
+        or raises is retried after a short backoff. ``WakeDeliveryUnknown``
+        retains uncertainty without retry; an exhausted ordinary run reports
         ``FAILED``. A raising dispatch is caught broadly (its error taxonomy
         is unknown to this module) so a delivery failure never crashes the
         publish path; ``CancelledError`` (a ``BaseException`` raised by
@@ -353,6 +362,13 @@ class SubagentBlockNotifier:
             try:
                 if await self._wake_dispatch(parent_id, child, notice):
                     return _WakeOutcome.DELIVERED
+            except WakeDeliveryUnknown:
+                _logger.warning(
+                    "subagent block notifier: unresolved wake retained for parent=%s child=%s",
+                    parent_id,
+                    child.id,
+                )
+                return _WakeOutcome.UNKNOWN
             except Exception:
                 # Broad: injected dispatch error types are unknown; don't crash the publish path.
                 _logger.warning(

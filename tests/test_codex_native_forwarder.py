@@ -554,6 +554,29 @@ async def test_post_user_message_text_posts_input_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_user_message_sends_native_item_provenance() -> None:
+    """Codex replay identity travels with the normal external item event."""
+    client = _RecordingClient()
+    item = {
+        "id": "item-7",
+        "type": "userMessage",
+        "content": [{"type": "text", "text": "hello"}],
+    }
+
+    await fwd._post_user_message(
+        client,
+        "conv_x",
+        {"threadId": "thread-1", "turnId": "turn-2"},
+        item,
+    )
+
+    _url, body = client.posts[0]
+    assert body["data"]["native_thread_id"] == "thread-1"
+    assert body["data"]["native_turn_id"] == "turn-2"
+    assert body["data"]["native_item_id"] == "item-7"
+
+
+@pytest.mark.asyncio
 async def test_post_user_message_truly_empty_is_skipped() -> None:
     """
     A ``userMessage`` with neither text nor a file block is not posted.

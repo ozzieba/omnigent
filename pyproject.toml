@@ -321,6 +321,8 @@ lint = [
     "grpcio-tools>=1.68,<=1.81.1",
 ]
 test = [
+    # Pin the capture-plugin namespace fix without upgrading the locked 0.14 library.
+    "structlog-config==0.14.0",
     "pytest>=7.0",
     # These clients are optional product capabilities, but their tests import
     # and execute the real packages against mocks.
@@ -420,6 +422,7 @@ members = [".github/triage_v2"]
 
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]
+structlog-config = { git = "https://github.com/ozzieba/structlog-config", rev = "13799e0f64f8a3bc1c750a933b0df9c1bc73cd27" }
 omnigent-client = { path = "sdks/python-client", editable = true }
 omnigent-ui-sdk = { path = "sdks/ui", editable = true }
 # Local resolution for the `slack` extra. Only pulled in when `omnigent[slack]`

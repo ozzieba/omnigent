@@ -256,6 +256,25 @@ def register_core_routes(
         from omnigent.server.environment_profiles import list_environment_profiles as _list
 
         profiles = _list()
+        sandbox_config = getattr(request.app.state, "sandbox_config", None)
+        for profile in profiles:
+            reference = profile.get("managed_host_image_reference")
+            image = (
+                sandbox_config.managed_host_image(reference)
+                if isinstance(reference, str) and sandbox_config is not None
+                else None
+            )
+            profile["managed_host_image"] = {
+                "reference": reference,
+                "state": "available" if image is not None else "unavailable",
+                "image": image,
+                "reason": (
+                    "Resolved from the operator-published Kubernetes image catalog; "
+                    "image selection does not add credentials, env values, or mounts."
+                    if image is not None
+                    else "No matching immutable image is published for the Kubernetes provider."
+                ),
+            }
         return {"object": "list", "data": profiles, "has_more": False}
 
     async def _schedule_managed_launch(
@@ -266,6 +285,7 @@ def register_core_routes(
         user_id: str | None,
         sandbox_provider: str | None,
         workspace: str | None,
+        runtime_image_reference: str | None,
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
@@ -354,6 +374,7 @@ def register_core_routes(
                 host_registry=getattr(request.app.state, "host_registry", None),
                 tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                 provider=sandbox_provider,
+                runtime_image_reference=runtime_image_reference,
                 agent_store=agent_store,
                 agent_id=agent_id,
                 project_store=project_store,
@@ -573,6 +594,7 @@ def register_core_routes(
                 user_id=user_id,
                 sandbox_provider=body.sandbox_provider,
                 workspace=body.workspace,
+                runtime_image_reference=resp.environment_runtime_ref,
             )
 
         # Host launch: if a host is targeted (caller-supplied or
@@ -759,6 +781,18 @@ def register_core_routes(
         if parsed_metadata.labels and _SLACK_ORCHESTRATOR_GRANT_LABEL in parsed_metadata.labels:
             raise HTTPException(status_code=403, detail="reserved session label")
 
+        from omnigent.server.managed_hosts import resolve_profile_runtime_reference
+
+        try:
+            environment_runtime_ref = resolve_profile_runtime_reference(
+                parsed_metadata.environment_profile,
+                deployment=getattr(request.app.state, "sandbox_config", None),
+                provider=parsed_metadata.sandbox_provider,
+                managed=parsed_metadata.host_type == "managed",
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
             inherited_runner_id = await _authorize_bundled_parent_and_inherit_runner(
@@ -777,6 +811,7 @@ def register_core_routes(
             parsed_metadata,
             bundle_bytes,
             inherited_runner_id,
+            environment_runtime_ref,
         )
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
@@ -811,6 +846,7 @@ def register_core_routes(
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
                 workspace=parsed_metadata.workspace,
+                runtime_image_reference=environment_runtime_ref,
             )
         return result, project_resolution.warnings
 

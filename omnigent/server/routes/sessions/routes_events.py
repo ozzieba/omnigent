@@ -15,6 +15,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from omnigent._native_failure_codes import native_failure_code
 from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
@@ -76,6 +77,7 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._host_admission import dispatch_authorized_host_operation
 from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
@@ -375,6 +377,36 @@ async def _retry_session_single_flight(
     return await asyncio.shield(task)
 
 
+_ADMISSION_REPORT_TYPES = frozenset(
+    {
+        "external_acp_subagent_start",
+        "external_antigravity_subagent_start",
+        "external_assistant_message",
+        "external_codex_approval_mode_change",
+        "external_codex_collaboration_mode_change",
+        "external_codex_subagent_start",
+        "external_compaction_status",
+        "external_conversation_item",
+        "external_elicitation_resolved",
+        "external_mcp_startup",
+        "external_model_change",
+        "external_model_options",
+        "external_output_reasoning_delta",
+        "external_output_text_delta",
+        "external_permission_mode_change",
+        "external_reasoning_effort_change",
+        "external_session_interrupted",
+        "external_session_status",
+        "external_session_superseded",
+        "external_session_title",
+        "external_session_todos",
+        "external_session_usage",
+        "external_subagent_start",
+        "external_tool_output_delta",
+    }
+)
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -606,6 +638,29 @@ def register_events_routes(
                 parse_client_side_tool_specs(body.tools)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        async def invoke_authorized():
+            return await _post_event_authorized(
+                request, session_id, body, user_id, conv, created_by
+            )
+
+        if body.type in _ADMISSION_REPORT_TYPES or body.type in (
+            _INTERRUPT_TYPE,
+            _STOP_SESSION_TYPE,
+        ):
+            return await invoke_authorized()
+        return await dispatch_authorized_host_operation(
+            request, conv.host_id, "input", invoke_authorized
+        )
+
+    async def _post_event_authorized(
+        request: Request,
+        session_id: str,
+        body: SessionEventInput,
+        user_id: str | None,
+        conv: Any,
+        created_by: str | None,
+    ) -> dict[str, bool | str]:
         if body.type == _RETRY_SESSION_TYPE:
             return await _retry_session_single_flight(
                 request=request,
@@ -1280,6 +1335,15 @@ def register_events_routes(
                         )
                     ),
                     message=output.strip(),
+                )
+            # Structured native provider codes survive without copying error text.
+            code = native_failure_code(data.get("native_failure_code"))
+            if status == "failed" and code is not None:
+                status_error = ErrorDetail(
+                    code="native_" + code,
+                    message=status_error.message
+                    if status_error is not None
+                    else "Native turn failed.",
                 )
             if status_error is not None:
                 await _persist_session_status_error_labels(

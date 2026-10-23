@@ -35,6 +35,8 @@ export interface AgentBundleInput {
   mcpServers?: MCPServerInput[];
   /** Immutable server catalog reference; the server validates the matching fixed policy. */
   environmentProfile?: string;
+  /** Workspace policy copied from the selected server catalog entry. */
+  environmentWorkspaceAccess?: "read-only" | "read-write";
 }
 
 /**
@@ -58,12 +60,10 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   lines.push(`  model: ${input.model}`);
   lines.push("  config:");
   lines.push(`    harness: ${input.harness}`);
-  if (
-    input.environmentProfile === "workspace-readonly@1" ||
-    input.environmentProfile === "workspace-readonly@2" ||
-    input.environmentProfile === "workspace-editable@1" ||
-    input.environmentProfile === "workspace-editable@2"
-  ) {
+  if (input.environmentProfile) {
+    if (!input.environmentWorkspaceAccess) {
+      throw new Error("The selected environment profile has no workspace access policy.");
+    }
     lines.push("");
     lines.push("params:");
     lines.push(`  environment_profile: ${yamlQuote(input.environmentProfile)}`);
@@ -74,8 +74,7 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
     lines.push("  sandbox:");
     lines.push("    type: auto");
     lines.push(
-      input.environmentProfile === "workspace-editable@1" ||
-        input.environmentProfile === "workspace-editable@2"
+      input.environmentWorkspaceAccess === "read-write"
         ? '    write_paths: ["."]'
         : "    write_paths: []",
     );

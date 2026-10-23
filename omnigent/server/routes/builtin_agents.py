@@ -28,8 +28,15 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import Agent
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
+from omnigent.server.routes._agent_model_selection import project_agent_model_selection
 from omnigent.server.routes._auth_helpers import require_user as _require_user
-from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
+from omnigent.server.schemas import (
+    AgentModelSelection,
+    AgentObject,
+    MCPServerSummary,
+    PaginatedList,
+    SkillSummary,
+)
 from omnigent.stores import AgentStore
 
 _logger = logging.getLogger(__name__)
@@ -53,6 +60,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     mcp_servers: list[MCPServerSummary] = []
     skills: list[SkillSummary] = []
     terminals: list[str] = []
+    model_selection = AgentModelSelection()
     harness: str | None = None
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
@@ -91,6 +99,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
+        model_selection = project_agent_model_selection(loaded.spec)
     except Exception:  # noqa: BLE001 — spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
@@ -105,6 +114,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,
+        model_selection=model_selection,
         mcp_servers=mcp_servers,
         mcp_servers_editable=False,
         skills=skills,

@@ -36,6 +36,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlPolicy,
     SqlProject,
+    SqlSessionGoal,
     SqlSessionPermission,
     SqlUserDailyCost,
     current_workspace_id,
@@ -74,6 +75,11 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
     parse_item_data,
+)
+from omnigent.entities.session_goal import (
+    SessionGoal,
+    SessionGoalConflict,
+    SetSessionGoalRequest,
 )
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.session_import.models import (
@@ -247,6 +253,7 @@ def _to_conversation(
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         project_id=meta.project_id if meta else None,
         environment_profile=meta.environment_profile if meta else None,
+        environment_runtime_ref=meta.environment_runtime_ref if meta else None,
     )
 
 
@@ -309,6 +316,7 @@ def _new_session_metadata_row(
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
     environment_profile: str | None = None,
+    environment_runtime_ref: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -330,6 +338,7 @@ def _new_session_metadata_row(
         runner_id=runner_id,
         project_id=project_id,
         environment_profile=environment_profile,
+        environment_runtime_ref=environment_runtime_ref,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -672,6 +681,11 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         created_at=row.created_at,
         data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
+        # The latest-message preview projection (``_ranked_latest_message_items``)
+        # deliberately omits these columns, so read them tolerantly.
+        native_thread_id=getattr(row, "native_thread_id", None),
+        native_turn_id=getattr(row, "native_turn_id", None),
+        native_item_id=getattr(row, "native_item_id", None),
     )
 
 
@@ -891,6 +905,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str | None = None,
         project_id: str | None = None,
         environment_profile: str | None = None,
+        environment_runtime_ref: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1024,6 +1039,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ),
                 project_id=project_id,
                 environment_profile=environment_profile,
+                environment_runtime_ref=environment_runtime_ref,
             )
             with self._session("insert_conversation_metadata") as meta_sess:
                 meta_sess.add(meta)
@@ -1296,6 +1312,65 @@ class SqlAlchemyConversationStore(ConversationStore):
             if parent_id is not None:
                 result[parent_id].append(child_id)
         return result
+
+    def get_session_goal(self, conversation_id: str) -> SessionGoal | None:
+        with self._conv_session("read_session_goal") as session:
+            row = session.get(SqlSessionGoal, (current_workspace_id(), conversation_id))
+            return self._session_goal_entity(row) if row is not None else None
+
+    @staticmethod
+    def _session_goal_entity(row: SqlSessionGoal) -> SessionGoal:
+        return SessionGoal.model_validate(
+            {name: getattr(row, name) for name in SessionGoal.model_fields}
+        )
+
+    def set_session_goal(
+        self,
+        conversation_id: str,
+        request: SetSessionGoalRequest,
+        updated_by: str | None,
+    ) -> SessionGoal:
+        with self._conv_session_immediate("update_session_goal") as session:
+            if session.get(SqlConversation, (current_workspace_id(), conversation_id)) is None:
+                raise ConversationNotFoundError(conversation_id)
+            self._lock_conversation(session, conversation_id)
+            row = session.get(SqlSessionGoal, (current_workspace_id(), conversation_id))
+            revision = row.revision if row is not None else 0
+            if revision != request.expected_revision:
+                raise SessionGoalConflict(conversation_id)
+            state = request.status or (row.status if row is not None else "paused")
+            evidence = request.completion_evidence
+            if "completion_evidence" not in request.model_fields_set and row is not None:
+                evidence = row.completion_evidence
+            if state == "completed":
+                if not evidence or not evidence.strip():
+                    raise ValueError("Completed goals require completion evidence")
+                if (
+                    row is not None
+                    and row.objective != request.objective
+                    and (
+                        request.status is None
+                        or "completion_evidence" not in request.model_fields_set
+                    )
+                ):
+                    raise ValueError(
+                        "Changed completed objectives need explicit status and evidence"
+                    )
+            now = now_epoch()
+            if row is None:
+                row = SqlSessionGoal(
+                    workspace_id=current_workspace_id(),
+                    session_id=conversation_id,
+                    created_at=now,
+                )
+                session.add(row)
+            row.objective = request.objective
+            row.status = state
+            row.revision = revision + 1
+            row.completion_evidence = evidence
+            row.updated_at = now
+            row.updated_by = updated_by
+            return self._session_goal_entity(row)
 
     def set_labels(
         self,
@@ -2063,6 +2138,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
+            # Native transcript retries are keyed by source identity, never by
+            # message text. The conversation lock serializes competing appends;
+            # the unique index is the cross-process backstop.
+            if len(items) == 1 and all(
+                (items[0].native_thread_id, items[0].native_turn_id, items[0].native_item_id)
+            ):
+                source = items[0]
+                existing = session.execute(
+                    select(SqlConversationItem).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.native_thread_id == source.native_thread_id,
+                        SqlConversationItem.native_turn_id == source.native_turn_id,
+                        SqlConversationItem.native_item_id == source.native_item_id,
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    decoded = self._decode_item_data_batch([existing.data])[0]
+                    return [_to_item(existing, decoded)]
+
             # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if conv_row is not None:
@@ -2114,6 +2209,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "type": encode_item_type(item.type),
                     "data": data,
                     "created_by": item.created_by,
+                    "native_thread_id": item.native_thread_id,
+                    "native_turn_id": item.native_turn_id,
+                    "native_item_id": item.native_item_id,
                 }
                 # A backend may omit search_text (see _item_search_text): when it
                 # returns None we drop the column so a schema without it still
@@ -2135,6 +2233,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         created_at=now,
                         data=item.data,
                         created_by=item.created_by,
+                        native_thread_id=item.native_thread_id,
+                        native_turn_id=item.native_turn_id,
+                        native_item_id=item.native_item_id,
                     )
                 )
             # One executemany for the batch: positions are pre-allocated above so
@@ -2151,6 +2252,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conv_row.next_position = next_pos
 
         return persisted
+
+    def find_native_item_id(
+        self, conversation_id: str, thread_id: str, turn_id: str, item_id: str
+    ) -> str | None:
+        """Return the persisted id for a native source item, if present."""
+        with self._conv_session("find_native_item_id") as session:
+            return session.execute(
+                select(SqlConversationItem.id).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.native_thread_id == thread_id,
+                    SqlConversationItem.native_turn_id == turn_id,
+                    SqlConversationItem.native_item_id == item_id,
+                )
+            ).scalar_one_or_none()
 
     def list_projects(
         self,
@@ -3341,6 +3457,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         runner_id: str | None = None,
         project_id: str | None = None,
         environment_profile: str | None = None,
+        environment_runtime_ref: str | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -3409,6 +3526,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             runner_id=runner_id,
             project_id=project_id,
             environment_profile=environment_profile,
+            environment_runtime_ref=environment_runtime_ref,
         )
 
     def _create_session_with_agent_with_id(
@@ -3428,6 +3546,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         runner_id: str | None = None,
         project_id: str | None = None,
         environment_profile: str | None = None,
+        environment_runtime_ref: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -3477,6 +3596,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             runner_id=runner_id,
             project_id=project_id,
             environment_profile=environment_profile,
+            environment_runtime_ref=environment_runtime_ref,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
         )
@@ -4248,6 +4368,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(subtree_ids),
+                )
+            )
+            ap_sess.execute(
+                delete(SqlSessionGoal).where(
+                    SqlSessionGoal.workspace_id == current_workspace_id(),
+                    SqlSessionGoal.session_id.in_(subtree_ids),
                 )
             )
             ap_sess.execute(

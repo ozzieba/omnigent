@@ -254,7 +254,16 @@ def _wait_ready(child: pexpect.spawn) -> None:
 
     :param child: Live pexpect child.
     """
-    child.expect([STATE_SLEEPING, PROMPT_READY], timeout=_READY_TIMEOUT)
+    try:
+        child.expect([STATE_SLEEPING, PROMPT_READY], timeout=_READY_TIMEOUT)
+    except pexpect.EOF:
+        from tests.e2e.omnigent._repl_startup_diagnostics import describe_startup_eof
+
+        try:
+            diagnostic = describe_startup_eof(child)
+        except Exception:
+            diagnostic = '{"stage":"REPL_READINESS_EOF","diagnostic":"UNAVAILABLE"}'
+        raise pexpect.EOF("REPL_STARTUP_EOF " + diagnostic) from None
 
 
 def _session_runner_id(base_url: str, session_id: str) -> str:

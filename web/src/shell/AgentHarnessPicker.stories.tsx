@@ -116,6 +116,14 @@ export const ReadyOnHost: Story = {
   play: async ({ canvasElement }) => openPicker(canvasElement),
 };
 
+export const ReadyOnManagedSandbox: Story = {
+  args: {
+    sandboxSelected: true,
+    managedSandboxSupportsBundles: true,
+  },
+  play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
 export const NeedsSetupBadges: Story = {
   args: {
     host: {

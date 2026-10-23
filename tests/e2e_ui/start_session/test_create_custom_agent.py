@@ -139,9 +139,16 @@ async def _register_routes(
             # Capture multipart or JSON create requests.
             content_type = route.request.headers.get("content-type", "")
             if "multipart" in content_type:
-                # For multipart, we can't easily parse the binary body in
-                # Playwright, so just record that a multipart POST happened.
-                create_requests.append({"__multipart__": True})
+                # The session metadata part is plain UTF-8 JSON; keep it so
+                # managed-target behavior can be asserted alongside the bundle.
+                body = route.request.post_data_buffer or b""
+                match = re.search(rb'name="metadata"\r\n\r\n([^\r\n]+)\r\n', body)
+                create_requests.append(
+                    {
+                        "__multipart__": True,
+                        "metadata": json.loads(match.group(1)) if match else None,
+                    }
+                )
             else:
                 create_requests.append(route.request.post_data_json)
             await route.fulfill(
@@ -311,6 +318,85 @@ async def _drive_create_and_submit(base_url: str, session_id: str) -> None:
             assert create_requests[0].get("__multipart__") is True, (
                 f"Expected multipart POST, got: {create_requests[0]}"
             )
+        finally:
+            await browser.close()
+
+
+def test_create_agent_on_managed_sandbox_carries_environment_profile(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A custom agent can launch on a managed sandbox with its profile intact."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_managed_sandbox_create(base_url, session_id))
+
+
+async def _drive_managed_sandbox_create(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_requests: list[dict[str, Any]] = []
+            await _register_routes(
+                page, created_session_id=session_id, create_requests=create_requests, managed=True
+            )
+
+            async def handle_no_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"hosts": []})
+                )
+
+            async def handle_profiles(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "data": [
+                                {
+                                    "id": "workspace-readonly",
+                                    "revision": 2,
+                                    "reference": "workspace-readonly@2",
+                                    "name": "Workspace read only",
+                                    "description": "Read repository files.",
+                                    "access": "read-only",
+                                    "workspace_access": "read-only",
+                                    "capabilities": [],
+                                }
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/hosts", handle_no_hosts)
+            await page.route("**/v1/environment-profiles", handle_profiles)
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text("Databricks Sandbox")
+            await _open_create_agent(page)
+            await page.get_by_test_id("create-agent-name").fill("sandbox-agent")
+            await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+            profile_picker = page.get_by_test_id("create-agent-environment-profile")
+            await profile_picker.click()
+            await page.get_by_role(
+                "option", name="Workspace read only (workspace-readonly@2)"
+            ).click()
+            await page.get_by_test_id("create-agent-submit").click()
+
+            await page.get_by_test_id("new-chat-landing-input").fill("inspect this workspace")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await _wait_until(lambda: len(create_requests) == 1)
+            request = create_requests[0]
+            assert request.get("__multipart__") is True, request
+            assert request["metadata"] == {
+                "environment_profile": "workspace-readonly@2",
+                "host_type": "managed",
+                "sandbox_provider": "lakebox",
+                "workspace": None,
+            }, request
         finally:
             await browser.close()
 

@@ -253,6 +253,7 @@ class Conversation:
     pending_elicitation_count: int | None = None
     project_id: str | None = None
     environment_profile: str | None = None
+    environment_runtime_ref: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
@@ -795,6 +796,9 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
+    native_thread_id: str | None = None
+    native_turn_id: str | None = None
+    native_item_id: str | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -831,6 +835,9 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    native_thread_id: str | None = None
+    native_turn_id: str | None = None
+    native_item_id: str | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:

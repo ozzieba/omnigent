@@ -6136,6 +6136,71 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
     ]
 
 
+@pytest.mark.parametrize("source", ["llm", "execution", "tool", "harness"])
+@pytest.mark.parametrize("code", ["project_attribution_required", "RuntimeError"])
+def test_session_peek_error_classification_excludes_private_fields(source: str, code: str) -> None:
+    from omnigent.runner.tool_dispatch import _project_api_item
+
+    item = {
+        "type": "error",
+        "source": source,
+        "code": code,
+        "message": "PRIVATE-ERROR-MESSAGE",
+        "traceback": "PRIVATE-TRACEBACK",
+        "data": {"private": "PRIVATE-NESTED"},
+    }
+    assert _project_api_item(item) == {"type": "error", "source": source, "code": code}
+
+
+@pytest.mark.parametrize("unclassified", [None, "PRIVATE-VALUE", "future_error", {}, [], 42])
+def test_session_peek_error_unknown_classification_is_omitted(unclassified: object) -> None:
+    from omnigent.runner.tool_dispatch import _project_api_item
+
+    assert _project_api_item(
+        {"type": "error", "source": unclassified, "code": unclassified, "message": "PRIVATE"}
+    ) == {"type": "error"}
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_error_classification_preserves_closed_metadata() -> None:
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            assert request.url.params["limit"] == "6"
+            assert request.url.params["order"] == "desc"
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "type": "error",
+                            "source": "execution",
+                            "code": "project_attribution_required",
+                            "message": "PRIVATE",
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        result = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "tail_items": 6}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert result["items"] == [
+        {"type": "error", "source": "execution", "code": "project_attribution_required"}
+    ]
+    assert "PRIVATE" not in json.dumps(result)
+
+
 _REST_HISTORY_CONTENT_SCENARIOS = [
     pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
     pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
@@ -6741,6 +6806,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
                             "agent_name": "researcher",
                             "title": "auth",
                             "status": "running",
+                            "updated_at": 1700000000.5,
                             "runner_id": "r1",
                             "parent_session_id": None,
                         },
@@ -6780,6 +6846,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "agent_name": "researcher",
             "title": "auth",
             "status": "running",
+            "last_activity_at": 1700000000.5,
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
@@ -6789,6 +6856,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "agent_name": "researcher",
             "title": "payments",
             "status": "idle",
+            "last_activity_at": None,
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,

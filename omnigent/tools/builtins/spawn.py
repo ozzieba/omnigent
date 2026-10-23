@@ -525,10 +525,13 @@ class SysSessionListTool(Tool):
             "history, get info, or close. 'sessions': a global list of "
             "every session "
             "you can access, each with status + runner connectivity, "
-            "for orchestration (inspect via sys_agent_get / "
+            "with persisted last_activity_at for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent. Calls without pagination keep "
+            "sessions running that agent. Pass sort_by=updated_at to list "
+            "recently active sessions first; the default remains created_at. "
+            "Activity metadata is distinct from live worker progress. "
+            "Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
@@ -558,6 +561,16 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "sort_by": {
+                            "type": "string",
+                            "enum": ["created_at", "updated_at"],
+                            "default": "created_at",
+                            "description": (
+                                "Order sessions newest-first by creation (default) or "
+                                "persisted activity. Reuse the same sort with its cursor. "
+                                "Does not change the complete sub_agents view."
                             ),
                         },
                         "limit": {

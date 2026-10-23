@@ -309,6 +309,7 @@ jobs:
             -v --tb=long --showlocals --log-level=INFO -r a \
             --durations=25 --durations-min=1.0 \
             --reruns=1 --reruns-delay=5 \
+            --ui-ci-progress \
             --ui-skip-build \
             --splits="$NUM_SHARDS" \
             --group="$((SHARD_ID + 1))" \
