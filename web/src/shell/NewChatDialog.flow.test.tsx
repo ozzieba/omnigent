@@ -2043,4 +2043,104 @@ describe("NewChatLandingScreen Turbo (per-session paid-credits switch)", () => {
       (await screen.findAllByTestId("new-chat-landing-config-gear-tooltip"))[0].textContent ?? "",
     ).toMatch(/Turbo: ?On/);
   });
+
+  // R2-3: the readback must not need a hover — the create will allow paid
+  // credits, so the landing screen names it while the choice is armed.
+  it("after saving Turbo on, a Turbo chip stays on the landing screen without hovering", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.queryByTestId("new-chat-landing-turbo-chip")).toBeNull();
+    openAgentConfig("ag_codex");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-turbo"));
+    saveConfig();
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-config-turbo")).toBeNull());
+    const chip = screen.getByTestId("new-chat-landing-turbo-chip");
+    expect(chip.textContent).toMatch(/Turbo/);
+    expect(chip.textContent).toMatch(/paid credits/);
+    expect(chip.getAttribute("title") ?? "").toMatch(/paid credits/);
+  });
+
+  it("the landing Turbo chip follows the agent: gone for Claude, back for Codex", async () => {
+    setAgents([
+      agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" }),
+      agent({
+        id: "ag_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+    ]);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_codex");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-turbo"));
+    saveConfig();
+    expect(screen.getByTestId("new-chat-landing-turbo-chip")).toBeTruthy();
+    selectAgent("ag_claude");
+    expect(screen.queryByTestId("new-chat-landing-turbo-chip")).toBeNull();
+    selectAgent("ag_codex");
+    expect(screen.getByTestId("new-chat-landing-turbo-chip")).toBeTruthy();
+  });
+
+  it("no landing Turbo chip when the switch is flipped but the modal is cancelled", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_turbo_cancel" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_codex");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-turbo"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-config-turbo")).toBeNull());
+    expect(screen.queryByTestId("new-chat-landing-turbo-chip")).toBeNull();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).turbo).toBeUndefined();
+  });
+
+  it("Codex -> Claude -> Codex: the saved Turbo choice comes back and is still sent", async () => {
+    setAgents([
+      agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" }),
+      agent({
+        id: "ag_claude",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_turbo_round_trip" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_codex");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-turbo"));
+    saveConfig();
+    selectAgent("ag_claude");
+    // The Claude summary must not mention Turbo.
+    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(
+      (await screen.findAllByTestId("new-chat-landing-config-gear-tooltip"))[0].textContent ?? "",
+    ).not.toMatch(/Turbo/);
+    fireEvent.blur(screen.getByTestId("new-chat-landing-config-gear"));
+    selectAgent("ag_codex");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(
+      (await screen.findByTestId("new-chat-landing-config-turbo")).getAttribute("aria-checked"),
+    ).toBe("true");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.labels?.["omnigent.wrapper"]).toBe("codex-native-ui");
+    expect(body.turbo).toBe(true);
+  });
 });
