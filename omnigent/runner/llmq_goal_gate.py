@@ -32,7 +32,8 @@ is ``active``, :class:`GoalContinuationGate`:
   interrupting it without a pause would only make Codex start the next
   continuation at once.
 
-Every Codex or llmq call is bounded (5 s) and fails open; the forwarder's event
+Every Codex or llmq call and the Turbo read are bounded (5 s) and fail open; status
+posts use the forwarder's server client and its own timeout. The forwarder's event
 loop never waits on this module (each ``turn/started`` is handled in a task).
 """
 
@@ -111,9 +112,15 @@ async def _codex_result(
     return result if isinstance(result, dict) else {}
 
 
+_GOAL_FAULT = "<codex fault>"  # not a Codex goal status: Codex could not say
+
+
 async def _goal_status(codex: CodexRequester, thread_id: str) -> str | None:
+    """The thread's goal status; ``None`` without a goal, ``_GOAL_FAULT`` on a fault."""
     result = await _codex_result(codex, "thread/goal/get", {"threadId": thread_id})
-    goal = result.get("goal") if result is not None else None
+    if result is None:
+        return _GOAL_FAULT
+    goal = result.get("goal")
     status = goal.get("status") if isinstance(goal, dict) else None
     return status if isinstance(status, str) else None
 
@@ -121,7 +128,7 @@ async def _goal_status(codex: CodexRequester, thread_id: str) -> str | None:
 async def _read_turbo(server: httpx.AsyncClient, session_id: str) -> bool:
     """The session's current Turbo flag; off when the server cannot say."""
     try:
-        resp = await server.get(f"/v1/sessions/{session_id}")
+        resp = await server.get(f"/v1/sessions/{session_id}", timeout=_CODEX_TIMEOUT_S)
         return resp.status_code == 200 and resp.json().get("turbo") is True
     except (httpx.HTTPError, ValueError, AttributeError):
         return False
@@ -190,6 +197,9 @@ class GoalContinuationGate:
         self._attribution_wait = attribution_wait_seconds
         self._grant_ttl = grant_ttl_seconds
         self._interrupt_settle = interrupt_settle_seconds
+        # Off after the first "retained"/"released" close: that llmq cannot settle
+        # an activated turn unmeasured, so activating would strand estimates.
+        self._activate = True
         self._tasks: set[asyncio.Task[Any]] = set()
         # Long-lived waits (held re-checks, unused-admission expiry).
         self._waits: set[asyncio.Task[Any]] = set()
@@ -380,7 +390,8 @@ class GoalContinuationGate:
         activation = TurnActivation(
             lambda: activate_codex_turn(self._client(), self._config, decision, turn_key=key)
         )
-        activation()  # the turn is already running
+        if self._activate:
+            activation()  # the turn is already running
         self._tracked[turn_id] = _Tracked(session_id, decision, key, activation)
         if turn_id in self._finished:
             self._close_later(turn_id, self._finished.pop(turn_id))
@@ -402,6 +413,11 @@ class GoalContinuationGate:
             tap=tap,
             activated=await tracked.activation.result(),
         )
+        if outcome in ("retained", "released") and self._activate:
+            self._activate = False
+            _logger.warning(
+                "llmq goal gate: llmq has no unmeasured settlement; activation turned off"
+            )
         _logger.info(
             "llmq goal gate session=%s reservation %s (%s)",
             tracked.session_id,
@@ -467,7 +483,12 @@ class GoalContinuationGate:
         try:
             while True:
                 await self._sleep(self._config.recheck_seconds)
-                if await _goal_status(codex, thread_id) != "paused":
+                status = await _goal_status(codex, thread_id)
+                if status == _GOAL_FAULT:
+                    # Codex could not say: the goal is still paused by us, so keep
+                    # holding (ending here would strand it paused for good).
+                    continue
+                if status != "paused":
                     # Resumed or cleared by someone else: the hold is over (a
                     # resumed continuation is admitted again at turn/started).
                     return

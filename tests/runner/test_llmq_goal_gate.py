@@ -32,6 +32,7 @@ import pytest
 pytest.importorskip("llm_quota_controller.api")
 
 from omnigent import codex_native_forwarder as fwd
+from omnigent.runner import llmq_goal_gate as goal_gate_module
 from omnigent.runner.llmq_gate import (
     GateConfig,
     mark_turn_start_pending,
@@ -459,3 +460,135 @@ def test_the_forwarder_gate_is_inert_unless_the_runner_gate_is_provisioned(monke
     assert isinstance(GoalContinuationGate.from_env(), GoalContinuationGate)
     monkeypatch.setenv("OMNIGENT_QUOTA_ROUTE", "work-vertex")
     assert GoalContinuationGate.from_env() is None
+
+
+async def test_a_transient_goal_get_fault_does_not_end_the_hold(setup) -> None:
+    """A Codex fault on thread/goal/get is not "the user resumed the goal".
+
+    Ending the hold there would leave the goal paused for good with the held
+    status showing, and the Turbo toggle would no longer release it.
+    (Reproduced by the independent #127 review.)
+    """
+    llmq, config, bridge = setup
+    llmq.publish(95)
+    codex, server = FakeCodex(), FakeServer()
+
+    async def on_sleep(n: int) -> None:
+        if n == 1:
+            codex.fail.add("thread/goal/get")  # one failed or timed-out goal read
+        elif n == 2:
+            codex.fail.discard("thread/goal/get")
+            server.turbo = True  # the user then enables Turbo
+
+    gate = make_gate(llmq, config, [], on_sleep)
+    async with server.client() as ap:
+        start(gate, codex, ap, bridge, "t1")
+        await asyncio.sleep(0.05)
+        gate.turn_finished("t1")
+        for _ in range(200):
+            if codex.goal_status == "active" or (not gate._waits and len(codex.requests) > 3):
+                break
+            await asyncio.sleep(0.01)
+        await gate.drain()
+        await gate.aclose()
+    assert codex.goal_status == "active"
+    assert codex.calls("thread/goal/set")[-1] == {"threadId": THREAD, "status": "active"}
+
+
+async def test_the_gate_stops_activating_after_an_llmq_that_cannot_settle_unmeasured(
+    setup, monkeypatch
+) -> None:
+    """Against an llmq without ``usage_unmeasured`` an activated, unmeasured turn
+    keeps its estimate for the whole lease ("retained"). Like the runner gate,
+    the goal gate then stops activating, so it strands at most one estimate."""
+    llmq, config, bridge = setup
+    llmq.publish(33)
+    activations: list[str] = []
+    outcomes: list[bool] = []
+
+    async def activate(_client, _config, decision, *, turn_key):
+        activations.append(turn_key)
+        return True
+
+    async def close(_client, _config, _decision, *, turn_key, tap, activated):
+        outcomes.append(activated)
+        return "retained" if activated else "released"
+
+    monkeypatch.setattr(goal_gate_module, "activate_codex_turn", activate)
+    monkeypatch.setattr(goal_gate_module, "close_codex_turn", close)
+    codex, server = FakeCodex(), FakeServer()
+    gate = make_gate(llmq, config, [])
+    async with server.client() as ap:
+        for turn in ("t1", "t2"):
+            start(gate, codex, ap, bridge, turn)
+            await gate.drain()
+            gate.turn_finished(turn)
+            await gate.drain()
+        await gate.aclose()
+    assert len(activations) == 1
+    assert outcomes == [True, False]
+
+
+async def test_the_gate_hears_a_turn_end_after_its_idle_edge_is_posted(tmp_path: Path) -> None:
+    """A held continuation posts its held status once the interrupted turn ends.
+
+    The forwarder must report the end only after it has posted that turn's own
+    idle edge; otherwise the idle edge lands on top of the held status and the
+    session shows idle with no hold reason or Turbo hint.
+    """
+    statuses: list[str] = []
+    seen_at_finish: list[list[str]] = []
+
+    class RecordingServer(FakeServer):
+        def client(self) -> httpx.AsyncClient:
+            async def handle(request: httpx.Request) -> httpx.Response:
+                if request.method == "POST":
+                    body = json.loads(request.content or b"{}")
+                    data = body.get("data") if isinstance(body, dict) else None
+                    if isinstance(data, dict) and isinstance(data.get("status"), str):
+                        statuses.append(data["status"])
+                return httpx.Response(200, json={})
+
+            return httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://ap")
+
+    class Spy:
+        def turn_started(self, **_kwargs: Any) -> None:
+            pass
+
+        def usage_updated(self, _params: Any) -> None:
+            pass
+
+        def turn_finished(self, _turn_id: str | None) -> None:
+            seen_at_finish.append(list(statuses))
+
+    codex = FakeCodex()
+    state = fwd._CodexForwarderState(
+        parent_session_id=SESSION,
+        codex_client=codex,  # type: ignore[arg-type]
+        llmq_goal_gate=Spy(),  # type: ignore[arg-type]
+    )
+    server = RecordingServer()
+    async with server.client() as ap:
+        usage_coalescer = fwd._SessionUsageCoalescer(ap, SESSION)
+        for event in (
+            {
+                "method": "turn/started",
+                "params": {"threadId": THREAD, "turn": {"id": "t1", "status": "inProgress"}},
+            },
+            {
+                "method": "turn/completed",
+                "params": {"threadId": THREAD, "turn": {"id": "t1", "status": "interrupted"}},
+            },
+        ):
+            await fwd._handle_event(
+                ap,
+                session_id=SESSION,
+                bridge_dir=tmp_path,
+                event=event,
+                usage_coalescer=usage_coalescer,
+                elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+                expected_thread_id=THREAD,
+                codex_client=codex,  # type: ignore[arg-type]
+                forwarder_state=state,
+            )
+    assert seen_at_finish and "idle" in seen_at_finish[0], (seen_at_finish, statuses)
