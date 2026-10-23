@@ -31,6 +31,8 @@ import pytest
 
 pytest.importorskip("llm_quota_controller.api")
 
+from llm_quota_controller.native_turns import NativeTurnSettlement
+
 import omnigent.runner.app as runner_app_mod
 from omnigent.runner import (
     create_runner_app,
@@ -43,6 +45,10 @@ from tests.runner.test_runner_dispatch import (
     _FakeHarnessStream,
     _runner_test_client,
 )
+
+#: llmq with the ``usage_unmeasured`` settlement (ozzieba/chatgpt-playground#1328).
+UNMEASURED_FORM = "usage_unmeasured" in NativeTurnSettlement.model_fields
+UNMEASURED = ("estimated", "settled") if UNMEASURED_FORM else ("released", "cancelled")
 
 DONE_CHUNKS = [
     'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
@@ -255,11 +261,11 @@ async def test_held_turn_dispatches_original_message_once_after_turbo(wired) -> 
     assert [r["attempt"] for r in llmq.seen] == [0, 1, 2]
     assert [r["turbo"] for r in llmq.seen] == [False, False, True]
     assert server.turbo_reads >= 3
-    # The harness reported no usage: the reservation is cancelled unmeasured (it must not
-    # keep counting as pending), never settled with zeros.
-    assert len(state["closes"]) == 1 and state["closes"][0][1] == "released"
+    # The harness reported no usage: the reservation is settled unmeasured at llmq's
+    # estimate (or cancelled on an older llmq), never settled with zeros.
+    assert len(state["closes"]) == 1 and state["closes"][0][1] == UNMEASURED[0]
     row = llmq.reservation(state["closes"][0][0])
-    assert row["status"] == "cancelled"
+    assert row["status"] == UNMEASURED[1]
     assert "native_input_tokens" not in json.loads(row["metadata_json"])
 
 
@@ -355,9 +361,11 @@ async def test_interrupt_after_dispatch_cancels_unmeasured_and_never_settles_zer
     rows = _reservations(llmq)
     assert len(rows) == 1 and len(harness.bodies) == 1
     # The turn ran (response.created was seen) with usage unknown: the close step ran
-    # on the interrupt, and cancelled the reservation unmeasured rather than settling zeros.
-    assert state["closes"] == [(rows[0]["id"], "released")]
-    assert rows[0]["status"] == "cancelled" and rows[0]["actual_ppm"] == 0
+    # on the interrupt, and settled the reservation unmeasured rather than with zeros.
+    assert state["closes"] == [(rows[0]["id"], UNMEASURED[0])]
+    assert rows[0]["status"] == UNMEASURED[1]
+    expected_charge = rows[0]["estimated_ppm"] if UNMEASURED_FORM else 0
+    assert rows[0]["actual_ppm"] == expected_charge
     assert "native_input_tokens" not in json.loads(rows[0]["metadata_json"])
 
 

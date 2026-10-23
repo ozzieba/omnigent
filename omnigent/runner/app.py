@@ -7732,7 +7732,8 @@ def create_runner_app(
         finally:
             # Every exit (done, harness error, spawn failure, interrupt) ends the
             # admitted reservation: cancel it when the harness was never reached,
-            # settle it when real usage was reported, else leave llmq's estimate.
+            # settle it with real usage when reported, else settle it unmeasured
+            # at llmq's estimate (marked retained_estimate).
             if _llmq_gate is not None:
                 _schedule_llmq_close(conv, _llmq_gate, _llmq_tap)
 

@@ -48,8 +48,9 @@ def config(tmp_path: Path, **overrides: Any) -> GateConfig:
 class Controller:
     """A fake llmq answering admissions from a script and recording requests."""
 
-    def __init__(self, answers: list[Any]) -> None:
+    def __init__(self, answers: list[Any], *, unmeasured_form: bool = True) -> None:
         self.answers = answers
+        self.unmeasured_form = unmeasured_form
         self.requests: list[dict[str, Any]] = []
         self.settlements: list[dict[str, Any]] = []
         self.cancellations: list[dict[str, Any]] = []
@@ -57,6 +58,9 @@ class Controller:
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         if request.url.path.endswith("/settlements"):
+            if "usage_unmeasured" in body and not self.unmeasured_form:
+                # An llmq from before ozzieba/chatgpt-playground#1328: extra field.
+                return httpx.Response(422, json={"detail": "extra_forbidden"})
             self.settlements.append(body)
             return httpx.Response(200, json={"settlement_id": "s", "status": "settled"})
         if request.url.path.endswith("/cancellations"):
@@ -579,14 +583,12 @@ async def test_a_turn_that_ran_with_measured_usage_is_settled(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_a_turn_that_ran_with_unknown_usage_is_cancelled_never_settled_with_zeros(
+async def test_a_turn_that_ran_with_unknown_usage_settles_at_the_estimate_never_zeros(
     tmp_path: Path,
 ) -> None:
-    """llmq would store {0, 0} as measured tokens (and zero the charge); cancel instead.
+    """llmq would store {0, 0} as measured tokens, and a cancel means "never ran".
 
-    Deliberate under-reporting (oz: llmq is not a security boundary, fail open): a
-    pending estimate that is never measured would otherwise count against the
-    window until its lease expires.
+    `usage_unmeasured` settles at llmq's own estimate, marked retained_estimate.
     """
     controller = Controller([])
     tap = TurnStreamTap()
@@ -595,9 +597,82 @@ async def test_a_turn_that_ran_with_unknown_usage_is_cancelled_never_settled_wit
         outcome = await close_codex_turn(
             client, config(tmp_path), ADMITTED, turn_key="e" * 64, tap=tap
         )
+    assert outcome == "estimated"
+    assert controller.settlements == [
+        {"turn_key": "e" * 64, "reservation_id": "res-9", "usage_unmeasured": True}
+    ]
+    assert controller.cancellations == []
+
+
+@pytest.mark.asyncio
+async def test_an_llmq_without_the_unmeasured_form_gets_a_cancel_instead(
+    tmp_path: Path,
+) -> None:
+    controller = Controller([], unmeasured_form=False)
+    tap = TurnStreamTap()
+    tap.feed(sse({"type": "response.created", "response": {"id": "r"}}))
+    async with client_for(controller) as client:
+        outcome = await close_codex_turn(
+            client, config(tmp_path), ADMITTED, turn_key="e" * 64, tap=tap
+        )
     assert outcome == "released"
     assert controller.settlements == []
     assert controller.cancellations == [{"turn_key": "e" * 64, "reservation_id": "res-9"}]
+
+
+def _ledger_denial(retry_after: float) -> dict[str, Any]:
+    return {
+        **admitted(),
+        "allowed": False,
+        "reason": "provider_window_exhausted",
+        "retry_after_seconds": retry_after,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answers", "sleeps", "states"),
+    [
+        # A long ledger hint is not waited for at all: the turn runs, unverified.
+        ([_ledger_denial(60.0)], [], ["unverified"]),
+        # Short hints are honoured until the admission-delay budget (5 s) is spent.
+        ([_ledger_denial(3.0), _ledger_denial(3.0)], [3.0], ["blocked", "unverified"]),
+    ],
+    ids=["long-hint-fails-open", "budget-spent-fails-open"],
+)
+async def test_ledger_denials_wait_at_most_the_admission_delay_then_fail_open(
+    tmp_path: Path, answers: list[Any], sleeps: list[float], states: list[str]
+) -> None:
+    """Design #76: only the fresh-evidence margin is a refusal; throttling is a capped wait."""
+    controller = Controller(answers)
+    seen_states: list[str] = []
+    seen_sleeps: list[float] = []
+
+    async def on_status(decision: GateDecision, turbo: bool) -> None:
+        seen_states.append(decision.state)
+
+    async def sleep(seconds: float) -> None:
+        seen_sleeps.append(seconds)
+
+    async def read_turbo() -> bool:
+        return False
+
+    async with client_for(controller) as client:
+        decision, _ = await gate_codex_turn(
+            client,
+            config(tmp_path),
+            session_id="conv_a",
+            turn_salt="7",
+            model="gpt-6.1-sol",
+            read_turbo=read_turbo,
+            on_status=on_status,
+            sleep=sleep,
+        )
+    assert (decision.allow, decision.verified) == (True, False)
+    assert decision.reason == "llmq_provider_window_exhausted"
+    assert decision.reservation_id is None
+    assert seen_sleeps == sleeps and seen_states == states
+    assert "retrying" not in (decision.message(turbo=False) or "")
 
 
 @pytest.mark.asyncio

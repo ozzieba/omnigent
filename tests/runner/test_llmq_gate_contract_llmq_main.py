@@ -50,6 +50,9 @@ from omnigent.runner.llmq_gate import (  # noqa: E402
 )
 
 ACTOR = "fleet-test"
+#: Whether this llmq has the ``usage_unmeasured`` settlement
+#: (ozzieba/chatgpt-playground#1328). Without it the gate falls back to a cancel.
+UNMEASURED_FORM = "usage_unmeasured" in NativeTurnSettlement.model_fields
 WEEK_MINUTES = 10080
 
 
@@ -416,15 +419,15 @@ async def test_measured_usage_is_settled_as_measured_tokens(tmp_path, gate_confi
     assert metadata["native_cached_input_tokens"] == 40
 
 
-async def test_unknown_usage_is_cancelled_and_never_recorded_as_measured_zero_tokens(
+async def test_unknown_usage_is_never_recorded_as_measured_zero_tokens(
     tmp_path, gate_config
 ) -> None:
     """The old behaviour settled {0, 0}: llmq stored it as MEASURED tokens (feeding
     _calibrate_token_cost) and, with measured charging on, charged 0 instead of the
     estimate. Leaving it pending instead made the estimate count in the window's
     `pending` until the 86,400 s lease expired (engine._pending_usage), which is a
-    false hold. Now an unmeasured completed turn is cancelled: no usage is recorded,
-    and the estimate stops counting. Deliberate under-reporting (oz: fail open)."""
+    false hold. An unmeasured completed turn now settles at llmq's estimate, marked
+    `retained_estimate`; an llmq without that form gets a cancel instead."""
     llmq = Llmq(tmp_path, measured_charging_enabled=True, measured_charging_min_samples=1)
     llmq.publish(33)
     _calibrated(llmq)
@@ -434,16 +437,19 @@ async def test_unknown_usage_is_cancelled_and_never_recorded_as_measured_zero_to
         outcome = await close_codex_turn(
             c2, gate_config, decision, turn_key=key, tap=_tap(CREATED, COMPLETED_NO_USAGE)
         )
-    assert outcome == "released"
     row = llmq.reservation(decision.reservation_id)
     metadata = json.loads(row["metadata_json"])
-    assert row["status"] == "cancelled" and row["actual_ppm"] == 0
+    if UNMEASURED_FORM:
+        assert outcome == "estimated"
+        assert row["status"] == "settled" and row["actual_ppm"] == row["estimated_ppm"]
+        assert metadata["native_usage_basis"] == "retained_estimate"
+    else:
+        assert outcome == "released"
+        assert row["status"] == "cancelled" and row["actual_ppm"] == 0
     assert "native_input_tokens" not in metadata and "native_output_tokens" not in metadata
 
 
-async def test_unmeasured_turn_leaves_no_active_reservation_in_llmq(
-    tmp_path, gate_config
-) -> None:
+async def test_unmeasured_turn_leaves_no_active_reservation_in_llmq(tmp_path, gate_config) -> None:
     """An active reservation is what llmq counts as `pending` until its lease expires."""
     llmq = Llmq(tmp_path)
     llmq.publish(33)
@@ -455,7 +461,7 @@ async def test_unmeasured_turn_leaves_no_active_reservation_in_llmq(
         outcome = await close_codex_turn(
             c2, gate_config, decision, turn_key=key, tap=_tap(CREATED, COMPLETED_NO_USAGE)
         )
-    assert outcome == "released"
+    assert outcome == ("estimated" if UNMEASURED_FORM else "released")
     with llmq.engine.db.connect() as connection:
         assert connection.execute(active).fetchone()[0] == 0
 

@@ -438,7 +438,7 @@ async def settle_codex_turn(
     There is deliberately no default usage: llmq stores whatever is sent as
     measured tokens, so a placeholder would poison its calibration and zero the
     charge once measured charging is on. Callers without real counts use
-    :func:`close_codex_turn`, which cancels the reservation unmeasured instead.
+    :func:`settle_unmeasured_codex_turn` (via :func:`close_codex_turn`).
 
     :returns: Whether llmq accepted the settlement.
     """
@@ -452,6 +452,37 @@ async def settle_codex_turn(
             "turn_key": turn_key,
             "reservation_id": decision.reservation_id,
             "usage": dict(usage),
+        },
+    )
+
+
+async def settle_unmeasured_codex_turn(
+    client: httpx.AsyncClient,
+    config: GateConfig,
+    decision: GateDecision,
+    *,
+    turn_key: str,
+) -> int | None:
+    """Settle a turn that RAN but reported no usage, at llmq's own estimate.
+
+    llmq records it as ``native_usage_basis=retained_estimate``: never as
+    measured tokens, and never as a cancellation (which means "never ran" and
+    refunds the pacing debit). The estimate then counts as pending only until
+    the provider's next usage observation. Needs an llmq with the
+    ``usage_unmeasured`` settlement (ozzieba/chatgpt-playground#1328).
+
+    :returns: llmq's HTTP status, or ``None`` when it could not be asked.
+    """
+    if decision.reservation_id is None:
+        return None
+    return await _post_reservation_status(
+        client,
+        config,
+        "settlements",
+        {
+            "turn_key": turn_key,
+            "reservation_id": decision.reservation_id,
+            "usage_unmeasured": True,
         },
     )
 
@@ -483,9 +514,19 @@ async def _post_reservation(
     route: str,
     payload: dict[str, object],
 ) -> bool:
+    status = await _post_reservation_status(client, config, route, payload)
+    return status is not None and status < 400
+
+
+async def _post_reservation_status(
+    client: httpx.AsyncClient,
+    config: GateConfig,
+    route: str,
+    payload: dict[str, object],
+) -> int | None:
     bearer = config.bearer()
     if bearer is None:
-        return False
+        return None
     try:
         resp = await client.post(
             f"{config.controller_url}/v1/native-turns/{route}",
@@ -495,7 +536,7 @@ async def _post_reservation(
         )
     except httpx.HTTPError:
         _logger.debug("llmq gate: %s unreachable for %s", route, payload.get("reservation_id"))
-        return False
+        return None
     if resp.status_code >= 400:
         _logger.debug(
             "llmq gate: %s of %s answered HTTP %s",
@@ -503,8 +544,7 @@ async def _post_reservation(
             payload.get("reservation_id"),
             resp.status_code,
         )
-        return False
-    return True
+    return resp.status_code
 
 
 async def close_codex_turn(
@@ -518,8 +558,10 @@ async def close_codex_turn(
     """End an admitted turn's reservation according to what the stream showed.
 
     :returns: ``"cancelled"`` (the turn never reached the harness),
-        ``"settled"`` (real usage reported), ``"released"`` (the turn ran but its
-        usage is unknown, so the reservation was cancelled unmeasured), or
+        ``"settled"`` (real usage reported), ``"estimated"`` (the turn ran but
+        its usage is unknown, so llmq settled it at its estimate, marked
+        ``retained_estimate``), ``"released"`` (the same, against an llmq without
+        that settlement form, so the reservation was cancelled instead), or
         ``"none"`` when there was no reservation or llmq refused the call.
     """
     if decision.reservation_id is None:
@@ -531,25 +573,23 @@ async def close_codex_turn(
         ok = await settle_codex_turn(client, config, decision, turn_key=turn_key, usage=tap.usage)
         return "settled" if ok else "none"
     # The turn RAN but nothing measured it (every codex-native turn: its executor
-    # reports no usage). llmq has no "unmeasured completion" settlement, and a
-    # zero-token settlement would be stored as measured usage. Leaving the
-    # reservation pending is not neutral either: llmq counts every active
-    # reservation's estimate in the window's `pending` (engine.py `_pending_usage`,
-    # read by `_evaluate_window` as `global_available = capacity - used - pending`)
-    # until the 86,400 s lease expires, so unmeasured turns would pile up and make
-    # llmq answer `provider_window_exhausted` / pacing holds against a window the
-    # provider says is nearly empty. Cancel it instead.
-    #
-    # This under-reports on purpose: the cancelled turn's cost is not booked until
-    # the provider's own usedPercent shows it in the next receipt. oz's rule is
-    # that llmq is NOT a security boundary and fails OPEN with an indicator, so a
-    # spurious hold from our own estimates is the worse error than a slightly late
-    # count. The real 90% credit-safety margin is unaffected: it is read from the
-    # provider-reported usedPercent (codex_native_contract.py), not from reservations.
-    # llmq accepts the cancel because the gate never calls /activations, so the
-    # reservation is not marked dispatch-authorized (engine.NativeTurnDispatched).
-    ok = await cancel_codex_turn(client, config, decision, turn_key=turn_key)
-    return "released" if ok else "none"
+    # reports no usage). A zero-token settlement would be stored as measured
+    # usage, a cancellation means "never ran" (charging 0 and refunding the
+    # pacing debit), and leaving the reservation active would count its estimate
+    # as pending until the 86,400 s lease expires. Settle it unmeasured: llmq
+    # charges the estimate, marks it `retained_estimate`, and stops counting it
+    # as pending at the provider's next usage observation.
+    status = await settle_unmeasured_codex_turn(client, config, decision, turn_key=turn_key)
+    if status is not None and status < 400:
+        return "estimated"
+    if status == 422:
+        # An llmq from before the `usage_unmeasured` form rejects the body. The
+        # least-bad fallback there is to release the reservation (under-reporting
+        # until the next receipt) rather than hold its estimate for the lease;
+        # llmq is not a security boundary (oz, 2026-10-07).
+        ok = await cancel_codex_turn(client, config, decision, turn_key=turn_key)
+        return "released" if ok else "none"
+    return "none"
 
 
 StatusCallback = Callable[[GateDecision, bool], Awaitable[None]]
@@ -581,6 +621,7 @@ async def gate_codex_turn(
     key = turn_key(session_id, turn_salt)
     attempt = 0
     held = False
+    paced = 0.0
     while True:
         turbo = await read_turbo()
         decision = await admit_codex_turn(
@@ -600,6 +641,22 @@ async def gate_codex_turn(
                 await asyncio.shield(cancel_codex_turn(client, config, decision, turn_key=key))
                 raise
             return decision, key
+        if decision.reason not in REFUSAL_REASONS and decision.retry_after_seconds is not None:
+            # A ledger denial (pacing, share, window estimate) is throttling, not
+            # the fresh-evidence margin: design #76 waits for it at most
+            # `max_admission_delay_seconds` in total and then runs the turn with
+            # the indicator, instead of holding it without limit.
+            wait = max(1.0, min(decision.retry_after_seconds, config.recheck_seconds))
+            if paced + wait > config.max_admission_delay_seconds:
+                decision = unverified("llmq_" + decision.reason)
+                await on_status(decision, turbo)
+                return decision, key
+            paced += wait
+            held = True
+            await on_status(decision, turbo)
+            await sleep(wait)
+            attempt += 1
+            continue
         held = True
         await on_status(decision, turbo)
         wait = (
