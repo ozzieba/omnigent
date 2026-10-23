@@ -1226,16 +1226,15 @@ async function readBackTurbo(
   patchSet: (patch: { turbo: boolean }) => void,
 ): Promise<void> {
   const seq = ledger.seq;
-  let session: Session;
   try {
-    session = await getSessionSlim(conversationId);
+    const session = await getSessionSlim(conversationId);
+    if (ledger.seq !== seq || ledger.inFlight !== 0) return;
+    ledger.settled = session?.turbo ?? false;
+    ledger.settledSeq = seq;
+    patchSet({ turbo: ledger.settled });
   } catch {
-    return; // keep the rollback; a later SSE or snapshot corrects it
+    // Keep the rollback; a later SSE or snapshot corrects it.
   }
-  if (ledger.seq !== seq || ledger.inFlight !== 0) return;
-  ledger.settled = session.turbo ?? false;
-  ledger.settledSeq = seq;
-  patchSet({ turbo: ledger.settled });
 }
 
 /**
@@ -2415,7 +2414,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } finally {
       ledger.inFlight -= 1;
       if (ledger.inFlight === 0 && ledger.failedSeq === ledger.seq) {
-        void readBackTurbo(conversationId, ledger, patchSet);
+        readBackTurbo(conversationId, ledger, patchSet).catch(() => undefined);
       }
     }
   },

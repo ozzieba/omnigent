@@ -82,6 +82,9 @@ describe("Turbo write ordering (R2-4)", () => {
   beforeEach(() => {
     updateSessionMock.mockReset();
     getSessionSlimMock.mockReset();
+    // A failed newest write reads Turbo back; by default that read fails, which
+    // keeps the rollback, so tests that do not care about it stay deterministic.
+    getSessionSlimMock.mockRejectedValue(new Error("not mocked"));
   });
 
   it("in-order responses: on then off ends off", async () => {
