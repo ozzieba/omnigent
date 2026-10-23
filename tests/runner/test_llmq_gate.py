@@ -972,3 +972,15 @@ def test_turn_attribution_stays_bounded_and_never_raises(tmp_path: Path) -> None
     llmq_gate.mark_turn_start_pending(missing)
     llmq_gate.note_admitted_turn(missing, "turn_x")
     assert llmq_gate.turn_admission_record(missing, "turn_x") == "unknown"
+
+
+def test_a_corrupted_admitted_turns_record_never_breaks_a_turn(tmp_path: Path) -> None:
+    from omnigent.runner.llmq_gate import (
+        ADMITTED_TURNS_FILE,
+        note_admitted_turn,
+        turn_admission_record,
+    )
+
+    (tmp_path / ADMITTED_TURNS_FILE).write_bytes(b"\xff\xfe" * 40_000)  # > trim size, not UTF-8
+    note_admitted_turn(tmp_path, "turn-1")
+    assert turn_admission_record(tmp_path, "turn-2") == "unknown"

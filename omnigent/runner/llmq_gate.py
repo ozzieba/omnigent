@@ -874,7 +874,7 @@ def note_admitted_turn(bridge_dir: Path, turn_id: str) -> None:
                 tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
                 tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
                 os.replace(tmp, path)
-        except OSError:
+        except (OSError, ValueError):
             _logger.debug("llmq gate: could not record admitted turn %s", turn_id, exc_info=True)
     clear_turn_start_pending(bridge_dir)
 
@@ -888,7 +888,7 @@ def turn_admission_record(bridge_dir: Path, turn_id: str) -> str:
     """
     try:
         recorded = (bridge_dir / ADMITTED_TURNS_FILE).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):  # ValueError: a corrupted (non-UTF-8) record
         recorded = ""
     if turn_id in recorded.splitlines():
         return "admitted"
