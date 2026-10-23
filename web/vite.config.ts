@@ -227,6 +227,11 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
+    // 15s, not vitest's 5s default: the Forge runner shares 24 cores across ~8 jobs and a
+    // loaded run turned 160 jsdom tests into 5000ms timeouts (jsdom setup + import alone
+    // took ~2900s of cumulative CPU). Healthy tests still finish in well under a second.
+    testTimeout: 15_000,
+    hookTimeout: 15_000,
     // Scope discovery to src/ — the web suite lives there. Without this,
     // vitest's default glob descends into the nested electron package and
     // tries to run its node:test files (which aren't vitest suites).
