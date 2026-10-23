@@ -18,7 +18,8 @@ REAL gate talking to llmq main's real app through an ASGI transport. Proves:
 - a verified reservation is activated once the harness starts the turn, and never when
   the harness was not reached;
 - the gate is inert for a work-vertex launch; an unexpected gate fault still shows the
-  indicator and the turn runs.
+  indicator and the turn runs;
+- a direct ``?stream=true`` Codex turn goes through the same gate and close.
 """
 
 from __future__ import annotations
@@ -576,3 +577,71 @@ async def test_unmeasured_activated_turns_close_on_either_llmq(wired) -> None:
         assert state["activations"] == [(first, True)]
         assert state["closes"] == [(first, "retained"), (second, "released")]
         assert status == {first: "active", second: "cancelled"}
+
+
+async def _post_stream(app, conv: str, text: str, *, model_override: str = "gpt-6.1-sol") -> str:
+    body: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_codex",
+        "model": "codex-agent",
+        "model_override": model_override,
+        "content": [{"type": "input_text", "text": text}],
+    }
+    async with _runner_test_client(app) as http:
+        response = await http.post(f"/v1/sessions/{conv}/events?stream=true", json=body)
+        assert response.status_code == 200, response.text
+        return response.text
+
+
+async def test_a_direct_stream_codex_turn_is_held_until_turbo_releases_it(wired) -> None:
+    """``?stream=true`` used to call the harness without the gate (review D3a)."""
+    llmq, server, state = wired
+    llmq.publish(95)
+    harness = RecordingHarness()
+
+    async def on_sleep(n: int) -> None:
+        if n == 2:
+            server.turbo = True
+
+    state["on_sleep"] = on_sleep
+    app = _runner(harness, state, _spec("codex"), server=server)
+    text = await _post_stream(app, "conv_stream_held", "original streamed prompt")
+    await _settle_bg()
+    assert "response.completed" in text
+    assert len(harness.bodies) == 1
+    assert "original streamed prompt" in json.dumps(harness.bodies[0]["content"])
+    assert [p["quota_gate"]["state"] for p in server.gate_posts] == [
+        "blocked",
+        "blocked",
+        "verified",
+    ]
+    assert [r["attempt"] for r in llmq.seen] == [0, 1, 2]
+    assert len(state["closes"]) == 1 and state["closes"][0][1] == UNMEASURED[0]
+    assert llmq.reservation(state["closes"][0][0])["status"] == UNMEASURED[1]
+
+
+async def test_a_direct_stream_codex_turn_activates_and_settles_its_usage(wired) -> None:
+    llmq, server, state = wired
+    state["activate"] = True
+    llmq.publish(33)
+    harness = RecordingHarness(chunks=DONE_WITH_USAGE_CHUNKS)
+    app = _runner(harness, state, _spec("codex-native"), server=server)
+    await _post_stream(app, "conv_stream_usage", "count my tokens")
+    await _settle_bg()
+    rows = _reservations(llmq)
+    assert len(rows) == 1 and len(harness.bodies) == 1
+    assert state["activations"] == [(rows[0]["id"], True)]
+    assert state["closes"] == [(rows[0]["id"], "settled")]
+    metadata = json.loads(rows[0]["metadata_json"])
+    assert (metadata["native_input_tokens"], metadata["native_output_tokens"]) == (140, 20)
+
+
+async def test_a_direct_stream_claude_turn_is_not_gated(wired) -> None:
+    llmq, server, state = wired
+    llmq.publish(95)
+    harness = RecordingHarness()
+    app = _runner(harness, state, _spec("claude-sdk"), server=server)
+    await _post_stream(app, "conv_stream_claude", "hi")
+    assert state["gate_calls"] == 0 and llmq.seen == [] and server.gate_posts == []
+    assert len(harness.bodies) == 1

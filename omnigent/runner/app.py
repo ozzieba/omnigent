@@ -7840,11 +7840,67 @@ def create_runner_app(
                 },
             )
 
+    async def _direct_stream_spec(conv: str, body: _JsonObject) -> AgentSpec | None:
+        """The agent spec a ``?stream=true`` turn runs, for the model llmq is asked about."""
+        agent_id = cast(str | None, body.get("agent_id"))
+        entry = _session_spec_cache.get(conv)
+        if entry is None and agent_id:
+            entry = _spec_cache.get(agent_id)
+        if entry is None and agent_id and spec_resolver is not None:
+            with contextlib.suppress(httpx.HTTPError, RuntimeError):
+                entry = await spec_resolver(agent_id, conv)
+        spec = _unwrap_resolved_spec(entry)
+        return spec if isinstance(spec, AgentSpec) else None
+
+    async def _gated_direct_stream(
+        conv: str, body: _JsonObject, inner: AsyncIterator[bytes]
+    ) -> AsyncIterator[bytes]:
+        """A ``?stream=true`` Codex turn, through the same gate and close as a background turn.
+
+        The harness is spawned but the turn is not delivered yet: delivery happens
+        when ``inner`` is first iterated, which is after the gate admits (or fails
+        open). A held turn keeps the response open with no bytes; the session shows
+        the held status. A client disconnect while held cancels the gate (no
+        reservation) and the turn is never delivered.
+        """
+        gate: tuple[GateDecision, str] | None = None
+        tap = TurnStreamTap()
+        activation: TurnActivation | None = None
+        delivering = False
+        try:
+            gate = await _gate_codex_turn_for_session(
+                conv, body, await _direct_stream_spec(conv, body)
+            )
+            tap, activation = _llmq_turn_tap(gate)
+            delivering = True
+            async for chunk in inner:
+                tap.feed(chunk)
+                yield chunk
+        finally:
+            if gate is not None:
+                _schedule_llmq_close(conv, gate, tap, activation)
+            if not delivering:
+                # Cancelled while held: the harness stream (which ends the turn
+                # itself) never ran, so end it here as the background path does.
+                _on_proxy_stream_end(conv, error={"message": "turn cancelled before dispatch"})
+            # Finalize the harness stream now rather than at garbage collection
+            # (never iterated when the gate was cancelled while holding).
+            aclose = getattr(inner, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
     async def _stream_message_to_harness(
         body: _JsonObject,
         conv_id: str,
         dispatch: TurnDispatch | None = None,
+        *,
+        gate_codex: bool = False,
     ) -> Response:
+        """Deliver one turn to the harness and stream its events.
+
+        :param gate_codex: Run a Codex turn through the llmq gate here (the direct
+            ``?stream=true`` path); the background turn path gates before calling.
+        """
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
@@ -8568,8 +8624,11 @@ def create_runner_app(
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="harness")
 
+        turn_stream: AsyncIterator[bytes] = proxy_stream()
+        if gate_codex and harness_name in CODEX_HARNESSES and _llmq_gate_config is not None:
+            turn_stream = _gated_direct_stream(conv_id, body, turn_stream)
         return StreamingResponse(
-            proxy_stream(),
+            turn_stream,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -8730,7 +8789,9 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
-                    response = await _stream_message_to_harness(message_body, conversation_id)
+                    response = await _stream_message_to_harness(
+                        message_body, conversation_id, gate_codex=True
+                    )
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,
