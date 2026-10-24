@@ -756,11 +756,16 @@ def test_build_codex_native_server_carries_the_terminal_ui_switch(
 
 
 class _SnapshotClient:
-    def __init__(self, labels: dict[str, str] | None) -> None:
+    def __init__(self, labels: dict[str, str] | None, workspace: Path) -> None:
         self._labels = labels
+        self._workspace = workspace
 
     async def get(self, url: str, timeout: float | None = None) -> Any:
-        payload = {"labels": self._labels} if self._labels is not None else {}
+        # The snapshot names the workspace, so the test does not depend on the
+        # caller's OMNIGENT_RUNNER_WORKSPACE (unset in CI).
+        payload: dict[str, Any] = {"workspace": str(self._workspace)}
+        if self._labels is not None:
+            payload["labels"] = self._labels
 
         class _R:
             status_code = 200
@@ -783,14 +788,18 @@ class _SnapshotClient:
     ],
 )
 async def test_runner_launch_config_knows_the_terminal_ui_wrapper(
-    monkeypatch: pytest.MonkeyPatch, labels: dict[str, str] | None, terminal_ui: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    labels: dict[str, str] | None,
+    terminal_ui: bool,
 ) -> None:
     from omnigent.runner.native.orchestration import _codex_native_launch_config
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
     config = await _codex_native_launch_config(
         session_id="conv_1",
-        server_client=_SnapshotClient(labels),  # type: ignore[arg-type]
+        server_client=_SnapshotClient(labels, tmp_path),  # type: ignore[arg-type]
     )
     assert config.terminal_ui is terminal_ui
 
