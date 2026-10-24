@@ -2807,6 +2807,8 @@ class MockedCodexNativeSession:
     base_url: str
     session_id: str
     sidecar: CodexResponsesSidecar
+    #: The spawned runner's combined stdout/stderr log.
+    runner_log_path: Path | None = None
 
 
 def _write_mock_codex_provider_config(
@@ -2835,10 +2837,23 @@ providers:
 
 
 @pytest.fixture
+def mocked_codex_runner_env() -> dict[str, str]:
+    """Extra environment for the runner of :func:`mocked_native_codex_session`.
+
+    Empty by default. A test module overrides this fixture to provision
+    runner-side features that read the runner's environment at startup (e.g.
+    the llmq gate's ``LLMQ_*`` variables), without leaking them into any other
+    test's runner.
+    """
+    return {}
+
+
+@pytest.fixture
 def mocked_native_codex_session(
     built_spa: None,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
+    mocked_codex_runner_env: dict[str, str],
 ) -> Iterator[MockedCodexNativeSession]:
     """Spawn native Codex against Codex's mock Responses sidecar.
 
@@ -2848,6 +2863,9 @@ def mocked_native_codex_session(
     be present before the AP server and runner start. Keeping a dedicated
     server prevents those mock-only env vars from affecting unrelated UI tests
     in the same shard.
+
+    The indirect parameter is a model name, a list of sidecar responses, or a
+    dict with optional ``"model"`` and ``"responses"`` keys (both at once).
     """
     if request.config.getoption("--ui-base-url"):
         pytest.skip("mocked native Codex e2e requires an isolated spawned server")
@@ -2859,7 +2877,11 @@ def mocked_native_codex_session(
         pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
 
     fixture_param = getattr(request, "param", None)
-    model = fixture_param if isinstance(fixture_param, str) else "mock-model"
+    if isinstance(fixture_param, dict):
+        model = str(fixture_param.get("model") or "mock-model")
+        fixture_param = fixture_param.get("responses")
+    else:
+        model = fixture_param if isinstance(fixture_param, str) else "mock-model"
 
     try:
         sidecar_bin = build_sidecar_bin()
@@ -2938,6 +2960,7 @@ def mocked_native_codex_session(
     }
     runner_env = {
         **shared_env,
+        **mocked_codex_runner_env,
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
@@ -3020,7 +3043,12 @@ def mocked_native_codex_session(
             )
 
         session_id = _create_native_codex_session(base_url, runner_id, model=model)
-        yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
+        yield MockedCodexNativeSession(
+            base_url=base_url,
+            session_id=session_id,
+            sidecar=sidecar,
+            runner_log_path=runner_log_path,
+        )
     finally:
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
