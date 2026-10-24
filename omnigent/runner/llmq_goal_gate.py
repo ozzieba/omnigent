@@ -315,8 +315,13 @@ class GoalContinuationGate:
         )
         self._meter.observe(params, count=counts)
 
-    def turn_finished(self, turn_id: str | None) -> None:
-        """A ``turn/completed`` / ``turn/failed`` for the forwarder's thread."""
+    def turn_finished(self, turn_id: str | None, *, bridge_dir: Path | None = None) -> None:
+        """A ``turn/completed`` / ``turn/failed`` for the forwarder's thread.
+
+        :param bridge_dir: The forwarder's bridge dir. Used to find the terminal-UI
+            hook's state when this gate never saw the turn start (the forwarder was
+            reconnecting, or a restarted runner's gate).
+        """
         if self._closed or not turn_id:
             return
         usage = None
@@ -326,7 +331,7 @@ class GoalContinuationGate:
         ended = self._turn_ended.get(turn_id)
         if ended is not None:
             ended.set()
-        bridge_dir = self._turn_bridge.pop(turn_id, None)
+        bridge_dir = self._turn_bridge.pop(turn_id, None) or bridge_dir
         if turn_id in self._tracked:
             self._close_later(turn_id, usage)
             return

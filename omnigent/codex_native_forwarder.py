@@ -3628,7 +3628,9 @@ async def _maybe_handle_turn_event(
             # After the turn's own idle edge, so a held continuation's status is
             # posted on top of it rather than under it.
             if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:
-                forwarder_state.llmq_goal_gate.turn_finished(_terminal_turn_id_from_params(params))
+                forwarder_state.llmq_goal_gate.turn_finished(
+                    _terminal_turn_id_from_params(params), bridge_dir=bridge_dir
+                )
         return True
     if method == "thread/tokenUsage/updated":
         if forwarder_state is not None and forwarder_state.llmq_goal_gate is not None:

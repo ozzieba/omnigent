@@ -400,8 +400,9 @@ async def test_the_forwarder_hands_turn_events_to_the_gate(tmp_path: Path) -> No
         def usage_updated(self, params: Any) -> None:
             self.events.append(("usage", params["turnId"]))
 
-        def turn_finished(self, turn_id: str | None) -> None:
+        def turn_finished(self, turn_id: str | None, *, bridge_dir: Path | None = None) -> None:
             self.events.append(("finished", turn_id))
+            assert bridge_dir == tmp_path  # the forwarder always names its bridge dir
 
     spy = Spy()
     codex = FakeCodex()
@@ -564,7 +565,7 @@ async def test_the_gate_hears_a_turn_end_after_its_idle_edge_is_posted(tmp_path:
         def usage_updated(self, _params: Any) -> None:
             pass
 
-        def turn_finished(self, _turn_id: str | None) -> None:
+        def turn_finished(self, _turn_id: str | None, **_kwargs: Any) -> None:
             seen_at_finish.append(list(statuses))
 
     codex = FakeCodex()
