@@ -673,3 +673,133 @@ async def test_an_admission_in_flight_at_aclose_starts_no_hold_after_close(setup
             task.cancel()
     assert leaked == []
     assert codex.calls("thread/goal/set") == []
+
+
+# --------------------------------------------------- terminal-UI turns without Stop
+
+
+async def _hook_admits(llmq: Llmq, config: GateConfig, bridge: Path, turn_id: str) -> dict:
+    """What the terminal-UI hook leaves behind for an admitted, activated typed turn."""
+    from omnigent.runner.llmq_gate import activate_codex_turn, admit_codex_turn, turn_key
+
+    key = turn_key(SESSION, f"tui:{turn_id}:1")
+    async with llmq.client() as client:
+        decision = await admit_codex_turn(
+            client, config, turn_key=key, attempt=0, model="gpt-6.1-sol", turbo=False
+        )
+        assert decision.verified and decision.reservation_id is not None
+        assert await activate_codex_turn(client, config, decision, turn_key=key) is True
+    opened = {
+        "codex_turn_id": turn_id,
+        "turn_key": key,
+        "reservation_id": decision.reservation_id,
+        "activated": True,
+    }
+    (bridge / "llmq_gate_state.json").write_text(json.dumps({"open": opened}))
+    note_admitted_turn(bridge, turn_id, clear_pending=False)
+    return opened
+
+
+def _counting(gate: GoalContinuationGate) -> list[str]:
+    paths: list[str] = []
+
+    async def record(request: httpx.Request) -> None:
+        paths.append(request.url.path)
+
+    gate._client().event_hooks["request"].append(record)
+    return paths
+
+
+async def test_a_terminal_ui_turn_that_ends_without_stop_is_settled_with_its_usage(
+    setup,
+) -> None:
+    """Codex fires no Stop for an interrupted or failed turn (codex-cli 0.159.1), so
+    the hook's reservation used to stay pending until the next prompt or the lease.
+    The forwarder closes it at turn/completed with the turn's measured usage."""
+    llmq, config, bridge = setup
+    llmq.publish(33)
+    opened = await _hook_admits(llmq, config, bridge, "t-tui")
+    codex, server = FakeCodex(goal_status=None), FakeServer()
+    gate = make_gate(llmq, config, [])
+    async with server.client() as ap:
+        start(gate, codex, ap, bridge, "t-tui")
+        await gate.drain()
+        gate.usage_updated(usage("t-tui", (800, 100, 30), (800, 100, 30)))
+        gate.turn_finished("t-tui")  # interrupted: no Stop ran
+        await gate.drain()
+        await gate.aclose()
+    row = llmq.reservation(opened["reservation_id"])
+    metadata = json.loads(row["metadata_json"])
+    assert row["status"] == "settled"
+    assert (metadata["native_input_tokens"], metadata["native_output_tokens"]) == (800, 30)
+    assert len(llmq.seen) == 1  # the hook's admission only; the gate admitted nothing
+
+
+async def test_the_hook_settling_the_same_turn_later_changes_nothing(setup) -> None:
+    """The hook's next prompt settles the same turn key again (its state still says
+    open): llmq answers idempotently and the measured settlement stands."""
+    from omnigent import codex_llmq_hook
+
+    llmq, config, bridge = setup
+    llmq.publish(33)
+    opened = await _hook_admits(llmq, config, bridge, "t-tui")
+    codex, server = FakeCodex(goal_status=None), FakeServer()
+    gate = make_gate(llmq, config, [])
+    async with server.client() as ap:
+        start(gate, codex, ap, bridge, "t-tui")
+        await gate.drain()
+        gate.usage_updated(usage("t-tui", (800, 100, 30), (800, 100, 30)))
+        gate.turn_finished("t-tui")
+        await gate.drain()
+        await gate.aclose()
+    async with llmq.client() as client:
+        await codex_llmq_hook._close_open(client, config, dict(opened))
+    row = llmq.reservation(opened["reservation_id"])
+    metadata = json.loads(row["metadata_json"])
+    assert row["status"] == "settled"
+    assert (metadata["native_input_tokens"], metadata["native_output_tokens"]) == (800, 30)
+
+
+async def test_a_turn_whose_stop_already_settled_it_is_not_closed_again(setup) -> None:
+    """Codex finishes the Stop hook before turn/completed, and Stop removes the
+    reservation from the hook's state: the forwarder makes no llmq call."""
+    llmq, config, bridge = setup
+    llmq.publish(33)
+    await _hook_admits(llmq, config, bridge, "t-tui")
+    (bridge / "llmq_gate_state.json").write_text(json.dumps({"session_id": SESSION}))
+    codex, server = FakeCodex(goal_status=None), FakeServer()
+    gate = make_gate(llmq, config, [])
+    paths = _counting(gate)
+    async with server.client() as ap:
+        start(gate, codex, ap, bridge, "t-tui")
+        await gate.drain()
+        gate.turn_finished("t-tui")
+        await gate.drain()
+        await gate.aclose()
+    assert paths == []
+
+
+async def test_an_earlier_turns_open_reservation_is_left_to_the_hook(setup) -> None:
+    """The hook's open record names another turn (one whose end the forwarder did
+    not see): this turn's end does not touch it; the hook's next prompt settles it."""
+    llmq, config, bridge = setup
+    llmq.publish(33)
+    opened = await _hook_admits(llmq, config, bridge, "t-earlier")
+    codex, server = FakeCodex(goal_status=None), FakeServer()
+    gate = make_gate(llmq, config, [])
+    paths = _counting(gate)
+    async with server.client() as ap:
+        note_admitted_turn(bridge, "t-now", clear_pending=False)
+        start(gate, codex, ap, bridge, "t-now")
+        await gate.drain()
+        gate.turn_finished("t-now")
+        await gate.drain()
+        await gate.aclose()
+    assert paths == []
+    assert llmq.reservation(opened["reservation_id"])["status"] == "active"
+
+
+def test_the_gate_reads_the_hooks_state_file() -> None:
+    from omnigent import codex_llmq_hook
+
+    assert goal_gate_module._HOOK_STATE_FILE == codex_llmq_hook._STATE_FILE
