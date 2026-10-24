@@ -63,7 +63,9 @@ from tests.e2e_ui.messages.test_message_render_parity import (
     _send,
 )
 from tests.e2e_ui.messages.test_native_codex_render_parity import (
+    _TERMINAL_VIEW,
     _open_terminal_view,
+    _type_into_tui,
     _wait_terminal_connected,
 )
 
@@ -989,3 +991,92 @@ def test_staging_margin_hold_then_turbo_releases_once(
     )
     assert created.status_code < 300, created.text[:300]
     assert new_turbo is True
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize(
+    "mocked_native_codex_session",
+    [{"model": MODEL, "responses": [_reply(n, f"TUI_REPLY_{n}") for n in range(1, 9)]}],
+    indirect=True,
+)
+def test_staging_tui_prompt_hook_blocks_then_turbo_admits(
+    page: Page,
+    mocked_native_codex_session: MockedCodexNativeSession,
+    staging_llmq: StagingLlmq,
+) -> None:
+    """Canary step 5: a prompt typed into the Codex TUI goes through the 3b hook.
+
+    At the margin with Turbo off the UserPromptSubmit hook blocks the prompt
+    (the model is never called); with Turbo on the next typed prompt is
+    admitted on a credit-bearing reservation, activated, and settled by Stop.
+    """
+    session = mocked_native_codex_session
+    llmq = staging_llmq
+    evidence = Evidence("s6-tui")
+    llmq.publish(95, credited=True)
+    _open_session(page, session)
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+
+    mark = llmq.mark()
+    blocked_text = f"S6 tui blocked {secrets.token_hex(4)}"
+    _type_into_tui(page, blocked_text)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not llmq.native_events(mark):
+        time.sleep(0.5)
+    time.sleep(3)
+    blocked_events = llmq.native_events(mark)
+    blocked_reqs = _provider_requests(session)
+    terminal_text = " ".join(page.locator(_TERMINAL_VIEW).last.inner_text().split())
+    shot_blocked = evidence.shot(page, "s6-tui-blocked")
+    _ensure_chat_view(page)
+    gear_blocked = _gear_summary(page)
+    evidence.add(
+        "S6-blocked",
+        native_events=blocked_events,
+        decisions=llmq.decisions(mark),
+        reservations=llmq.reservations(mark),
+        provider_requests_with_text=_requests_with(blocked_reqs, blocked_text),
+        request_summaries=_request_summaries(blocked_reqs),
+        terminal_mentions_margin=_MARGIN_SENTENCE[:40] in terminal_text,
+        terminal_tail=terminal_text[-600:],
+        gear=gear_blocked,
+        shot=shot_blocked,
+    )
+    assert [e["event_type"] for e in blocked_events] == ["native_turn_refused"]
+    assert blocked_events[0]["detail"]["reason"] == "credit_safety_margin"
+    assert blocked_events[0]["detail"]["turbo"] is False
+    assert _requests_with(blocked_reqs, blocked_text) == 0
+    assert llmq.decisions(mark) == [] and llmq.reservations(mark) == []
+
+    turbo_on = _set_turbo(page, True)
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    mark2 = llmq.mark()
+    admitted_text = f"S6 tui turbo {secrets.token_hex(4)}"
+    _type_into_tui(page, admitted_text)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        if _requests_with(_provider_requests(session), admitted_text) >= 1:
+            break
+        time.sleep(0.5)
+    settled = llmq.wait_settled(mark2, timeout=90)
+    admitted_reqs = _provider_requests(session)
+    evidence.add(
+        "S6-turbo",
+        turbo_toggle=turbo_on,
+        provider_requests_with_text=_requests_with(admitted_reqs, admitted_text),
+        request_summaries=_request_summaries(admitted_reqs),
+        ledger=llmq.ledger_delta(mark2),
+        settled=settled,
+        shot=evidence.shot(page, "s6-tui-turbo"),
+        runner_gate_log=_runner_gate_lines(session),
+    )
+    assert _requests_with(admitted_reqs, admitted_text) == 1
+    decisions = llmq.decisions(mark2)
+    assert len(decisions) == 1 and decisions[0]["allowed"] is True
+    assert llmq.native_events(mark2) == []
+    assert len(settled) == 1 and settled[0]["status"] == "settled"
+    assert settled[0]["metadata"].get("native_credit_bearing") is True
+    assert settled[0]["metadata"].get("dispatch_authorized_at") is not None
+    assert settled[0]["metadata"].get("native_usage_basis") == "retained_estimate"
