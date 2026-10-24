@@ -859,10 +859,12 @@ def clear_turn_start_pending(bridge_dir: Path) -> None:
         _logger.debug("llmq gate: could not clear a pending turn start", exc_info=True)
 
 
-def note_admitted_turn(bridge_dir: Path, turn_id: str) -> None:
+def note_admitted_turn(bridge_dir: Path, turn_id: str, *, clear_pending: bool = True) -> None:
     """Record that Codex turn ``turn_id`` was admitted before it started.
 
-    Also clears the pending-start marker. Best-effort: never raises.
+    Also clears the pending-start marker, unless ``clear_pending`` is false (a
+    caller other than the runner's own ``turn/start`` must leave that marker to
+    the runner). Best-effort: never raises.
     """
     if turn_id and "\n" not in turn_id:
         path = bridge_dir / ADMITTED_TURNS_FILE
@@ -876,7 +878,8 @@ def note_admitted_turn(bridge_dir: Path, turn_id: str) -> None:
                 os.replace(tmp, path)
         except (OSError, ValueError):
             _logger.debug("llmq gate: could not record admitted turn %s", turn_id, exc_info=True)
-    clear_turn_start_pending(bridge_dir)
+    if clear_pending:
+        clear_turn_start_pending(bridge_dir)
 
 
 def turn_admission_record(bridge_dir: Path, turn_id: str) -> str:

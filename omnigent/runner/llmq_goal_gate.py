@@ -32,6 +32,15 @@ is ``active``, :class:`GoalContinuationGate`:
   interrupting it without a pause would only make Codex start the next
   continuation at once.
 
+It also ends the terminal-UI hook's reservations (:mod:`omnigent.codex_llmq_hook`)
+for turns that end without a ``Stop`` hook: Codex fires ``Stop`` only for a turn
+that completed, and finishes it before ``turn/completed`` (codex-cli 0.159.1), so
+an interrupted or failed turn (or one another ``UserPromptSubmit`` hook blocked)
+still has its reservation open in the hook's state at ``turn/completed``. It is
+closed then, with the turn's measured usage when the forwarder saw it, instead
+of waiting for the session's next prompt or llmq's lease. The hook's own later
+settlement of that turn key is idempotent at llmq.
+
 Every Codex or llmq call and the Turbo read are bounded (5 s) and fail open; status
 posts use the forwarder's server client and its own timeout. The forwarder's event
 loop never waits on this module (each ``turn/started`` is handled in a task).
@@ -42,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -63,6 +73,7 @@ from omnigent.runner.llmq_gate import (
     close_codex_turn,
     llmq_usage,
     normalize_model,
+    note_admitted_turn,
     turn_admission_record,
     turn_key,
     unverified,
@@ -81,6 +92,9 @@ _GRANT_TTL_S = 120.0
 #: turn's own idle edge does not land after (and over) it.
 _INTERRUPT_SETTLE_S = 10.0
 _FINISHED_KEEP = 16
+#: :data:`omnigent.codex_llmq_hook._STATE_FILE`, the terminal-UI hook's state in the
+#: bridge dir (a test pins the two together).
+_HOOK_STATE_FILE = "llmq_gate_state.json"
 
 
 class CodexRequester(Protocol):
@@ -216,6 +230,8 @@ class GoalContinuationGate:
         self._meter = CodexTurnUsage()
         self._meter_turn: str | None = None
         self._turn_ended: dict[str, asyncio.Event] = {}
+        # The bridge dir of each started turn, to find the terminal-UI hook's state.
+        self._turn_bridge: dict[str, Path] = {}
 
     @classmethod
     def from_env(cls) -> GoalContinuationGate | None:
@@ -270,6 +286,9 @@ class GoalContinuationGate:
         self._turn_ended[turn_id] = asyncio.Event()
         while len(self._turn_ended) > _FINISHED_KEEP:
             self._turn_ended.pop(next(iter(self._turn_ended)))
+        self._turn_bridge[turn_id] = bridge_dir
+        while len(self._turn_bridge) > _FINISHED_KEEP:
+            self._turn_bridge.pop(next(iter(self._turn_bridge)))
         if codex is None:
             return
         self._codex = codex
@@ -296,8 +315,13 @@ class GoalContinuationGate:
         )
         self._meter.observe(params, count=counts)
 
-    def turn_finished(self, turn_id: str | None) -> None:
-        """A ``turn/completed`` / ``turn/failed`` for the forwarder's thread."""
+    def turn_finished(self, turn_id: str | None, *, bridge_dir: Path | None = None) -> None:
+        """A ``turn/completed`` / ``turn/failed`` for the forwarder's thread.
+
+        :param bridge_dir: The forwarder's bridge dir. Used to find the terminal-UI
+            hook's state when this gate never saw the turn start (the forwarder was
+            reconnecting, or a restarted runner's gate).
+        """
         if self._closed or not turn_id:
             return
         usage = None
@@ -307,6 +331,7 @@ class GoalContinuationGate:
         ended = self._turn_ended.get(turn_id)
         if ended is not None:
             ended.set()
+        bridge_dir = self._turn_bridge.pop(turn_id, None) or bridge_dir
         if turn_id in self._tracked:
             self._close_later(turn_id, usage)
             return
@@ -314,6 +339,11 @@ class GoalContinuationGate:
         self._finished[turn_id] = usage
         while len(self._finished) > _FINISHED_KEEP:
             self._finished.popitem(last=False)
+        if bridge_dir is not None:
+            self._spawn(
+                self._close_hook_turn(bridge_dir, turn_id, usage),
+                name=f"llmq-hook-close-{turn_id}",
+            )
 
     async def drain(self) -> None:
         """Wait for the in-flight work, not the long-lived waits (tests)."""
@@ -367,6 +397,11 @@ class GoalContinuationGate:
                 # Not a goal continuation (or the goal cannot be read): out of
                 # this gate's scope; such turns are left as they were.
                 return
+            # This gate owns the turn's admission from here on. Record it, so a
+            # steer into it (Codex fires the terminal-UI hook's UserPromptSubmit
+            # for a steer, with this turn's id) or a replayed turn/started is
+            # not admitted again (omnigent.codex_llmq_hook).
+            note_admitted_turn(bridge_dir, turn_id, clear_pending=False)
             grant = self._grants.pop(session_id, None)
             if grant is not None:
                 decision, key = grant
@@ -441,6 +476,45 @@ class GoalContinuationGate:
             outcome,
             tracked.decision.reservation_id,
             extra={"session_id": tracked.session_id},
+        )
+
+    async def _close_hook_turn(
+        self, bridge_dir: Path, turn_id: str, usage: dict[str, object] | None
+    ) -> None:
+        """Close the terminal-UI hook's reservation for a turn that ended without ``Stop``.
+
+        Only a reservation the hook still holds open for THIS turn is closed; the
+        hook's ``Stop`` (a completed turn) has already removed its own. The hook's
+        state file is left as it is: its next prompt settles the same turn key
+        again, which llmq answers idempotently.
+        """
+        state = _read_json_object(bridge_dir / _HOOK_STATE_FILE)
+        raw = state.get("open") if state is not None else None
+        if not isinstance(raw, dict) or raw.get("codex_turn_id") != turn_id:
+            return
+        reservation_id = raw.get("reservation_id")
+        key = raw.get("turn_key")
+        if not isinstance(reservation_id, str) or not isinstance(key, str):
+            return
+        tap = TurnStreamTap()
+        tap.dispatched = True  # Codex started the turn
+        tap.usage = llmq_usage(usage)
+        decision = GateDecision(
+            allow=True, verified=True, reason="admitted", reservation_id=reservation_id
+        )
+        outcome = await close_codex_turn(
+            self._client(),
+            self._config,
+            decision,
+            turn_key=key,
+            tap=tap,
+            activated=raw.get("activated") is True,
+        )
+        _logger.info(
+            "llmq goal gate: terminal-UI turn %s ended without Stop; reservation %s (%s)",
+            turn_id,
+            outcome,
+            reservation_id,
         )
 
     # ----------------------------------------------------------- hold
@@ -565,3 +639,11 @@ class GoalContinuationGate:
             cancel_codex_turn(self._client(), self._config, decision, turn_key=key),
             name=f"llmq-goal-grant-cancel-{session_id}",
         )
+
+
+def _read_json_object(path: Path) -> dict[str, object] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) else None
