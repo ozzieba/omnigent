@@ -551,15 +551,21 @@ def test_stop_without_a_reservation_makes_no_call(world: World) -> None:
 def test_next_prompt_settles_a_turn_whose_stop_never_fired(world: World) -> None:
     world.run()
     world.run(payload={"hook_event_name": "UserPromptSubmit", "turn_id": "turn-2"})
-    assert world.llmq_paths() == [
-        "admissions",
+    # The earlier turn is settled alongside the new prompt's admission (one llmq
+    # timeout on the prompt path, not two), so only the counts are ordered.
+    assert sorted(world.llmq_paths()) == [
         "activations",
+        "activations",
+        "admissions",
+        "admissions",
         "settlements",
-        "admissions",
-        "activations",
     ]
+    first, second = (b for _h, p, b in world.calls if p.endswith("/admissions"))
     settle = next(b for _h, p, b in world.calls if p.endswith("/settlements"))
     assert settle["usage_unmeasured"] is True
+    # The settled reservation is the EARLIER turn's, never the new one's.
+    assert settle["turn_key"] == first["turn_key"] != second["turn_key"]
+    assert world.state()["open"]["codex_turn_id"] == "turn-2"
 
 
 # ----------------------------------------------------------------- indicator

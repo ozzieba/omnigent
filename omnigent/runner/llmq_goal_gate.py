@@ -63,6 +63,7 @@ from omnigent.runner.llmq_gate import (
     close_codex_turn,
     llmq_usage,
     normalize_model,
+    note_admitted_turn,
     turn_admission_record,
     turn_key,
     unverified,
@@ -367,6 +368,11 @@ class GoalContinuationGate:
                 # Not a goal continuation (or the goal cannot be read): out of
                 # this gate's scope; such turns are left as they were.
                 return
+            # This gate owns the turn's admission from here on. Record it, so a
+            # steer into it (Codex fires the terminal-UI hook's UserPromptSubmit
+            # for a steer, with this turn's id) or a replayed turn/started is
+            # not admitted again (omnigent.codex_llmq_hook).
+            note_admitted_turn(bridge_dir, turn_id, clear_pending=False)
             grant = self._grants.pop(session_id, None)
             if grant is not None:
                 decision, key = grant

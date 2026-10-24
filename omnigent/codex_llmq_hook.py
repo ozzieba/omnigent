@@ -23,13 +23,17 @@ therefore also registers this module (see
   form answers 422 and the reservation is cancelled instead). Codex hooks carry no
   token usage, so TUI settlement is ALWAYS the retained estimate, never measured
   usage and never ``{0, 0}``. Codex fires ``Stop`` only for a turn that completed
-  (not for a failed or hook-blocked one); a turn without one is settled the same
-  way by the next prompt, and llmq's lease covers a session that ends first.
+  (not for a failed, interrupted or hook-blocked one; codex-cli 0.159.1); a turn
+  without one is settled the same way by the next prompt, alongside that prompt's
+  admission, and llmq's lease covers a session that ends first.
 
 Turns the runner delivers into the same app-server thread (web messages of a
 terminal-UI session) fire ``UserPromptSubmit`` too. The executor marks each
 ``turn/start`` it issues (:func:`mark_runner_turn`) and this hook skips the marked
-turn, so a runner-gated turn is never admitted twice.
+turn, so a runner-gated turn is never admitted twice. Codex also fires
+``UserPromptSubmit`` for a steer, with the running turn's id: a turn some gate
+already recorded as admitted (``llmq-admitted-turns``: the executor's runner turns,
+this hook's own, the forwarder's goal continuations) is skipped.
 
 Codex runs hooks with the app-server's filtered environment
 (:func:`omnigent.inner.codex_executor._clean_codex_env`), which keeps
@@ -57,7 +61,6 @@ import sys
 import tempfile
 import time
 import urllib.parse
-import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -89,11 +92,13 @@ _REQUIRED_ENV = ("LLMQ_CONTROLLER_URL", "LLMQ_TOKEN_FILE", "LLMQ_AGENT_ID")
 _GATE_FILE = "llmq_gate.json"
 _STATE_FILE = "llmq_gate_state.json"
 _RUNNER_TURN_FILE = "llmq_runner_turn.json"
+#: :data:`omnigent.runner.llmq_gate.ADMITTED_TURNS_FILE`, named here so the light
+#: exits need not import llmq_gate (a test pins the two together).
+_ADMITTED_TURNS_FILE = "llmq-admitted-turns"
 #: A runner ``turn/start`` marker older than this is ignored (the turn's hook
 #: never fired, e.g. the hook was not trusted yet).
 RUNNER_TURN_TTL_SECONDS = 300.0
 _SERVER_TIMEOUT_S = 5.0
-_REQUEST_TIMEOUT_S = 5.0
 _HOOK_BUDGET_S = 45.0
 
 
@@ -251,6 +256,10 @@ class _Server:
         self._headers = headers
         self._session_path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
         self.session_id = session_id
+        #: False once a request could not reach the server (connect error,
+        #: timeout): the indicator POST is then skipped instead of waiting out a
+        #: second 5 s timeout on the prompt path.
+        self.reachable = True
         self.client = httpx.AsyncClient(
             base_url=url, headers=headers, timeout=_SERVER_TIMEOUT_S, follow_redirects=False
         )
@@ -292,6 +301,8 @@ class _Server:
             if resp.status_code == 200:
                 body = resp.json()
                 return isinstance(body, dict) and body.get("turbo") is True
+        except httpx.TransportError:
+            self.reachable = False
         except (httpx.HTTPError, ValueError):
             pass
         return False
@@ -302,6 +313,8 @@ class _Server:
 
         from omnigent._native_post_delivery import post_external_session_status
 
+        if not self.reachable:
+            return False
         try:
             await post_external_session_status(
                 self.client,
@@ -325,6 +338,7 @@ async def _prompt_submit(
 
     from omnigent.runner.llmq_gate import (
         REFUSAL_REASONS,
+        activate_codex_turn,
         gate_codex_turn,
         normalize_model,
         note_admitted_turn,
@@ -336,69 +350,90 @@ async def _prompt_submit(
     turbo = False
     try:
         async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as llmq:
-            if state.get("open"):
-                # A new turn means the previous one ended without a Stop.
-                await _settle_open(llmq, config, state)
-                _save_state(bridge_dir, state)
-            if _consume_runner_turn(bridge_dir):
-                state["runner_turn_id"] = turn_id
-                _save_state(bridge_dir, state)
-                return {}  # the runner admitted this turn itself
-            turbo = await server.turbo() if server is not None else False
-            seen: list[GateDecision] = []
-
-            async def read_turbo() -> bool:
-                return turbo
-
-            async def on_status(decision: GateDecision, _turbo: bool) -> None:
-                seen.append(decision)
-
-            async def sleep(seconds: float) -> None:
-                if seen and not seen[-1].allow and seen[-1].reason in REFUSAL_REASONS:
-                    raise _Held(seen[-1])
-                await asyncio.sleep(seconds)
-
-            model = normalize_model(_payload_str(payload, "model"), config.default_model)
+            # A new turn means the previous one ended without a Stop (Codex fires
+            # none for an interrupted or failed turn). Settle it ALONGSIDE this
+            # prompt's admission, so a hung llmq holds the prompt for one 5 s
+            # timeout, not two. Popped now, so it is never this turn's reservation.
+            previous = state.pop("open", None)
+            settling = (
+                asyncio.create_task(_close_open(llmq, config, previous))
+                if previous is not None
+                else None
+            )
             try:
-                decision, key = await gate_codex_turn(
-                    llmq,
-                    config,
-                    session_id=session_id,
-                    turn_salt=f"tui:{turn_id or ''}:{time.time_ns()}",
-                    model=model,
-                    read_turbo=read_turbo,
-                    on_status=on_status,
-                    sleep=sleep,
-                )
-            except _Held as held:
-                if server is not None and await server.post_gate(held.decision, turbo):
-                    state["indicator"] = "blocked"
+                if _consume_runner_turn(bridge_dir):
+                    state["runner_turn_id"] = turn_id
                     _save_state(bridge_dir, state)
-                return {
-                    "decision": "block",
-                    "reason": held.decision.message(turbo=turbo) or held.decision.reason,
-                }
-            if turn_id is not None:
-                # The turn will run: tell the forwarder's goal-continuation gate it
-                # was admitted here (omnigent.runner.llmq_goal_gate), so a prompt
-                # typed while a goal is active is not admitted twice.
-                note_admitted_turn(bridge_dir, turn_id, clear_pending=False)
-            if decision.reservation_id is not None:
-                state["open"] = {
-                    "codex_turn_id": turn_id,
-                    "turn_key": key,
-                    "reservation_id": decision.reservation_id,
-                }
-                _save_state(bridge_dir, state)
-                await _activate(llmq, config, decision, turn_key=key, model=model, turbo=turbo)
-            if server is not None and (
-                decision.state != "verified" or state.get("indicator", "verified") != "verified"
-            ):
-                # Show "unverified", or clear an earlier unverified/blocked chip.
-                if await server.post_gate(decision, turbo):
-                    state["indicator"] = decision.state
+                    return {}  # the runner admitted this turn itself
+                if turn_id is not None and _turn_admitted(bridge_dir, turn_id):
+                    return {}  # a steer into a turn another gate already admitted
+                turbo = await server.turbo() if server is not None else False
+                seen: list[GateDecision] = []
+
+                async def read_turbo() -> bool:
+                    return turbo
+
+                async def on_status(decision: GateDecision, _turbo: bool) -> None:
+                    seen.append(decision)
+
+                async def sleep(seconds: float) -> None:
+                    if seen and not seen[-1].allow and seen[-1].reason in REFUSAL_REASONS:
+                        raise _Held(seen[-1])
+                    await asyncio.sleep(seconds)
+
+                model = normalize_model(_payload_str(payload, "model"), config.default_model)
+                try:
+                    decision, key = await gate_codex_turn(
+                        llmq,
+                        config,
+                        session_id=session_id,
+                        turn_salt=f"tui:{turn_id or ''}:{time.time_ns()}",
+                        model=model,
+                        read_turbo=read_turbo,
+                        on_status=on_status,
+                        sleep=sleep,
+                    )
+                except _Held as held:
+                    if server is not None and await server.post_gate(held.decision, turbo):
+                        state["indicator"] = "blocked"
+                        _save_state(bridge_dir, state)
+                    return {
+                        "decision": "block",
+                        "reason": held.decision.message(turbo=turbo) or held.decision.reason,
+                    }
+                if turn_id is not None:
+                    # The turn will run: tell the forwarder's goal-continuation gate it
+                    # was admitted here (omnigent.runner.llmq_goal_gate), so a prompt
+                    # typed while a goal is active is not admitted twice.
+                    note_admitted_turn(bridge_dir, turn_id, clear_pending=False)
+                if decision.reservation_id is not None:
+                    opened: dict[str, object] = {
+                        "codex_turn_id": turn_id,
+                        "turn_key": key,
+                        "reservation_id": decision.reservation_id,
+                    }
+                    state["open"] = opened
                     _save_state(bridge_dir, state)
-            return {}
+                    # Activate before Codex dispatches (best effort), with the runner's
+                    # helper; remember whether llmq authorised the dispatch, after
+                    # which the turn must never be cancelled (close_codex_turn).
+                    if await activate_codex_turn(llmq, config, decision, turn_key=key) is True:
+                        opened["activated"] = True
+                        _save_state(bridge_dir, state)
+                if server is not None and (
+                    decision.state != "verified"
+                    or state.get("indicator", "verified") != "verified"
+                ):
+                    # Show "unverified", or clear an earlier unverified/blocked chip.
+                    if await server.post_gate(decision, turbo):
+                        state["indicator"] = decision.state
+                        _save_state(bridge_dir, state)
+                return {}
+            finally:
+                if settling is not None:
+                    with contextlib.suppress(Exception):
+                        await settling
+                    _save_state(bridge_dir, state)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - the gate never blocks a prompt on its own faults
@@ -433,9 +468,13 @@ async def _settle_open(
     older llmq answers 422, nothing on any other fault (the lease covers it).
     The reservation is forgotten either way, as the runner does.
     """
+    return await _close_open(llmq, config, state.pop("open", None))
+
+
+async def _close_open(llmq: httpx.AsyncClient, config: GateConfig, raw: object) -> str:
+    """:func:`_settle_open` for an ``open`` record already taken from the state."""
     from omnigent.runner.llmq_gate import GateDecision, TurnStreamTap, close_codex_turn
 
-    raw = state.pop("open", None)
     if not isinstance(raw, dict):
         return "none"
     reservation_id = raw.get("reservation_id")
@@ -447,50 +486,9 @@ async def _settle_open(
     decision = GateDecision(
         allow=True, verified=True, reason="admitted", reservation_id=reservation_id
     )
-    return await close_codex_turn(llmq, config, decision, turn_key=key, tap=tap)
-
-
-async def _activate(
-    llmq: httpx.AsyncClient,
-    config: GateConfig,
-    decision: GateDecision,
-    *,
-    turn_key: str,
-    model: str,
-    turbo: bool,
-) -> bool:
-    """Activate the admitted reservation before Codex dispatches (best effort).
-
-    llmq_gate has no activation helper (the runner never activates), so this
-    posts llmq's ``NativeTurnActivation`` directly: the admission body plus the
-    reservation and a fresh activation id. Faults are ignored.
-    """
-    import httpx
-
-    bearer = config.bearer()
-    if bearer is None or decision.reservation_id is None:
-        return False
-    body = {
-        "turn_key": turn_key,
-        "agent_id": config.agent_id,
-        "workstream": config.workstream,
-        "harness": "codex",
-        "model": model,
-        "evidence": "controller",
-        "turbo": turbo,
-        "reservation_id": decision.reservation_id,
-        "activation_id": "tui-" + uuid.uuid4().hex,
-    }
-    try:
-        resp = await llmq.post(
-            f"{config.controller_url}/v1/native-turns/activations",
-            json=body,
-            headers={"Authorization": f"Bearer {bearer}"},
-            timeout=_REQUEST_TIMEOUT_S,
-        )
-    except httpx.HTTPError:
-        return False
-    return resp.status_code == 200
+    return await close_codex_turn(
+        llmq, config, decision, turn_key=key, tap=tap, activated=raw.get("activated") is True
+    )
 
 
 # ----------------------------------------------------------------- files
@@ -529,6 +527,15 @@ def _consume_runner_turn(bridge_dir: Path) -> bool:
     if isinstance(at, bool) or not isinstance(at, (int, float)):
         return False
     return 0 <= time.time() - at <= RUNNER_TURN_TTL_SECONDS
+
+
+def _turn_admitted(bridge_dir: Path, turn_id: str) -> bool:
+    """Whether some gate recorded Codex turn ``turn_id`` as admitted (cheap read)."""
+    try:
+        recorded = (bridge_dir / _ADMITTED_TURNS_FILE).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    return turn_id in recorded.splitlines()
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
@@ -623,6 +630,14 @@ def _run(argv: list[str]) -> dict[str, object]:
         if not state.get("open") and _consume_runner_turn(bridge_dir):
             state["runner_turn_id"] = turn_id
             _save_state(bridge_dir, state)
+            return {}
+        # Codex fires UserPromptSubmit for a steer too, with the RUNNING turn's id
+        # (real codex-cli 0.159.1). A turn already admitted by any gate (the
+        # runner's executor, this hook, the forwarder's goal gate) is not admitted
+        # again: e.g. a steer into a goal continuation, or a web message the runner
+        # admitted and delivered as ``turn/steer``. Checked after the runner
+        # marker, so a runner turn the executor already recorded still takes it.
+        if not state.get("open") and turn_id is not None and _turn_admitted(bridge_dir, turn_id):
             return {}
     from omnigent.runner.llmq_gate import GateConfig
 
