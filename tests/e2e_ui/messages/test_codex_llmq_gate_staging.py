@@ -992,6 +992,31 @@ def test_staging_margin_hold_then_turbo_releases_once(
     assert created.status_code < 300, created.text[:300]
     assert new_turbo is True
 
+    # Turbo back OFF: the next turn at the margin is held again (the flag is
+    # read live on every admission, both ways).
+    turbo_off = _set_turbo(page, False)
+    mark_off = llmq.mark()
+    off_text = f"S5 turbo off again {secrets.token_hex(4)}"
+    _send(page, off_text)
+    expect(page.locator(_WORKING)).to_contain_text(_MARGIN_SENTENCE, timeout=60_000)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not llmq.native_events(mark_off):
+        time.sleep(0.5)
+    off_events = llmq.native_events(mark_off)
+    off_requests = _requests_with(_provider_requests(session), off_text)
+    evidence.add(
+        "S5-turbo-off",
+        turbo_toggle=turbo_off,
+        native_events=off_events,
+        provider_requests_with_text=off_requests,
+        record_turbo=_session_json(session).get("turbo"),
+    )
+    assert turbo_off["patch"].get("status") == 200
+    assert off_events and off_events[0]["event_type"] == "native_turn_refused"
+    assert off_events[0]["detail"]["turbo"] is False
+    assert off_requests == 0
+    assert llmq.decisions(mark_off) == []
+
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
