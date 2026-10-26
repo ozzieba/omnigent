@@ -28,8 +28,10 @@ import contextlib
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
+import httpx
 import pexpect
 
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
@@ -117,6 +119,28 @@ def _lock_is_held(record_path: Path) -> bool:
         return False
     finally:
         os.close(fd)
+
+
+def _wait_for_daemon_online(record: Path, port: int, pid: int) -> None:
+    """Establish the exact daemon's tunnel before testing its reuse."""
+    deadline = time.monotonic() + _BOOT_TIMEOUT
+    while time.monotonic() < deadline:
+        payload = json.loads(record.read_text())
+        assert payload["pid"] == pid, "daemon changed before its tunnel became ready"
+        host_id = payload.get("host_id")
+        if host_id:
+            try:
+                response = httpx.get(
+                    f"http://127.0.0.1:{port}/v1/hosts/{host_id}",
+                    timeout=2.0,
+                    trust_env=False,
+                )
+                if response.status_code == 200 and response.json().get("status") == "online":
+                    return
+            except httpx.HTTPError:
+                pass
+        _POLL_PAUSE.wait(0.25)
+    raise AssertionError("daemon owns its record but did not establish its host tunnel")
 
 
 def _assert_daemon_owns_record(record: Path, pid: int) -> None:
@@ -375,11 +399,11 @@ def test_background_spawn_reuses_daemon_when_flock_held(
     mock_credentials_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    """A second spin-up reuses the live daemon whose record flock is held.
+    """A second spin-up reuses the online daemon whose record flock is held.
 
     The first ``--background`` spawn leaves a daemon holding its record's
-    flock. A second spawn must probe that held lock, conclude the owner is
-    alive, and reuse it — same pid, no duplicate daemon.
+    flock. After its tunnel becomes online, a second spawn must reuse that
+    healthy owner — same pid, no duplicate daemon.
 
     :param omnigent_python: Python interpreter fixture.
     :param omnigent_repo_root: Repo root fixture (subprocess cwd).
@@ -398,6 +422,7 @@ def test_background_spawn_reuses_daemon_when_flock_held(
     try:
         server_pid, _port = _read_local_server_record(home)
         assert _lock_is_held(record), "first daemon should hold the record flock"
+        _wait_for_daemon_online(record, _port, pid1)
 
         proc2 = _spawn_background_daemon(omnigent_python, omnigent_repo_root, env)
         assert proc2.returncode == 0, (

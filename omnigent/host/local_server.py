@@ -17,8 +17,10 @@ importing ``cli.py`` to keep that dependency direction clean.
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -725,6 +727,29 @@ def _find_free_local_port() -> int:
 # Deployments (Databricks Apps, Docker) pin their own port (typically 8000,
 # the platform convention) and do NOT read this constant.
 _DEFAULT_LOCAL_PORT = 6767
+
+
+def bind_local_server_socket(host: str, preferred: int) -> socket.socket:
+    """Reserve the canonical listener until uvicorn takes ownership.
+
+    Holding a listening socket prevents a concurrent startup from taking the
+    advertised port between its probe and the server's eventual bind.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, preferred))
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            sock.bind((host, 0))
+        sock.listen(socket.SOMAXCONN)
+        sock.setblocking(False)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
 
 
 def pick_local_port(preferred: int = _DEFAULT_LOCAL_PORT) -> int:

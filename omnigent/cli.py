@@ -4035,10 +4035,11 @@ def server(
     # See _apply_bind_auth_defaults for the full decision matrix.
     _apply_bind_auth_defaults(host)
 
+    _canonical_socket = None
     if _is_canonical_local_server:
         from omnigent.host.local_server import (
+            bind_local_server_socket,
             local_server_url_if_healthy,
-            pick_local_port,
         )
 
         _existing = local_server_url_if_healthy()
@@ -4049,7 +4050,9 @@ def server(
                 "(or pass --server <url> to target a different server)."
             )
             return
-        _picked = pick_local_port(port)
+        _canonical_socket = bind_local_server_socket(host, port)
+        ctx.call_on_close(_canonical_socket.close)
+        _picked = int(_canonical_socket.getsockname()[1])
         if _picked != port:
             click.echo(
                 f"  ⚠ port {port} is busy — using {_picked} instead.",
@@ -4411,7 +4414,11 @@ def server(
         timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     try:
-        _ShutdownSignalingServer(_config).run()
+        _server = _ShutdownSignalingServer(_config)
+        if _canonical_socket is None:
+            _server.run()
+        else:
+            _server.run(sockets=[_canonical_socket])
     except KeyboardInterrupt:
         # uvicorn.run() swallows KeyboardInterrupt; match that behaviour so
         # a Ctrl-C exit doesn't print Click's "Aborted!" or exit non-zero.
