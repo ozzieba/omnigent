@@ -1,6 +1,7 @@
 """Durability, concurrent ownership and lifecycle evidence."""
 
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 from sqlalchemy import inspect
@@ -57,6 +58,39 @@ def test_concurrent_creation(db_uri):
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert sorted(pool.map(write, ["Restore A", "Restore B"])) == ["conflict", "stored"]
     assert s.get_session_goal(sid).revision == 1
+
+
+@pytest.mark.parametrize("initial_revision", [0, 1])
+def test_concurrent_revision_after_waiting_for_lock(db_uri, initial_revision):
+    """A writer that waits for the parent lock must read the winner's revision."""
+    store = SqlAlchemyConversationStore(db_uri)
+    if store._conv_engine.dialect.name != "mysql":
+        pytest.skip("controlled REPEATABLE READ snapshot race requires MySQL")
+    sid = store.create_conversation().id
+    if initial_revision:
+        store.set_session_goal(sid, req("Initial"), "owner")
+    waiting = Event()
+    release = Event()
+
+    class DelayedWriter(SqlAlchemyConversationStore):
+        def _lock_conversation(self, session, conversation_id):
+            waiting.set()
+            assert release.wait(10), "winner did not release the delayed writer"
+            super()._lock_conversation(session, conversation_id)
+
+    delayed = DelayedWriter(db_uri)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(
+            delayed.set_session_goal, sid, req("Delayed", initial_revision), "owner"
+        )
+        try:
+            assert waiting.wait(10), "delayed writer did not reach the lock"
+            winner = store.set_session_goal(sid, req("Winner", initial_revision), "owner")
+        finally:
+            release.set()
+        with pytest.raises(SessionGoalConflict):
+            result.result(timeout=10)
+    assert store.get_session_goal(sid) == winner
 
 
 def test_completion_evidence(conversation_store):

@@ -1334,9 +1334,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         updated_by: str | None,
     ) -> SessionGoal:
         with self._conv_session_immediate("update_session_goal") as session:
+            # MySQL snapshots begin at the first nonlocking read. Lock first so
+            # a writer waiting here sees the previous owner's committed goal.
+            self._lock_conversation(session, conversation_id)
             if session.get(SqlConversation, (current_workspace_id(), conversation_id)) is None:
                 raise ConversationNotFoundError(conversation_id)
-            self._lock_conversation(session, conversation_id)
             row = session.get(SqlSessionGoal, (current_workspace_id(), conversation_id))
             revision = row.revision if row is not None else 0
             if revision != request.expected_revision:
