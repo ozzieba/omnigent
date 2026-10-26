@@ -499,11 +499,32 @@ def _fake_client(ap_client: httpx.AsyncClient) -> object:
     """
     base = str(ap_client.base_url).rstrip("/")
 
+    class _StreamingSessions(SessionsNamespace):
+        """Stream the real pub-sub generator without ASGITransport buffering."""
+
+        async def stream(self, session_id: str):
+            from types import SimpleNamespace
+            from unittest.mock import AsyncMock
+
+            from omnigent_client._sessions import _parse_sse_lines
+
+            from omnigent.server.routes._sessions.helpers import _stream_live_events
+
+            request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
+
+            async def lines():
+                async for chunk in _stream_live_events(request, session_id):
+                    for line in chunk.splitlines():
+                        yield line
+
+            async for event in _parse_sse_lines(lines()):
+                yield event
+
     class _FakeClient:
         """Duck-typed Omnigent client backed by the tunnel-stack httpx client."""
 
         def __init__(self) -> None:
-            self.sessions = SessionsNamespace(ap_client, base)
+            self.sessions = _StreamingSessions(ap_client, base)
             self.files = FilesNamespace(ap_client, base)
 
     return _FakeClient()

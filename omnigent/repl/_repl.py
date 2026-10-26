@@ -219,6 +219,9 @@ WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel"
 # position 99.
 _LIST_ITEMS_PAGE_SIZE = 100
 
+# Match the SDK SSE connect budget; never POST into an unacknowledged live tail.
+_SESSION_STREAM_READY_TIMEOUT_S = 30.0
+
 # Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
 # cadence refreshes deeper levels (the SSE stream only carries the active
@@ -1383,6 +1386,7 @@ class _SessionsChatReplAdapter:
         # Set by run_repl() to the rendering callback.
         self._on_event: Callable[[object], None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        self._stream_ready = asyncio.Event()
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
         self._bind_lock = asyncio.Lock()
@@ -1709,6 +1713,7 @@ class _SessionsChatReplAdapter:
                 self._hydrate_from_session_snapshot(session)
             await self._bind_runner_if_needed()
             if self._stream_task is None:
+                self._stream_ready.clear()
                 self._stream_task = asyncio.create_task(
                     self._stream_pump(),
                     name=f"sessions-adapter-stream-{self._session_id}",
@@ -2124,6 +2129,7 @@ class _SessionsChatReplAdapter:
         self._hydrate_from_session_snapshot(session)
         await self._bind_runner_if_needed()
 
+        self._stream_ready.clear()
         self._stream_task = asyncio.create_task(self._stream_pump())
         return new_session_id
 
@@ -2173,6 +2179,7 @@ class _SessionsChatReplAdapter:
             self._stream_task = None
         session = await self._client.sessions.get(new_session_id)
         self._hydrate_from_session_snapshot(session)
+        self._stream_ready.clear()
         self._stream_task = asyncio.create_task(self._stream_pump())
         return new_session_id
 
@@ -2233,6 +2240,9 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
+                    # The first event (normally the ready heartbeat) proves the
+                    # no-replay subscriber is registered before a fast input.
+                    self._stream_ready.set()
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2243,12 +2253,15 @@ class _SessionsChatReplAdapter:
                             turn_done.set()
                     if self._on_event is not None:
                         self._on_event(event)
+                self._stream_ready.clear()
                 # Clean close (server sent [DONE]). Reopen.
                 await asyncio.sleep(backoff)
                 backoff = 0.5
             except asyncio.CancelledError:
+                self._stream_ready.clear()
                 raise
             except Exception as exc:  # noqa: BLE001 — reconnect on any error
+                self._stream_ready.clear()
                 # Recoverable transport errors (peer closed mid-chunk,
                 # read timeout, transient network error) are normal
                 # background noise — the session continues server-side
@@ -2291,6 +2304,23 @@ class _SessionsChatReplAdapter:
                     )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
+
+    async def _wait_for_stream_ready(self) -> None:
+        """Await subscription acknowledgment before sending a no-replay input."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SESSION_STREAM_READY_TIMEOUT_S
+        try:
+            while not self._stream_ready.is_set():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(self._stream_ready.wait(), timeout=remaining)
+                # A disconnect may clear the flag after waking this waiter.
+                # Recheck it without giving reconnects a fresh timeout budget.
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "Session event stream did not become ready; input was not sent."
+            ) from exc
 
     async def send(
         self,
@@ -2356,6 +2386,7 @@ class _SessionsChatReplAdapter:
         if self._model_override is not None:
             event_payload["model_override"] = self._model_override
 
+        await self._wait_for_stream_ready()
         # Signal that a turn is active. The _on_event callback
         # uses this to know it should handle streaming text deltas
         # and tool rendering inline rather than as history items.
@@ -2457,6 +2488,7 @@ class _SessionsChatReplAdapter:
         if self._model_override is not None:
             event_payload["model_override"] = self._model_override
 
+        await self._wait_for_stream_ready()
         self._is_streaming = True
         self._turn_done = asyncio.Event()
         command_key = (skill_name, arguments)
