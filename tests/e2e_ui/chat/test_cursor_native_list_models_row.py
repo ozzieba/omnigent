@@ -245,13 +245,16 @@ def catalog_session(
 def _expand_list_models_tool_call(page: Page) -> None:
     """Expand the ``sys_list_models`` tool call in the transcript.
 
-    A lone call renders directly as a ``sys_list_models(...)`` trigger;
-    completed multi-step turns fold calls into a collapsed "Called N tools"
-    group — expand groups when present, then click the call trigger so its
-    output preview (the catalog JSON) is on screen.
+    Settled turns nest the trace behind a "Worked for" disclosure. Open it,
+    then any "Called N tools" group, before opening the call's JSON preview.
 
     :param page: The Playwright page, on the parent session.
     """
+    worked = page.get_by_role("button", name=re.compile(r"^Worked(?: for |$)"))
+    expect(worked.first).to_be_visible(timeout=30_000)
+    if worked.first.get_attribute("aria-expanded") != "true":
+        worked.first.click()
+    expect(worked.first).to_have_attribute("aria-expanded", "true")
     direct = page.get_by_role("button", name=re.compile(r"^sys_list_models\("))
     if not direct.count():
         groups = page.get_by_text(re.compile(r"^Called \d+ tools?$"))
@@ -328,6 +331,10 @@ def test_cursor_native_worker_row_not_source_none(
     # the turn and folds its tool calls. Wait for the authoritative session
     # status UI to go idle so the trigger cannot be replaced mid-click.
     expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=30_000)
+
+    # Settled history mounts its work disclosure closed, avoiding the live
+    # turn's one-frame collapse replacing a tool card during expansion.
+    page.reload()
 
     # Put the catalog on screen the way a user reads it (and the video shows it).
     _expand_list_models_tool_call(page)

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import expect, sync_playwright
+from playwright.async_api import async_playwright, expect
 
 _ROOT = Path(__file__).resolve().parents[3]
 _HTML = """<!doctype html><html><head>
@@ -86,32 +86,32 @@ def surface_url(tmp_path):
 
 
 @pytest.mark.parametrize("failure", ["timeout", "rejection"])
-def test_native_load_recovery(surface_url, failure, tmp_path):
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
-        page = browser.new_page()
+async def test_native_load_recovery(surface_url, failure, tmp_path):
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page()
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
         loads = []
         descriptors = []
 
-        def api(route):
+        async def api(route):
             path = route.request.url.split("/docloop", 1)[1]
             if path == "/document":
-                route.fulfill(json={"format": "ipynb"})
+                await route.fulfill(json={"format": "ipynb"})
             elif path == "/jupyter":
                 descriptors.append(path)
-                route.fulfill(
+                await route.fulfill(
                     json={"url": "/v1/sessions/fixture/docloop/jupyter/lab/tree/task.ipynb"}
                 )
             elif path.startswith("/jupyter/lab/tree/"):
                 loads.append(path)
-                route.fulfill(
+                await route.fulfill(
                     content_type="text/html",
                     body=_LAB.replace("READY", "true" if len(loads) > 1 else "false"),
                 )
             elif path.startswith("/versions"):
-                route.fulfill(
+                await route.fulfill(
                     json={
                         "schema_version": 1,
                         "session_id": "fixture",
@@ -120,43 +120,45 @@ def test_native_load_recovery(surface_url, failure, tmp_path):
                     }
                 )
             else:
-                route.fulfill(status=404)
+                await route.fulfill(status=404)
 
-        page.route("**/v1/**", api)
-        page.route(
-            "**/surface-fixture", lambda route: route.fulfill(content_type="text/html", body=_HTML)
-        )
-        page.clock.install()
-        page.goto(surface_url + "/surface-fixture")
+        await page.route("**/v1/**", api)
+
+        async def surface_fixture(route):
+            await route.fulfill(content_type="text/html", body=_HTML)
+
+        await page.route("**/surface-fixture", surface_fixture)
+        await page.clock.install()
+        await page.goto(surface_url + "/surface-fixture")
         frame = page.frame_locator("iframe")
-        expect(frame.locator("body")).to_contain_text("Local notebook fixture")
+        await expect(frame.locator("body")).to_contain_text("Local notebook fixture")
         # Let the parent attach its restoration promise observer first.
-        page.clock.run_for(500)
+        await page.clock.run_for(500)
         if failure == "timeout":
-            page.clock.fast_forward(120_000)
-            expect(page.get_by_role("alert")).to_contain_text("did not finish loading")
+            await page.clock.fast_forward(120_000)
+            await expect(page.get_by_role("alert")).to_contain_text("did not finish loading")
         else:
-            frame.locator("body").evaluate(
+            await frame.locator("body").evaluate(
                 '() => window.failRestore(new Error("fixture failure"))'
             )
-            expect(page.get_by_role("alert")).to_contain_text("could not restore")
+            await expect(page.get_by_role("alert")).to_contain_text("could not restore")
         evidence = Path(os.environ.get("OMNIGENT_E2E_EVIDENCE_DIR", tmp_path))
         evidence.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(evidence / f"native-load-{failure}.png"), full_page=True)
-        page.clock.fast_forward(120_000)
+        await page.screenshot(path=str(evidence / f"native-load-{failure}.png"), full_page=True)
+        await page.clock.fast_forward(120_000)
         assert len(loads) == len(descriptors) == 1
-        page.get_by_role("button", name="Try again").click()
-        expect(frame.locator("body")).to_contain_text("Local notebook fixture")
-        page.clock.run_for(750)
-        expect(page.get_by_role("status")).to_have_text("Kernel: idle")
-        page.evaluate('window.savedFrame = document.querySelector("iframe")')
-        page.evaluate("window.showSurface(false)")
-        page.evaluate("window.showSurface(true)")
-        page.get_by_role("button", name="History", exact=True).click()
-        page.get_by_role("button", name="JupyterLab", exact=True).click()
-        page.clock.fast_forward(240_000)
-        assert page.evaluate('window.savedFrame === document.querySelector("iframe")')
+        await page.get_by_role("button", name="Try again").click()
+        await expect(frame.locator("body")).to_contain_text("Local notebook fixture")
+        await page.clock.run_for(750)
+        await expect(page.get_by_role("status")).to_have_text("Kernel: idle")
+        await page.evaluate('window.savedFrame = document.querySelector("iframe")')
+        await page.evaluate("window.showSurface(false)")
+        await page.evaluate("window.showSurface(true)")
+        await page.get_by_role("button", name="History", exact=True).click()
+        await page.get_by_role("button", name="JupyterLab", exact=True).click()
+        await page.clock.fast_forward(240_000)
+        assert await page.evaluate('window.savedFrame === document.querySelector("iframe")')
         assert len(loads) == len(descriptors) == 2
-        expect(page.get_by_role("alert")).to_have_count(0)
+        await expect(page.get_by_role("alert")).to_have_count(0)
         assert errors == []
-        browser.close()
+        await browser.close()

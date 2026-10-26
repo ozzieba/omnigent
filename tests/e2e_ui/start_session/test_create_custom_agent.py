@@ -512,20 +512,15 @@ async def _drive_cancel(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_create_agent_hidden_on_sandbox(
+def test_create_agent_available_on_managed_sandbox(
     seeded_session: tuple[str, str],
 ) -> None:
-    """On a managed sandbox target, "Create custom agent" is hidden.
-
-    A sandbox provisions its runner from a baked image with no create path for
-    an uploaded bundle, so the affordance is omitted from the picker. Switching
-    to a connected host brings it back.
-    """
+    """Managed sandboxes and connected hosts both accept custom agent bundles."""
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_hidden_on_sandbox(base_url, session_id))
+    _run_in_fresh_loop(_drive_available_on_managed_sandbox(base_url, session_id))
 
 
-async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
+async def _drive_available_on_managed_sandbox(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -550,11 +545,11 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
 
-            # On the sandbox, "Create custom agent" is not offered (a managed
-            # sandbox has no create path for an uploaded bundle), so it's never
-            # in the DOM.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
+            await _open_create_agent(page)
+            dialog = page.get_by_test_id("create-agent-dialog")
+            await expect(dialog).to_be_visible(timeout=5_000)
+            await dialog.get_by_role("button", name="Cancel").click()
+            await expect(dialog).to_be_hidden()
 
             # Switch to the connected host: with no custom agents yet, create is
             # a top-level row (not behind a "Custom agents" submenu) and opens.
@@ -573,20 +568,15 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_pending_agent_dropped_when_switching_to_sandbox(
+def test_pending_agent_kept_when_switching_to_managed_sandbox(
     seeded_session: tuple[str, str],
 ) -> None:
-    """A pending custom agent picked on a host is dropped on switch to sandbox.
-
-    Creating a custom agent selects it as the pending pick. Since a pending
-    bundle can't run on a managed sandbox, switching the target to the sandbox
-    must fall the selection back to a real agent and drop the pending row.
-    """
+    """A pending custom bundle stays selected when switching to a managed sandbox."""
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_pending_dropped_on_sandbox(base_url, session_id))
+    _run_in_fresh_loop(_drive_pending_kept_on_managed_sandbox(base_url, session_id))
 
 
-async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> None:
+async def _drive_pending_kept_on_managed_sandbox(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -617,16 +607,17 @@ async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> N
                 "pending-agent"
             )
 
-            # Switch the target back to the sandbox: the pending pick is dropped.
+            # A managed sandbox accepts the same pending bundle as the host.
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id("new-chat-landing-sandbox-option").click()
             await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
                 "Databricks Sandbox"
             )
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).not_to_contain_text(
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
                 "pending-agent"
             )
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await expect(page.get_by_test_id("new-chat-landing-agent-pending")).to_have_count(0)
+            await page.get_by_test_id("new-chat-landing-custom-agents").hover()
+            await expect(page.get_by_test_id("new-chat-landing-agent-pending")).to_be_visible()
         finally:
             await browser.close()
