@@ -395,7 +395,6 @@ async def _drive_managed_sandbox_create(base_url: str, session_id: str) -> None:
                 "environment_profile": "workspace-readonly@2",
                 "host_type": "managed",
                 "sandbox_provider": "lakebox",
-                "workspace": None,
             }, request
         finally:
             await browser.close()
