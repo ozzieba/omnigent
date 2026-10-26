@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pyte
 import pytest
 
 from tests.e2e.conftest import (
@@ -51,6 +52,48 @@ from tests.e2e.conftest import (
 )
 
 pexpect = pytest.importorskip("pexpect")
+
+
+class _TerminalCapture:
+    """Track the rendered screen and the complete raw terminal transcript."""
+
+    def __init__(self, columns: int, rows: int) -> None:
+        self.screen = pyte.Screen(columns, rows)
+        self.stream = pyte.Stream(self.screen)
+        self.output = ""
+
+    def write(self, data: str) -> None:
+        self.output += data
+        self.stream.feed(data)
+
+    def flush(self) -> None:
+        pass
+
+    def wait_for_sleeping(self, child: Any, timeout: float) -> None:
+        """Wait for the actual screen, including incremental cursor updates."""
+        deadline = time.monotonic() + timeout
+        while not any(
+            "· ready" in line and "state: sleepin" in line for line in self.screen.display
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"REPL did not return to idle:\n{self.screen.display}")
+            try:
+                child.expect(r"(?s).+", timeout=remaining)
+            except pexpect.TIMEOUT as exc:
+                raise AssertionError(
+                    f"REPL did not return to idle:\n{self.screen.display}"
+                ) from exc
+
+
+def test_terminal_capture_reconstructs_incremental_idle_update() -> None:
+    terminal = _TerminalCapture(columns=120, rows=40)
+    terminal.write("state: sleeping")
+    terminal.output = ""
+    terminal.write("\rstate: sl\x1b[Cepi")
+    assert "state: sleeping" not in terminal.output
+    assert "state: sleeping" in terminal.screen.display[0]
+
 
 _ASK_DEMO_DIR = Path(__file__).resolve().parents[1] / "resources" / "agents" / "ask-demo"
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
@@ -884,17 +927,19 @@ def test_repl_tool_call_refusal_blocks_tool(
         dimensions=(40, 120),
         timeout=_LAUNCH_TIMEOUT,
     )
+    terminal = _TerminalCapture(columns=120, rows=40)
+    child.logfile_read = terminal
     try:
         _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT, welcome_pattern="e2e.tool.gate")
         child.send("testing456" + "\r")
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        # Turn is now aborted — wait for the REPL to return to idle.
-        _wait_for_turn_complete(child, timeout=30)
+        # Cursor updates can split the idle label across terminal writes.
+        terminal.wait_for_sleeping(child, timeout=30)
         # The tool must never have run: raw echo output must not appear
         # anywhere in the terminal buffer captured so far.
-        assert "echo: testing456" not in child.before, (
+        assert "echo: testing456" not in terminal.output, (
             "Raw tool output appeared in REPL despite refusal — the tool "
             "ran when it must not have."
         )
