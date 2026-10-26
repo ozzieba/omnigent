@@ -332,9 +332,12 @@ def test_cursor_native_worker_row_not_source_none(
     # status UI to go idle so the trigger cannot be replaced mid-click.
     expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=30_000)
 
-    # Settled history mounts its work disclosure closed, avoiding the live
-    # turn's one-frame collapse replacing a tool card during expansion.
+    # Recently active history can still animate its disclosure closed after reload.
+    # Wait for that collapse before opening the persisted catalog.
     page.reload()
+    expect(
+        page.get_by_role("button", name=re.compile(r"^Worked(?: for |$)")).first
+    ).to_have_attribute("aria-expanded", "false", timeout=30_000)
 
     # Put the catalog on screen the way a user reads it (and the video shows it).
     _expand_list_models_tool_call(page)
