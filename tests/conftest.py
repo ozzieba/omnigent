@@ -97,6 +97,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 # ``PYTEST_PROGRESS_LOG_DIR`` in :func:`pytest_configure`. ``None``
 # when env var is unset (local dev).
 _PROGRESS_LOG_PATH: str | None = None
+_FAILED_WORKER_TEST = False
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -127,6 +128,13 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
     check_test_environment(db_uri=db_uri, base_url=base_url, warn_only=False)
 
 
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Record failures in this worker for bounded post-run diagnostics."""
+    global _FAILED_WORKER_TEST
+    if report.failed:
+        _FAILED_WORKER_TEST = True
+
+
 def pytest_unconfigure(config: pytest.Config) -> None:
     """Clean up per-session resources.
 
@@ -143,6 +151,17 @@ def pytest_unconfigure(config: pytest.Config) -> None:
         print(f"\nreaped leaked omnigent process: {cmdline}", file=sys.stderr)
     for cmdline in survivors:
         print(f"\nUNREAPED omnigent process survived SIGKILL: {cmdline}", file=sys.stderr)
+    if _FAILED_WORKER_TEST and _PROGRESS_LOG_PATH is not None:
+        from tests._process_log_evidence import preserve_process_log_summary
+
+        progress = Path(_PROGRESS_LOG_PATH)
+        try:
+            preserve_process_log_summary(
+                _TEST_OMNIGENT_DATA_DIR,
+                progress.with_name(progress.name.replace("progress-", "progress-process-")),
+            )
+        except OSError as exc:
+            print(f"Could not preserve process diagnostics: {type(exc).__name__}", file=sys.stderr)
     shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
 
 
