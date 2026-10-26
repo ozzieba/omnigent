@@ -6,10 +6,12 @@ and Node 22+. The iframe fixture deliberately stalls/restores/rejects Lab startu
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -86,7 +88,15 @@ def surface_url(tmp_path):
 
 
 @pytest.mark.parametrize("failure", ["timeout", "rejection"])
-async def test_native_load_recovery(surface_url, failure, tmp_path):
+def test_native_load_recovery(surface_url, failure, tmp_path):
+    # Sync Playwright fixtures in this suite leave a loop running on the main thread.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(
+            asyncio.run, _drive_native_load_recovery(surface_url, failure, tmp_path)
+        ).result()
+
+
+async def _drive_native_load_recovery(surface_url, failure, tmp_path):
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         page = await browser.new_page()
