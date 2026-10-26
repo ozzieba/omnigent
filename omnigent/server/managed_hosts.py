@@ -1209,6 +1209,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    runtime_image_launcher_factory: Callable[[str], SandboxHostLauncher] | None = None
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -1377,9 +1378,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         managed_host_images=(
             _parse_kubernetes_image_catalog(raw) if provider == "kubernetes" else {}
         ),
-        runtime_image_launcher_factory=(
-            runtime_image_launcher_factory if provider == "kubernetes" else None
-        ),
+        runtime_image_launcher_factory=runtime_image_launcher_factory,
     )
 
 

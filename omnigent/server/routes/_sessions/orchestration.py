@@ -2257,12 +2257,12 @@ async def _persist_external_conversation_item(
 ) -> str:
     """Serialize provenance retries before they can consume queued uploads."""
     item = _parse_external_conversation_item(body)
-    provenance = (item.native_thread_id, item.native_turn_id, item.native_item_id)
-    if not all(provenance):
+    thread_id, turn_id, item_id = (item.native_thread_id, item.native_turn_id, item.native_item_id)
+    if not thread_id or not turn_id or not item_id:
         return await _persist_external_conversation_item_once(
             session_id, conv, body, conversation_store, created_by, background_title_coordinator
         )
-    key = (session_id, *provenance)
+    key = (session_id, thread_id, turn_id, item_id)
     async with _external_item_lock(key):
         return await _persist_external_conversation_item_once(
             session_id, conv, body, conversation_store, created_by, background_title_coordinator
@@ -8533,6 +8533,7 @@ async def _create_session_from_existing_agent(
             )
             if (
                 environment_runtime_ref is None
+                or sandbox_config is None
                 or selected_provider is None
                 or selected_provider.provider != "kubernetes"
                 or sandbox_config.managed_host_image(environment_runtime_ref) is None
