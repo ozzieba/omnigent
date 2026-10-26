@@ -285,6 +285,52 @@ def wait_for_ready(child: pexpect.spawn, *, timeout: float) -> None:
     child.expect([STATE_SLEEPING, PROMPT_READY], timeout=timeout)
 
 
+def _process_diagnostics(pid: int, proc: Path = Path("/proc")) -> str:
+    """Capture process states and wait channels without reading command arguments."""
+    pending = [pid]
+    seen: set[int] = set()
+    lines: list[str] = []
+    while pending and len(seen) < 32:
+        current = pending.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        base = proc / str(current)
+        try:
+            status = (base / "status").read_text(encoding="utf-8")
+            fields = [
+                line
+                for line in status.splitlines()
+                if line.startswith(("Name:", "State:", "PPid:", "Threads:"))
+            ]
+            try:
+                wchan = (base / "wchan").read_text(encoding="utf-8").strip()
+            except OSError:
+                wchan = "unavailable"
+            try:
+                executable = str((base / "exe").readlink())
+            except OSError:
+                executable = "unavailable"
+            lines.append(f"pid={current} exe={executable} wchan={wchan} {' '.join(fields)}")
+            try:
+                children = (base / "task" / str(current) / "children").read_text(encoding="utf-8")
+                pending.extend(int(value) for value in children.split() if value.isdecimal())
+            except OSError:
+                pass
+        except OSError:
+            lines.append(f"pid={current} unavailable")
+    return "\n".join(lines)
+
+
+def expect_initial_prompt(child: pexpect.spawn, *, timeout: float) -> None:
+    """Keep startup timeout behavior while recording the stalled process tree."""
+    try:
+        child.expect(PROMPT_READY, timeout=timeout)
+    except pexpect.TIMEOUT as exc:
+        exc.add_note(f"Startup process diagnostics:\n{_process_diagnostics(child.pid)}")
+        raise
+
+
 def submit_prompt(child: pexpect.spawn, text: str) -> None:
     """
     Type a prompt into the REPL and submit it.

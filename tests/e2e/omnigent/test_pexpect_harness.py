@@ -2,12 +2,42 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
+import pexpect
 import pytest
 import yaml
 
-from tests.e2e.omnigent._pexpect_harness import ensure_repl_test_theme_env
+from tests.e2e.omnigent._pexpect_harness import (
+    _process_diagnostics,
+    ensure_repl_test_theme_env,
+    expect_initial_prompt,
+)
+
+
+def test_process_diagnostics_reports_child_state_without_arguments(tmp_path: Path) -> None:
+    for pid, state, children in [(10, "S (sleeping)", "11"), (11, "D (disk sleep)", "")]:
+        proc = tmp_path / str(pid)
+        (proc / "task" / str(pid)).mkdir(parents=True)
+        (proc / "status").write_text(f"Name:\tpython\nState:\t{state}\nThreads:\t1\n")
+        (proc / "wchan").write_text("futex_wait")
+        (proc / "task" / str(pid) / "children").write_text(children)
+        (proc / "cmdline").write_text("sensitive argument")
+    diagnostics = _process_diagnostics(10, proc=tmp_path)
+    assert "pid=10" in diagnostics and "pid=11" in diagnostics
+    assert "D (disk sleep)" in diagnostics and "futex_wait" in diagnostics
+    assert "sensitive argument" not in diagnostics
+
+
+def test_initial_prompt_timeout_keeps_exception_and_adds_process_context() -> None:
+    child = pexpect.spawn(sys.executable, ["-c", "import time; time.sleep(5)"], encoding="utf-8")
+    try:
+        with pytest.raises(pexpect.TIMEOUT) as raised:
+            expect_initial_prompt(child, timeout=0.2)
+        assert f"pid={child.pid}" in "\n".join(raised.value.__notes__)
+    finally:
+        child.close(force=True)
 
 
 def test_ensure_repl_test_theme_env_seeds_isolated_home(tmp_path: Path) -> None:

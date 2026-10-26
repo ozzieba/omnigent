@@ -47,6 +47,7 @@ from typing import Any
 from tests.e2e.omnigent._pexpect_harness import (
     await_turn_complete,
     clean_exit,
+    expect_initial_prompt,
     spawn_omnigent_run,
     strip_ansi,
     submit_prompt,
@@ -159,7 +160,7 @@ def test_repl_cancel_re_arms_for_next_turn(
         timeout=_SPAWN_TIMEOUT,
     )
     try:
-        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
+        expect_initial_prompt(child, timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _LONG_PROMPT)
         # Wait for the turn to actually start streaming — the
         # visible ``⠹ working`` activity line marks the moment the
