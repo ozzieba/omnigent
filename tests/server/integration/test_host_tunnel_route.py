@@ -371,9 +371,11 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     registry = HostRegistry()
     store = HostStore(db_uri)
     updates: list[str] = []
+    host_updated = asyncio.Event()
 
     async def _on_host_update(host_id: str, _owner: str | None) -> None:
         updates.append(host_id)
+        host_updated.set()
 
     app = FastAPI()
     app.include_router(
@@ -409,14 +411,11 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
         }
     )
 
-    async def _wait_until_ready() -> None:
-        while True:
-            host = store.get_host(_HOST_ID)
-            if host is not None and host.configured_harnesses == {"pi": True}:
-                return
-            await asyncio.sleep(0.01)
+    await asyncio.wait_for(host_updated.wait(), timeout=0.5)
 
-    await asyncio.wait_for(_wait_until_ready(), timeout=0.5)
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.configured_harnesses == {"pi": True}
 
     conn = registry.get(_HOST_ID)
     assert conn is not None
