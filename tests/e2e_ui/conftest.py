@@ -2865,7 +2865,7 @@ def mocked_native_codex_session(
     in the same shard.
 
     The indirect parameter is a model name, a list of sidecar responses, or a
-    dict with optional ``"model"`` and ``"responses"`` keys (both at once).
+    dict with optional ``"model"``, ``"responses"``, and ``"codex_config"``.
     """
     if request.config.getoption("--ui-base-url"):
         pytest.skip("mocked native Codex e2e requires an isolated spawned server")
@@ -2877,8 +2877,10 @@ def mocked_native_codex_session(
         pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
 
     fixture_param = getattr(request, "param", None)
+    codex_config = ""
     if isinstance(fixture_param, dict):
         model = str(fixture_param.get("model") or "mock-model")
+        codex_config = str(fixture_param.get("codex_config") or "")
         fixture_param = fixture_param.get("responses")
     else:
         model = fixture_param if isinstance(fixture_param, str) else "mock-model"
@@ -2913,6 +2915,8 @@ def mocked_native_codex_session(
     artifact_dir = server_tmp / "artifacts"
     for path in (source_codex_home, home_dir, state_dir, artifact_dir):
         path.mkdir(parents=True, exist_ok=True)
+    if codex_config:
+        (source_codex_home / "config.toml").write_text(codex_config, encoding="utf-8")
     # Reproduce the intermittent production path deterministically: a user
     # hook needs review while the runner's version probe is unparseable. The
     # real Codex binary still handles every non-version invocation.

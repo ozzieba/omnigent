@@ -36,7 +36,14 @@ _NATIVE_CODEX_TIMEOUT_MS = 180_000
 
 @pytest.mark.parametrize(
     "mocked_native_codex_session",
-    [_TOOL_RESPONSES],
+    [
+        {
+            "responses": _TOOL_RESPONSES,
+            # This fixture runs a fixed local command in a disposable Codex home.
+            # CI containers may not permit the command sandbox's user namespaces.
+            "codex_config": 'sandbox_mode = "danger-full-access"\napproval_policy = "never"\n',
+        }
+    ],
     indirect=True,
     ids=["shell-tool"],
 )
