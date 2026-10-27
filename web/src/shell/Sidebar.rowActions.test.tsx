@@ -599,7 +599,11 @@ describe("double-click to rename", () => {
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed" });
   });
 
-  it("ignores a double-click whose first click landed on a different row", () => {
+  it("ignores a double-click whose first click landed on a different row", ({ onTestFinished }) => {
+    // Model user-event time independently of rendering delays on a busy runner.
+    let clickTime = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => clickTime);
+    onTestFinished(() => clock.mockRestore());
     // A native double-click delivers click, click, dblclick to one element.
     // If the list reorders between the two clicks (a session's updated_at
     // bump pushes rows around under the cursor), the second click and the
@@ -629,6 +633,7 @@ describe("double-click to rename", () => {
     view.rerenderSidebar();
 
     // Click #2 and the dblclick land on B, the row now under the cursor.
+    clickTime = 100;
     const rowB = screen.getByRole("link", { name: /Session B/ });
     fireEvent.click(rowB);
     fireEvent.dblClick(rowB);
@@ -638,7 +643,9 @@ describe("double-click to rename", () => {
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
 
     // A clean double-click on B — both clicks on the row — still renames it.
+    clickTime = 1_000;
     fireEvent.click(rowB);
+    clickTime = 1_100;
     fireEvent.click(rowB);
     fireEvent.dblClick(rowB);
     const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
