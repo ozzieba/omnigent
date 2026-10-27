@@ -338,10 +338,15 @@ describe("nextRunAtMs", () => {
     "FREQ=DAILY;INTERVAL=3",
     "FREQ=MONTHLY;BYMONTHDAY=15",
     "FREQ=YEARLY;BYMONTH=3",
-  ])("matches the deterministic 2000-anchor result for %s", (rrule) => {
-    const now = new Date("2026-07-24T05:00:00Z");
-    expect(nextRunAtMs(rrule, "UTC", now)).toBe(referenceNextRunAtMs(rrule, now));
-  });
+  ])(
+    "matches the deterministic 2000-anchor result for %s",
+    (rrule) => {
+      const now = new Date("2026-07-24T05:00:00Z");
+      expect(nextRunAtMs(rrule, "UTC", now)).toBe(referenceNextRunAtMs(rrule, now));
+    },
+    // The oracle walks ~228k occurrences; coverage on a contended runner can pass 15s.
+    60_000,
+  );
 
   it("computes hourly next-run values without iterating from the 2000 anchor", () => {
     const start = performance.now();

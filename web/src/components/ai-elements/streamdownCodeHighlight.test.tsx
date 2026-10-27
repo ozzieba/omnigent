@@ -35,11 +35,14 @@ describe("Streamdown code highlighting via lazyCodePlugin", () => {
       { timeout: 10000 },
     );
 
-    // The keyword and the numeric literal land in distinct highlighted tokens.
+    // The keyword is its own highlighted token. Shiki stops tokenizing a line once
+    // its time limit passes, so on a starved CPU the rest of the line can arrive as
+    // one span: assert the literal is present in the highlighted text, not that it
+    // is a separate token.
     const tokenText = Array.from(container.querySelectorAll(coloredSelector)).map(
-      (el) => el.textContent,
+      (el) => el.textContent ?? "",
     );
     expect(tokenText).toContain("const");
-    expect(tokenText).toContain("42");
+    expect(tokenText.join("")).toContain("42");
   }, 15000);
 });

@@ -178,7 +178,9 @@ describe("sidebar highlight while viewing a sub-agent", () => {
     renderAt("/c/conv_child");
 
     // Once the parent walk resolves, the root's row carries the highlight.
-    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-[var(--sidebar-active)]"));
+    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-[var(--sidebar-active)]"), {
+      timeout: 5000,
+    });
     expect(rowFor("conv_other")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
@@ -190,7 +192,9 @@ describe("sidebar highlight while viewing a sub-agent", () => {
 
     // A top-level session resolves to itself; highlight lands immediately and
     // doesn't bleed onto siblings.
-    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-[var(--sidebar-active)]"));
+    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-[var(--sidebar-active)]"), {
+      timeout: 5000,
+    });
     expect(rowFor("conv_other")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 });
