@@ -3,6 +3,7 @@ import { authenticatedFetch, fetchWithBrowserSession } from "@/lib/identity";
 import { mountNotebookPane } from "./notebook-pane.mjs";
 import { NotebookStorageStatus } from "./NotebookStorageStatus";
 import { NotebookHistory } from "./NotebookHistory";
+import { OwnerContinuationPanel } from "./OwnerContinuationPanel";
 
 const LOAD_TIMEOUT_MS = 120_000;
 
@@ -23,6 +24,7 @@ export function NativeNotebookSurface({
   const [org, setOrg] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [kernelStatus, setKernelStatus] = useState("Loading JupyterLab…");
+  const [bindingId, setBindingId] = useState<string | null>(null);
   const editor = useRef<HTMLDivElement>(null);
   const frame = useRef<HTMLIFrameElement>(null);
   useEffect(() => {
@@ -118,6 +120,7 @@ export function NativeNotebookSurface({
           throw new Error("Send a message in Chat to open this session’s notebook.");
         const document = await response.json();
         if (abort.signal.aborted) return;
+        setBindingId(typeof document.binding_id === "string" ? document.binding_id : null);
         if (document.format === "org") {
           setOrg(true);
           setSource(true);
@@ -157,6 +160,7 @@ export function NativeNotebookSurface({
     return () => pane.dispose();
   }, [source, sessionId]);
   const retry = () => {
+    setBindingId(null);
     setUrl(null);
     setFailure(null);
     setMessage("Opening notebook…");
@@ -167,6 +171,9 @@ export function NativeNotebookSurface({
   return (
     <div className="docloop-notebook-surface">
       {history && <NotebookStorageStatus sessionId={sessionId} active={active} />}
+      {!history && bindingId && (
+        <OwnerContinuationPanel sessionId={sessionId} bindingId={bindingId} active={active} />
+      )}
       <div className="docloop-notebook-toolbar" aria-label="Notebook editor">
         {!org && (
           <button

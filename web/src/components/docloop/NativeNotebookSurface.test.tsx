@@ -77,6 +77,19 @@ describe("native notebook loading recovery", () => {
     },
   );
 
+  it("shows owner recovery controls for a bound document", async () => {
+    fetchers.document.mockResolvedValueOnce(
+      new Response('{"format":"ipynb","binding_id":"bound-document"}'),
+    );
+    render(<NativeNotebookSurface sessionId="test" active />);
+    await advance();
+    expect(screen.getByRole("region", { name: "Automatic recovery" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Queue automatic recovery" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    await advance();
+    expect(screen.queryByRole("region", { name: "Automatic recovery" })).toBeNull();
+  });
+
   it("handles restoration rejection and recovers on retry", async () => {
     render(<NativeNotebookSurface sessionId="test" active />);
     await advance();
