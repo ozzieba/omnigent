@@ -347,7 +347,12 @@ class _RunnerDatabricksAuth(httpx.Auth):
                         request.headers["Authorization"] = f"Bearer {token}"
                         yield request
                     return
-                raise httpx.RequestError("Databricks token refresh returned no token")
+                reason = getattr(self._factory, "failure_reason", None)
+                raise httpx.RequestError(
+                    "Omnigent authentication unavailable: "
+                    + (reason or "token renewal returned no token"),
+                    request=request,
+                )
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
         if self._factory is None:
@@ -441,7 +446,6 @@ class _InitialAuthTokenFactory:
         self._last_initial_token: str = token  # retained for managed-mint proxy auth
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
-        self._fallback_resolved = False
         self._no_credential_logged = False
         self._lock = threading.Lock()
 
@@ -457,13 +461,12 @@ class _InitialAuthTokenFactory:
         """
         if self._initial_token is not None:
             return self._initial_token
-        if not self._fallback_resolved:
+        if self._fallback_factory is None:
             self._fallback_factory = _make_auth_token_factory(
                 self._server_url,
                 _allow_initial_token=False,
                 _proxy_bearer=self._last_initial_token,
             )
-            self._fallback_resolved = True
         token = self._fallback_factory() if self._fallback_factory is not None else None
         # Managed mint cannot renew itself when its proxy bearer expires —
         # the injected host bearer before a first mint, or the minted JWT
@@ -477,15 +480,23 @@ class _InitialAuthTokenFactory:
             )
             token = self._fallback_factory() if self._fallback_factory is not None else None
         if self._fallback_factory is None and not self._no_credential_logged:
-            # This state is terminal for the process, so say it once
-            # rather than on every subsequent callback.
             self._no_credential_logged = True
             _logger.error(
-                "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                "to renew it; run `databricks auth login` to re-authenticate",
+                "host bootstrap bearer expired and no renewable Omnigent credential "
+                "is currently available; credential discovery will retry",
                 extra={"session_id": runner_primary_session_id()},
             )
+        if token is not None:
+            self._no_credential_logged = False
         return token
+
+    @property
+    def failure_reason(self) -> str | None:
+        """Expose safe renewal diagnostics from the current credential path."""
+        with self._lock:
+            if self._fallback_factory is None and self._initial_token is None:
+                return "no renewable credential is currently available; discovery will retry"
+            return getattr(self._fallback_factory, "failure_reason", None)
 
     @property
     def declined(self) -> bool:
@@ -868,6 +879,7 @@ class _ManagedMintTokenFactory:
         self._proxy_bearer = proxy_bearer
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
+        self.failure_reason: str | None = None
         # Serializes mint/latch state across concurrent callbacks so a
         # decline reset and a re-mint cannot interleave into duplicate
         # mints or a declined-latch alongside a freshly cached token.
@@ -916,6 +928,7 @@ class _ManagedMintTokenFactory:
             )
         except httpx.HTTPStatusError as exc:
             response = exc.response
+            self.failure_reason = f"runner token endpoint returned HTTP {response.status_code}"
             if (
                 response.status_code in (400, 404)
                 or response.is_server_error
@@ -944,13 +957,15 @@ class _ManagedMintTokenFactory:
                     self.proxy_auth_failed = True
                 return cached
             return self._still_valid_cached_token(now)
-        except (httpx.HTTPError, ValueError, KeyError, OSError):
+        except (httpx.HTTPError, ValueError, KeyError, OSError) as exc:
+            self.failure_reason = f"runner token endpoint failed ({type(exc).__name__})"
             # Transient mint failure: keep serving the cached token while
             # it is still valid; otherwise report "no token" and let the
             # tunnel's / HTTP client's on-401 retry drive the next mint.
             return self._still_valid_cached_token(now)
         self._cached_token = token
         self._cached_expires_at = expires_at
+        self.failure_reason = None
         # Promote the minted JWT to proxy bearer so subsequent refreshes
         # through the Apps proxy are authenticated with a valid credential.
         self._proxy_bearer = token
@@ -1025,10 +1040,22 @@ def _mint_managed_owner_token(
         **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
     with httpx.Client(timeout=10.0, trust_env=not is_loopback_url(server_url)) as client:
-        response = client.post(mint_url, headers=headers)
-        response.raise_for_status()
-        payload = response.json()
-    return payload["token"], float(payload["expires_at"])
+        for attempt in range(3):
+            try:
+                response = client.post(mint_url, headers=headers)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if attempt == 2 or (status != 429 and status < 500):
+                    raise
+            except httpx.TransportError:
+                if attempt == 2:
+                    raise
+            else:
+                payload = response.json()
+                return payload["token"], float(payload["expires_at"])
+            time.sleep(0.5 * (2**attempt))
+    raise AssertionError("token renewal retry loop exhausted without a result")
 
 
 def _runner_tunnel_binding_token_from_env() -> str | None:
